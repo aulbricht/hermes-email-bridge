@@ -18,13 +18,29 @@ AgentMail is the first adapter, not a core dependency. The bridge contract is in
 
 ## Install
 
-Python 3.11 or newer is required.
+Python 3.11 or newer is required. The default macOS Python 3.9 is not supported.
+
+### Recommended: uv
 
 ```bash
 git clone https://github.com/aulbricht/hermes-email-bridge.git
 cd hermes-email-bridge
-python -m venv .venv
+uv sync
+cp .env.example .env
+```
+
+For development tools and tests, use `uv sync --extra dev`. Run commands with
+`uv run`, for example `uv run hermes-email-bridge init-db`.
+
+### pip fallback
+
+Create the virtual environment with Python 3.11 or newer explicitly, then update
+pip before requesting an editable Hatchling install:
+
+```bash
+python3.11 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -e .
 cp .env.example .env
 ```
