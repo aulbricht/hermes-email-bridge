@@ -160,7 +160,7 @@ def test_webhook_marks_unauthenticated_event_as_unauthenticated() -> None:
     provider = AgentMailProvider(api_key="test", inbox_id="bridge@agentmail.to")
     message = provider.parse_webhook(
         {
-            "event_type": "message.unauthenticated",
+            "event_type": "message.received.unauthenticated",
             "message": {
                 "inbox_id": "bridge@agentmail.to",
                 "message_id": "message-1",

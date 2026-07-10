@@ -75,7 +75,6 @@ class Settings:
     agentmail_allow_insecure_local_http: bool
     webhook_host: str
     webhook_port: int
-    webhook_workers: int
     webhook_queue_size: int
 
     @classmethod
@@ -86,7 +85,6 @@ class Settings:
             hermes_timeout = float(values.get("HERMES_TIMEOUT", "300"))
             webhook_port = int(values.get("EMAIL_BRIDGE_WEBHOOK_PORT", "8787"))
             raw_retention_days = int(values.get("EMAIL_BRIDGE_RAW_RETENTION_DAYS", "30"))
-            webhook_workers = int(values.get("EMAIL_BRIDGE_WEBHOOK_WORKERS", "1"))
             webhook_queue_size = int(values.get("EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE", "8"))
         except ValueError as exc:
             raise ConfigError(f"invalid numeric configuration: {exc}") from exc
@@ -96,8 +94,8 @@ class Settings:
             raise ConfigError("webhook port must be between 1 and 65535")
         if raw_retention_days <= 0:
             raise ConfigError("raw retention days must be positive")
-        if webhook_workers <= 0 or webhook_queue_size <= 0:
-            raise ConfigError("webhook workers and queue size must be positive")
+        if webhook_queue_size <= 0:
+            raise ConfigError("webhook queue size must be positive")
 
         provider = values.get("EMAIL_BRIDGE_PROVIDER", "agentmail").strip().lower()
         db_path = Path(
@@ -146,7 +144,6 @@ class Settings:
             agentmail_allow_insecure_local_http=allow_local_http,
             webhook_host=values.get("EMAIL_BRIDGE_WEBHOOK_HOST", "127.0.0.1"),
             webhook_port=webhook_port,
-            webhook_workers=webhook_workers,
             webhook_queue_size=webhook_queue_size,
         )
 

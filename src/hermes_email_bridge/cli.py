@@ -149,7 +149,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     secret=settings.agentmail_webhook_secret,
                     host=settings.webhook_host,
                     port=settings.webhook_port,
-                    worker_count=settings.webhook_workers,
                     queue_size=settings.webhook_queue_size,
                 )
                 return 0

@@ -78,7 +78,6 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `HERMES_TIMEOUT` | `300` | Invocation timeout in seconds |
 | `EMAIL_BRIDGE_WEBHOOK_HOST` | `127.0.0.1` | Webhook listen host |
 | `EMAIL_BRIDGE_WEBHOOK_PORT` | `8787` | Webhook listen port |
-| `EMAIL_BRIDGE_WEBHOOK_WORKERS` | `1` | Maximum concurrent webhook-triggered Hermes invocations |
 | `EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE` | `8` | Accepted webhook events waiting for a worker |
 
 For a named Hermes profile, point `HERMES_COMMAND` at that profile's Hermes wrapper. The bridge appends `--resume SESSION` when mapped and always appends `--query PROMPT`; it never invokes a shell.
@@ -129,7 +128,7 @@ hermes-email-bridge serve
 curl http://127.0.0.1:8787/healthz
 ```
 
-Expose `/webhooks` through HTTPS and register it for AgentMail's `message.received` event. `serve` refuses to start without `AGENTMAIL_WEBHOOK_SECRET` and verifies the exact raw body using AgentMail's Svix headers before parsing it. Verified events enter a bounded queue; saturation returns HTTP 503 so the provider can retry. See AgentMail's [webhook setup](https://docs.agentmail.to/webhooks-overview) and [verification](https://docs.agentmail.to/webhook-verification) guides.
+Expose `/webhooks` through HTTPS and register it for AgentMail's `message.received` event. `serve` refuses to start without `AGENTMAIL_WEBHOOK_SECRET` and verifies the exact raw body using AgentMail's Svix headers before parsing it. Verified events enter a bounded queue and one worker processes them serially so messages cannot race to create or resume the same Hermes session; saturation returns HTTP 503 so the provider can retry. See AgentMail's [webhook setup](https://docs.agentmail.to/webhooks-overview) and [verification](https://docs.agentmail.to/webhook-verification) guides.
 
 To enable actual replies, change both safety gates deliberately:
 

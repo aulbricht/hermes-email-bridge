@@ -58,7 +58,7 @@ def test_rejects_tampered_webhook() -> None:
         verify_svix(payload + b" ", headers, secret, now=1_700_000_001)
 
 
-def _message(message_id: str) -> NormalizedEmail:
+def _message(message_id: str, *, thread_id: str | None = None) -> NormalizedEmail:
     return NormalizedEmail(
         provider="fake",
         provider_message_id=message_id,
@@ -67,7 +67,7 @@ def _message(message_id: str) -> NormalizedEmail:
         subject="Subject",
         text_body="Body",
         received_at=datetime(2026, 7, 10, tzinfo=UTC),
-        thread_id=message_id,
+        thread_id=message_id if thread_id is None else thread_id,
         sender_authentication=SenderAuthentication.AUTHENTICATED,
     )
 
@@ -80,6 +80,7 @@ class BlockingRunner(HermesRunner):
         self.calls = 0
         self.active = 0
         self.max_active = 0
+        self.mappings: list[ConversationMapping | None] = []
 
     def run(
         self,
@@ -90,6 +91,7 @@ class BlockingRunner(HermesRunner):
             self.calls += 1
             self.active += 1
             self.max_active = max(self.max_active, self.active)
+            self.mappings.append(mapping)
             self.started.set()
         self.release.wait()
         with self._lock:
@@ -103,7 +105,7 @@ def test_webhook_dispatcher_bounds_queue_and_concurrency() -> None:
     runner = BlockingRunner()
     with MappingStore(":memory:") as store:
         service = BridgeService(provider=provider, store=store, runner=runner)
-        dispatcher = WebhookDispatcher(service, provider, worker_count=1, queue_size=1)
+        dispatcher = WebhookDispatcher(service, provider, queue_size=1)
         try:
             assert dispatcher.submit({"message_id": "message-0"})
             assert runner.started.wait(timeout=2)
@@ -116,13 +118,38 @@ def test_webhook_dispatcher_bounds_queue_and_concurrency() -> None:
         assert runner.max_active == 1
 
 
+def test_same_thread_messages_are_serialized_without_loss() -> None:
+    messages = [
+        _message("message-1", thread_id="shared-thread"),
+        _message("message-2", thread_id="shared-thread"),
+    ]
+    provider = FakeProvider(messages)
+    runner = BlockingRunner()
+    with MappingStore(":memory:") as store:
+        service = BridgeService(provider=provider, store=store, runner=runner)
+        dispatcher = WebhookDispatcher(service, provider, queue_size=1)
+        try:
+            assert dispatcher.submit({"message_id": "message-1"})
+            assert runner.started.wait(timeout=2)
+            assert dispatcher.submit({"message_id": "message-2"})
+            assert runner.calls == 1
+        finally:
+            runner.release.set()
+            dispatcher.shutdown()
+        assert runner.calls == 2
+        assert runner.max_active == 1
+        assert runner.mappings[0] is None
+        assert runner.mappings[1] is not None
+        assert runner.mappings[1].hermes_session == "session-message-1"
+
+
 def test_webhook_dispatcher_coalesces_in_flight_duplicate() -> None:
     message = _message("message-1")
     provider = FakeProvider([message])
     runner = BlockingRunner()
     with MappingStore(":memory:") as store:
         service = BridgeService(provider=provider, store=store, runner=runner)
-        dispatcher = WebhookDispatcher(service, provider, worker_count=1, queue_size=1)
+        dispatcher = WebhookDispatcher(service, provider, queue_size=1)
         try:
             assert dispatcher.submit({"message_id": "message-1"})
             assert runner.started.wait(timeout=2)
@@ -164,7 +191,6 @@ def test_saturated_webhook_server_returns_503(monkeypatch: pytest.MonkeyPatch) -
                     secret=_headers(b"{}", int(time.time()))[1],
                     host="127.0.0.1",
                     port=0,
-                    worker_count=1,
                     queue_size=1,
                 )
             except BaseException as exc:

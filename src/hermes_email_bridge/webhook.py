@@ -66,30 +66,25 @@ def verify_svix(
 
 
 class WebhookDispatcher:
-    """Bound Hermes work with a fixed worker count and queue."""
+    """Serialize Hermes work through one worker and a bounded queue."""
 
     def __init__(
         self,
         service: BridgeService,
         provider: EmailProvider,
         *,
-        worker_count: int = 1,
         queue_size: int = 8,
     ) -> None:
-        if worker_count <= 0 or queue_size <= 0:
-            raise ValueError("worker_count and queue_size must be positive")
+        if queue_size <= 0:
+            raise ValueError("queue_size must be positive")
         self.service = service
         self.provider = provider
         self._queue: queue.Queue[tuple[str | None, dict[str, Any]] | None] = queue.Queue(queue_size)
         self._lock = threading.Lock()
         self._pending: set[str] = set()
         self._stopped = False
-        self._workers = [
-            threading.Thread(target=self._run, name=f"webhook-worker-{index + 1}")
-            for index in range(worker_count)
-        ]
-        for worker in self._workers:
-            worker.start()
+        self._worker = threading.Thread(target=self._run, name="webhook-worker")
+        self._worker.start()
 
     def submit(self, payload: dict[str, Any]) -> bool:
         key = _payload_key(payload)
@@ -127,10 +122,8 @@ class WebhookDispatcher:
             if self._stopped:
                 return
             self._stopped = True
-        for _worker in self._workers:
-            self._queue.put(None)
-        for worker in self._workers:
-            worker.join()
+        self._queue.put(None)
+        self._worker.join()
 
 
 def _payload_key(payload: dict[str, Any]) -> str | None:
@@ -150,7 +143,6 @@ def serve_webhooks(
     secret: str,
     host: str,
     port: int,
-    worker_count: int = 1,
     queue_size: int = 8,
 ) -> None:
     """Serve `/webhooks` and `/healthz` until interrupted."""
@@ -200,9 +192,7 @@ def serve_webhooks(
                 "webhook request", extra={"event": "webhook_request", "detail": format % args}
             )
 
-    dispatcher = WebhookDispatcher(
-        service, provider, worker_count=worker_count, queue_size=queue_size
-    )
+    dispatcher = WebhookDispatcher(service, provider, queue_size=queue_size)
     try:
         server = ThreadingHTTPServer((host, port), Handler)
     except Exception:
