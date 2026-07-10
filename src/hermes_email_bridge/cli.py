@@ -12,6 +12,7 @@ from dataclasses import asdict
 from . import __version__
 from .config import ConfigError, Settings
 from .log import configure_logging
+from .models import ConversationMapping
 from .providers.agentmail import AgentMailProvider
 from .providers.base import EmailProvider
 from .runner import SubprocessHermesRunner
@@ -38,7 +39,13 @@ def _parser() -> argparse.ArgumentParser:
     inspect = commands.add_parser("inspect", help="Fetch and normalize one provider message")
     inspect.add_argument("message_id")
     inspect.add_argument("--raw", action="store_true", help="Include the raw provider payload")
-    commands.add_parser("mappings", help="List email-thread to Hermes mappings")
+    mappings = commands.add_parser("mappings", help="List or rotate persistent mappings")
+    mapping_commands = mappings.add_subparsers(dest="mappings_command")
+    rotate = mapping_commands.add_parser("rotate", help="Rotate one bridge marker")
+    rotate.add_argument("mapping_id", type=int)
+    rotate.add_argument("--ttl-days", type=int, default=90)
+    purge = commands.add_parser("purge-raw", help="Purge retained raw email payloads")
+    purge.add_argument("--older-than-days", type=int)
     commands.add_parser("init-db", help="Initialize the SQLite mapping store")
     return parser
 
@@ -49,6 +56,7 @@ def _provider(settings: Settings) -> EmailProvider:
         api_key=api_key,
         inbox_id=inbox_id,
         base_url=settings.agentmail_base_url,
+        allow_insecure_local_http=settings.agentmail_allow_insecure_local_http,
     )
 
 
@@ -68,7 +76,17 @@ def _service(
         send_replies=settings.send_replies,
         dry_run=settings.dry_run,
         store_raw=settings.store_raw,
+        raw_retention_days=settings.raw_retention_days,
+        allow_subject_resume=settings.allow_subject_resume,
     )
+
+
+def _masked_mapping(mapping: ConversationMapping) -> dict[str, object]:
+    value = asdict(mapping)
+    marker = str(value["bridge_marker"])
+    suffix = marker[-4:] if len(marker) > 4 else ""
+    value["bridge_marker"] = f"v1:****{suffix}"
+    return value
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -81,7 +99,38 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(settings.db_path)
                 return 0
             if args.command == "mappings":
-                print(json.dumps([asdict(item) for item in store.list_mappings()], default=str))
+                if args.mappings_command == "rotate":
+                    try:
+                        mapping = store.rotate_mapping_marker(
+                            args.mapping_id, ttl_days=args.ttl_days
+                        )
+                    except KeyError as exc:
+                        raise ConfigError(f"mapping {args.mapping_id} does not exist") from exc
+                    print(
+                        json.dumps(
+                            {
+                                "id": mapping.id,
+                                "bridge_marker": f"v1:{mapping.bridge_marker}",
+                                "expires_at": mapping.bridge_marker_expires_at,
+                            },
+                            default=str,
+                        )
+                    )
+                    return 0
+                print(
+                    json.dumps(
+                        [_masked_mapping(item) for item in store.list_mappings()],
+                        default=str,
+                    )
+                )
+                return 0
+            if args.command == "purge-raw":
+                days = (
+                    settings.raw_retention_days
+                    if args.older_than_days is None
+                    else args.older_than_days
+                )
+                print(json.dumps({"purged": store.purge_raw(days)}))
                 return 0
 
             provider = _provider(settings)
@@ -100,6 +149,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     secret=settings.agentmail_webhook_secret,
                     host=settings.webhook_host,
                     port=settings.webhook_port,
+                    worker_count=settings.webhook_workers,
+                    queue_size=settings.webhook_queue_size,
                 )
                 return 0
 

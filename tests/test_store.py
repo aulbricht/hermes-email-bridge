@@ -1,34 +1,47 @@
-from datetime import UTC, datetime
+import os
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from hermes_email_bridge.models import NormalizedEmail
+import pytest
+
+from hermes_email_bridge.models import (
+    NormalizedEmail,
+    ResolutionStatus,
+    SenderAuthentication,
+)
 from hermes_email_bridge.store import MappingStore
 
 
 def _message(
     *,
     message_id: str = "<inbound@example.com>",
+    from_email: str = "person@example.com",
+    subject: str = "Re: Project Atlas",
     in_reply_to: str | None = None,
     references: tuple[str, ...] = (),
     headers: dict[str, str] | None = None,
     thread_id: str | None = "thread-1",
+    authentication: SenderAuthentication = SenderAuthentication.AUTHENTICATED,
 ) -> NormalizedEmail:
     return NormalizedEmail(
         provider="agentmail",
         provider_message_id=message_id,
-        from_email="person@example.com",
+        from_email=from_email,
         to_email="bridge@agentmail.to",
-        subject="Re: Project Atlas",
+        subject=subject,
         text_body="reply",
         received_at=datetime(2026, 7, 9, tzinfo=UTC),
         in_reply_to=in_reply_to,
         references=references,
         thread_id=thread_id,
         raw_payload={"headers": headers or {}},
+        sender_authentication=authentication,
     )
 
 
-def test_resolves_in_reply_to_and_references(tmp_path: Path) -> None:
+def test_authenticated_participant_resolves_all_supported_paths(tmp_path: Path) -> None:
+    marker = "abcdefghijklmnopqrstuvwxyz_123456"
     with MappingStore(tmp_path / "bridge.db") as store:
         mapping = store.add_mapping(
             provider="agentmail",
@@ -36,56 +49,219 @@ def test_resolves_in_reply_to_and_references(tmp_path: Path) -> None:
             provider_thread_id="original-thread",
             subject="Project Atlas",
             participant_email="person@example.com",
+            bridge_marker=marker,
             message_ids=("<outbound@example.com>",),
         )
-        by_reply = store.resolve(
-            _message(in_reply_to="<outbound@example.com>", thread_id="new-thread")
+        messages = (
+            (_message(in_reply_to="<outbound@example.com>", thread_id=None), "in_reply_to"),
+            (
+                _message(
+                    message_id="<reference@example.com>",
+                    references=("<outbound@example.com>",),
+                    thread_id=None,
+                ),
+                "references",
+            ),
+            (_message(thread_id="original-thread"), "thread_id"),
+            (
+                _message(
+                    thread_id=None,
+                    headers={"X-Hermes-Bridge": f"v1:{marker}"},
+                ),
+                "bridge_marker",
+            ),
         )
-        by_reference = store.resolve(
-            _message(
-                message_id="<second@example.com>",
-                references=("<old@example.com>", "<outbound@example.com>"),
-                thread_id="new-thread",
-            )
+        for message, method in messages:
+            resolution = store.resolve(message)
+            assert resolution.status is ResolutionStatus.AUTHORIZED
+            assert resolution.mapping and resolution.mapping.id == mapping.id
+            assert resolution.matched_by == method
+
+        subject = store.resolve(_message(thread_id=None))
+        assert subject.status is ResolutionStatus.NO_MATCH
+        enabled_subject = store.resolve(_message(thread_id=None), allow_subject_resume=True)
+        assert enabled_subject.status is ResolutionStatus.AUTHORIZED
+        assert enabled_subject.matched_by == "subject"
+
+
+@pytest.mark.parametrize(
+    ("authentication", "from_email"),
+    [
+        (SenderAuthentication.UNAUTHENTICATED, "person@example.com"),
+        (SenderAuthentication.UNKNOWN, "person@example.com"),
+        (SenderAuthentication.AUTHENTICATED, "attacker@example.com"),
+    ],
+)
+def test_spoofed_resume_attributes_are_denied(
+    tmp_path: Path,
+    authentication: SenderAuthentication,
+    from_email: str,
+) -> None:
+    marker = "abcdefghijklmnopqrstuvwxyz_123456"
+    with MappingStore(tmp_path / "bridge.db") as store:
+        store.add_mapping(
+            provider="agentmail",
+            hermes_session="session-1",
+            provider_thread_id="thread-1",
+            subject="Project Atlas",
+            participant_email="person@example.com",
+            bridge_marker=marker,
+            message_ids=("<outbound@example.com>",),
         )
+        forged = _message(
+            from_email=from_email,
+            authentication=authentication,
+            in_reply_to="<outbound@example.com>",
+            headers={
+                "Authentication-Results": "mx.example; dkim=fail; dmarc=fail",
+                "X-Hermes-Bridge": f"v1:{marker}",
+            },
+        )
+        resolution = store.resolve(forged, allow_subject_resume=True)
 
-        assert by_reply and by_reply.mapping.id == mapping.id
-        assert by_reply.matched_by == "in_reply_to"
-        assert by_reference and by_reference.mapping.id == mapping.id
-        assert by_reference.matched_by == "references"
+        assert resolution.status is ResolutionStatus.DENIED
+        assert resolution.mapping is None
 
 
-def test_extracts_opaque_bridge_marker(tmp_path: Path) -> None:
+def test_null_participant_mapping_is_retained_but_not_resumable(tmp_path: Path) -> None:
     with MappingStore(tmp_path / "bridge.db") as store:
         mapping = store.add_mapping(
             provider="agentmail",
-            hermes_session="session-2",
-            bridge_marker="abcdefghijklmnopqrstuvwxyz_123456",
+            hermes_session="legacy-session",
+            provider_thread_id="legacy-thread",
         )
-        resolved = store.resolve(
-            _message(
-                thread_id=None,
-                headers={"X-Hermes-Bridge": "v1:abcdefghijklmnopqrstuvwxyz_123456"},
+        assert mapping.participant_email is None
+        resolution = store.resolve(_message(thread_id="legacy-thread"))
+        assert resolution.status is ResolutionStatus.DENIED
+
+
+def test_thread_conflict_never_overwrites_session(tmp_path: Path) -> None:
+    with MappingStore(tmp_path / "bridge.db") as store:
+        original = store.add_mapping(
+            provider="agentmail",
+            hermes_session="session-1",
+            provider_thread_id="thread-1",
+            participant_email="person@example.com",
+        )
+        with pytest.raises(ValueError, match="different Hermes session"):
+            store.add_mapping(
+                provider="agentmail",
+                hermes_session="session-2",
+                provider_thread_id="thread-1",
+                participant_email="person@example.com",
             )
+        assert store.list_mappings()[0].hermes_session == original.hermes_session
+
+        other = store.add_mapping(
+            provider="agentmail",
+            hermes_session="session-2",
+            provider_thread_id="thread-1",
+            participant_email="other@example.com",
         )
-        forged_body = _message(thread_id=None, headers={})
-
-        assert resolved and resolved.mapping.id == mapping.id
-        assert resolved.matched_by == "bridge_marker"
-        assert store.resolve(forged_body) is None
+        assert other.id != original.id
 
 
-def test_sqlite_mapping_persists(tmp_path: Path) -> None:
+def test_marker_rotation_and_expiry(tmp_path: Path) -> None:
     path = tmp_path / "bridge.db"
     with MappingStore(path) as store:
-        store.add_mapping(
+        original = store.add_mapping(
             provider="agentmail",
-            hermes_session="persisted-session",
-            provider_thread_id="persisted-thread",
+            hermes_session="session-1",
+            participant_email="person@example.com",
+        )
+        rotated = store.rotate_mapping_marker(original.id, ttl_days=1)
+        assert rotated.bridge_marker != original.bridge_marker
+        assert rotated.bridge_marker_expires_at is not None
+        assert (
+            store.resolve(
+                _message(
+                    thread_id=None,
+                    headers={"X-Hermes-Bridge": f"v1:{original.bridge_marker}"},
+                )
+            ).status
+            is ResolutionStatus.NO_MATCH
         )
 
-    with MappingStore(path) as reopened:
-        mappings = reopened.list_mappings()
-        assert len(mappings) == 1
-        assert mappings[0].hermes_session == "persisted-session"
-        assert reopened.resolve(_message(thread_id="persisted-thread")) is not None
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE mappings SET bridge_marker_expires_at = ? WHERE id = ?",
+            ((datetime.now(UTC) - timedelta(days=1)).isoformat(), original.id),
+        )
+    with MappingStore(path) as store:
+        expired = store.resolve(
+            _message(
+                thread_id=None,
+                headers={"X-Hermes-Bridge": f"v1:{rotated.bridge_marker}"},
+            )
+        )
+        assert expired.status is ResolutionStatus.DENIED
+        assert expired.matched_by == "expired_bridge_marker"
+
+
+def test_v0_database_migrates_without_data_loss(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE mappings (
+                id INTEGER PRIMARY KEY, provider TEXT NOT NULL, hermes_session TEXT NOT NULL,
+                hermes_topic TEXT, provider_thread_id TEXT, subject_key TEXT,
+                participant_email TEXT, bridge_marker TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX mappings_provider_thread
+                ON mappings(provider, provider_thread_id)
+                WHERE provider_thread_id IS NOT NULL;
+            INSERT INTO mappings VALUES (
+                1, 'agentmail', 'legacy-session', NULL, 'legacy-thread', 'legacy',
+                'person@example.com', 'abcdefghijklmnopqrstuvwxyz_123456',
+                '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00'
+            );
+            """
+        )
+    with MappingStore(path) as store:
+        mapping = store.list_mappings()[0]
+        assert mapping.hermes_session == "legacy-session"
+        assert mapping.bridge_marker_expires_at is None
+        assert (
+            store.resolve(_message(thread_id="legacy-thread")).status is ResolutionStatus.AUTHORIZED
+        )
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_rejects_newer_database_version(tmp_path: Path) -> None:
+    path = tmp_path / "future.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA user_version = 99")
+    with pytest.raises(RuntimeError, match="newer than supported"):
+        MappingStore(path)
+
+
+def test_ongoing_raw_retention_preserves_processed_record_and_secure_new_file(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "bridge.db"
+    old = _message(message_id="old", thread_id=None)
+    with MappingStore(path) as store:
+        store.mark_processed(old, "done", store_raw=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE processed_messages SET processed_at = ? WHERE message_id = 'old'",
+            ((datetime.now(UTC) - timedelta(days=31)).isoformat(),),
+        )
+    with MappingStore(path) as store:
+        store.mark_processed(
+            _message(message_id="new", thread_id=None),
+            "done",
+            store_raw=True,
+            raw_retention_days=30,
+        )
+        assert store.is_processed("agentmail", "old")
+    with sqlite3.connect(path) as connection:
+        assert connection.execute(
+            "SELECT raw_payload FROM processed_messages WHERE message_id = 'old'"
+        ).fetchone() == (None,)
+    if os.name == "posix":
+        assert path.stat().st_mode & 0o777 == 0o600
+        assert path.parent.stat().st_mode & 0o777 == 0o700

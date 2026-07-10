@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from .models import NormalizedEmail, PollSummary
+from .models import NormalizedEmail, PollSummary, ResolutionStatus
 from .providers.base import EmailProvider
 from .runner import HermesRunner
 from .store import MappingStore
@@ -21,7 +21,9 @@ class BridgeService:
         runner: HermesRunner,
         send_replies: bool = False,
         dry_run: bool = True,
-        store_raw: bool = True,
+        store_raw: bool = False,
+        raw_retention_days: int = 30,
+        allow_subject_resume: bool = False,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -29,6 +31,9 @@ class BridgeService:
         self.send_replies = send_replies
         self.dry_run = dry_run
         self.store_raw = store_raw
+        self.raw_retention_days = raw_retention_days
+        self.allow_subject_resume = allow_subject_resume
+        self.store.purge_raw(raw_retention_days)
 
     def handle(self, message: NormalizedEmail) -> str:
         context: dict[str, object] = {
@@ -52,13 +57,31 @@ class BridgeService:
                 **context,
             },
         )
-        resolved = self.store.resolve(message)
-        mapping = resolved.mapping if resolved else None
+        resolution = self.store.resolve(message, allow_subject_resume=self.allow_subject_resume)
+        if resolution.status is ResolutionStatus.DENIED:
+            logger.warning(
+                "message denied",
+                extra={
+                    "event": "message_denied",
+                    "reason": resolution.matched_by,
+                    "sender_authentication": message.sender_authentication,
+                    **context,
+                },
+            )
+            self.store.mark_processed(
+                message,
+                "authorization_denied",
+                store_raw=False,
+                raw_retention_days=self.raw_retention_days,
+            )
+            return "skipped"
+
+        mapping = resolution.mapping
         logger.info(
-            "mapping found" if resolved else "mapping not found",
+            "mapping found" if mapping else "mapping not found",
             extra={
-                "event": "mapping_found" if resolved else "mapping_not_found",
-                "matched_by": resolved.matched_by if resolved else None,
+                "event": "mapping_found" if mapping else "mapping_not_found",
+                "matched_by": resolution.matched_by,
                 "hermes_session": mapping.hermes_session if mapping else None,
                 **context,
             },
@@ -99,7 +122,12 @@ class BridgeService:
             try:
                 reply_id = self.provider.reply(message, result.reply)
             except Exception:
-                self.store.mark_processed(message, "reply_failed", store_raw=self.store_raw)
+                self.store.mark_processed(
+                    message,
+                    "reply_failed",
+                    store_raw=self.store_raw,
+                    raw_retention_days=self.raw_retention_days,
+                )
                 logger.exception("reply failed", extra={"event": "reply_failed", **context})
                 raise
             if mapping:
@@ -110,7 +138,12 @@ class BridgeService:
                 extra={"event": "reply_sent", "reply_message_id": reply_id, **context},
             )
 
-        self.store.mark_processed(message, outcome, store_raw=self.store_raw)
+        self.store.mark_processed(
+            message,
+            outcome,
+            store_raw=self.store_raw,
+            raw_retention_days=self.raw_retention_days,
+        )
         return "processed"
 
     @staticmethod

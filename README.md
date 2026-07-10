@@ -10,7 +10,7 @@ AgentMail is the first adapter, not a core dependency. The bridge contract is in
 
 - AgentMail polling, message inspection, threaded replies, and verified webhooks
 - Provider-neutral typed message and attachment models
-- SQLite mappings by opaque bridge marker, `In-Reply-To`, `References`, provider thread, then exact normalized subject
+- Authorization-aware SQLite mappings bound to a provider-authenticated participant
 - Hermes session creation and resume through its non-interactive CLI
 - JSON structured logs with secret-field redaction
 - Persistent poll cursor, processed-message idempotency, and optional raw payload storage
@@ -66,7 +66,11 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_DB_PATH` | `~/.local/state/hermes-email-bridge/bridge.db` | SQLite database |
 | `EMAIL_BRIDGE_SEND_REPLIES` | `false` | Allow outbound replies |
 | `EMAIL_BRIDGE_DRY_RUN` | `true` | Skip provider send even when replies are enabled |
-| `EMAIL_BRIDGE_STORE_RAW` | `true` | Persist raw provider payloads for debugging |
+| `AGENTMAIL_BASE_URL` | `https://api.agentmail.to/v0` | HTTPS AgentMail API base URL |
+| `AGENTMAIL_ALLOW_INSECURE_LOCAL_HTTP` | `false` | Permit HTTP only to `localhost` or a loopback IP for local tests |
+| `EMAIL_BRIDGE_STORE_RAW` | `false` | Persist raw provider payloads for debugging |
+| `EMAIL_BRIDGE_RAW_RETENTION_DAYS` | `30` | Logical retention limit for opted-in raw payloads |
+| `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME` | `false` | Enable authenticated exact-participant subject fallback |
 | `EMAIL_BRIDGE_POLL_INTERVAL` | `30` | Continuous poll interval in seconds |
 | `EMAIL_BRIDGE_LOG_LEVEL` | `INFO` | Python log level |
 | `HERMES_COMMAND` | `hermes chat --quiet --source tool` | Shell-free Hermes command prefix |
@@ -74,6 +78,8 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `HERMES_TIMEOUT` | `300` | Invocation timeout in seconds |
 | `EMAIL_BRIDGE_WEBHOOK_HOST` | `127.0.0.1` | Webhook listen host |
 | `EMAIL_BRIDGE_WEBHOOK_PORT` | `8787` | Webhook listen port |
+| `EMAIL_BRIDGE_WEBHOOK_WORKERS` | `1` | Maximum concurrent webhook-triggered Hermes invocations |
+| `EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE` | `8` | Accepted webhook events waiting for a worker |
 
 For a named Hermes profile, point `HERMES_COMMAND` at that profile's Hermes wrapper. The bridge appends `--resume SESSION` when mapped and always appends `--query PROMPT`; it never invokes a shell.
 
@@ -104,6 +110,18 @@ List persistent mappings:
 hermes-email-bridge mappings
 ```
 
+Markers are masked in this output. Rotate one marker and reveal the replacement once:
+
+```bash
+hermes-email-bridge mappings rotate 1 --ttl-days 90
+```
+
+Purge retained raw payloads without deleting processed-message idempotency records:
+
+```bash
+hermes-email-bridge purge-raw --older-than-days 30
+```
+
 Run the webhook receiver:
 
 ```bash
@@ -111,7 +129,7 @@ hermes-email-bridge serve
 curl http://127.0.0.1:8787/healthz
 ```
 
-Expose `/webhooks` through HTTPS and register it for AgentMail's `message.received` event. `serve` refuses to start without `AGENTMAIL_WEBHOOK_SECRET` and verifies the exact raw body using AgentMail's Svix headers before parsing it. See AgentMail's [webhook setup](https://docs.agentmail.to/webhooks-overview) and [verification](https://docs.agentmail.to/webhook-verification) guides.
+Expose `/webhooks` through HTTPS and register it for AgentMail's `message.received` event. `serve` refuses to start without `AGENTMAIL_WEBHOOK_SECRET` and verifies the exact raw body using AgentMail's Svix headers before parsing it. Verified events enter a bounded queue; saturation returns HTTP 503 so the provider can retry. See AgentMail's [webhook setup](https://docs.agentmail.to/webhooks-overview) and [verification](https://docs.agentmail.to/webhook-verification) guides.
 
 To enable actual replies, change both safety gates deliberately:
 
@@ -144,7 +162,9 @@ with MappingStore("bridge.db") as store:
     print(f"X-Hermes-Bridge: v1:{mapping.bridge_marker}")
 ```
 
-The marker is a random opaque capability that only selects an existing database mapping. It does not encode a session, command, or configuration value.
+The marker is a random opaque capability that only selects an existing database mapping. It does not encode a session, command, or configuration value. New markers expire after 90 days by default and are valid only for the mapping's authenticated participant.
+
+`X-Hermes-Bridge` is still a bearer capability visible to every email recipient and to mail infrastructure that handles the message. Do not reuse or publish it; rotate it if the recipient set changes or a message containing it is exposed.
 
 ## Architecture
 
@@ -152,12 +172,13 @@ The marker is a random opaque capability that only selects an existing database 
 flowchart LR
     A["AgentMail poll or signed webhook"] --> B["AgentMail adapter"]
     B --> C["NormalizedEmail"]
-    C --> D["SQLite mapping resolver"]
-    D --> E["Hermes runner"]
+    C --> D{"Authenticated exact participant?"}
+    D -->|"denied"| J["Record denial; no Hermes or mapping mutation"]
+    D -->|"authorized / new"| E["SQLite resolver and Hermes runner"]
     E --> F{"Reply gates"}
     F -->|"disabled / dry-run"| G["Structured skip log"]
     F -->|"enabled"| H["Provider threaded reply"]
-    D --> I["Marker, message IDs, thread, subject"]
+    E --> I["Marker, message IDs, thread; optional subject"]
 ```
 
 The provider boundary is [`EmailProvider`](src/hermes_email_bridge/providers/base.py). An adapter implements `poll`, `get`, and `reply`; webhook parsing is optional. Core orchestration has no AgentMail imports.
@@ -167,9 +188,11 @@ Resolution order is:
 1. Existing opaque bridge marker from provider metadata or `X-Hermes-Bridge`
 2. `In-Reply-To`, then newest-to-oldest `References`
 3. Provider thread ID
-4. Exact normalized subject, preferring the same correspondent
+4. Exact normalized subject and participant, only when `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME=true`
 
-Every successful match links the inbound and outbound message IDs to the mapping, improving subsequent reply matching.
+Every resume path is an authorization decision: the provider must classify the sender as authenticated and the normalized sender address must exactly match the mapping's non-null participant. AgentMail authentication comes only from its signed event type or API `received`/`unauthenticated` classification. Raw `Authentication-Results` headers are untrusted and ignored. Failed, missing, or unknown authentication never invokes Hermes, sends a reply, or changes a mapping.
+
+Every authorized match links the inbound and outbound message IDs to the mapping, improving subsequent reply matching. Provider thread IDs are unique per authenticated participant; conflicting attempts cannot overwrite an existing Hermes session.
 
 ## Trust boundary
 
@@ -181,10 +204,11 @@ Additional safeguards:
 - Configurable replies plus independent dry-run gate
 - No shell evaluation of `HERMES_COMMAND`
 - API keys and webhook secrets never logged
-- Processed message IDs prevent duplicate Hermes invocations
-- Raw payloads are stored only in SQLite, never emitted in normal logs
+- Processed message IDs plus in-process webhook coalescing prevent duplicate Hermes invocations
+- AgentMail bearer credentials are sent only to a validated HTTPS origin; redirects are rejected
+- Raw payloads default off and, when enabled, are stored only in SQLite and logically purged after the configured retention period
 
-Raw emails can contain sensitive data. Protect the SQLite database or set `EMAIL_BRIDGE_STORE_RAW=false`.
+Raw emails can contain sensitive data. Leave `EMAIL_BRIDGE_STORE_RAW=false` unless debugging requires them. The bridge creates a new state directory with mode `0700` and a new database with mode `0600` on POSIX systems, but existing directories, database copies, SQLite sidecars, and backups remain the operator's responsibility. Logical purge sets expired payloads to `NULL`; use your normal SQLite maintenance if physical page reclamation is required.
 
 ## Development
 
@@ -196,7 +220,7 @@ uv run mypy
 uv run python -m build
 ```
 
-Tests cover normalization, all requested mapping paths, SQLite persistence, dry-run behavior, the fake provider contract, the subprocess runner, and webhook verification.
+Tests cover authentication and spoofing rejection, every mapping path, schema migration, marker rotation and expiry, raw retention, URL and redirect rejection, bounded webhook processing, normalization, dry-run behavior, the subprocess runner, and Svix verification.
 
 ## AgentMail notes and current limits
 
@@ -207,6 +231,7 @@ Current deliberate limits:
 - Attachment metadata is normalized; attachment content is not downloaded or sent to Hermes.
 - WebSockets are not implemented because polling and production webhooks cover the initial use cases.
 - One process is configured for one AgentMail inbox.
+- Webhook duplicate coalescing is in-process; multi-process deployments need a durable database claim or lease.
 - A provider reply failure is recorded and logged but is not automatically retried; use the log context for manual recovery.
 
 See the current AgentMail [message API](https://docs.agentmail.to/messages) and [list endpoint](https://docs.agentmail.to/api-reference/inboxes/messages/list) for upstream behavior.

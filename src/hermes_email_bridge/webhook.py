@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import logging
+import queue
 import threading
 import time
 from collections.abc import Mapping
@@ -64,6 +65,84 @@ def verify_svix(
         raise WebhookVerificationError("invalid webhook signature")
 
 
+class WebhookDispatcher:
+    """Bound Hermes work with a fixed worker count and queue."""
+
+    def __init__(
+        self,
+        service: BridgeService,
+        provider: EmailProvider,
+        *,
+        worker_count: int = 1,
+        queue_size: int = 8,
+    ) -> None:
+        if worker_count <= 0 or queue_size <= 0:
+            raise ValueError("worker_count and queue_size must be positive")
+        self.service = service
+        self.provider = provider
+        self._queue: queue.Queue[tuple[str | None, dict[str, Any]] | None] = queue.Queue(queue_size)
+        self._lock = threading.Lock()
+        self._pending: set[str] = set()
+        self._stopped = False
+        self._workers = [
+            threading.Thread(target=self._run, name=f"webhook-worker-{index + 1}")
+            for index in range(worker_count)
+        ]
+        for worker in self._workers:
+            worker.start()
+
+    def submit(self, payload: dict[str, Any]) -> bool:
+        key = _payload_key(payload)
+        with self._lock:
+            if self._stopped:
+                return False
+            if key and key in self._pending:
+                return True
+            if key:
+                self._pending.add(key)
+            try:
+                self._queue.put_nowait((key, payload))
+            except queue.Full:
+                if key:
+                    self._pending.remove(key)
+                return False
+        return True
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                key, payload = item
+                _process_payload(self.service, self.provider, payload)
+                if key:
+                    with self._lock:
+                        self._pending.remove(key)
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if self._stopped:
+                return
+            self._stopped = True
+        for _worker in self._workers:
+            self._queue.put(None)
+        for worker in self._workers:
+            worker.join()
+
+
+def _payload_key(payload: dict[str, Any]) -> str | None:
+    message = payload.get("message")
+    if isinstance(message, dict) and message.get("message_id"):
+        return str(message["message_id"])
+    for field in ("message_id", "event_id"):
+        if payload.get(field):
+            return str(payload[field])
+    return None
+
+
 def serve_webhooks(
     *,
     service: BridgeService,
@@ -71,6 +150,8 @@ def serve_webhooks(
     secret: str,
     host: str,
     port: int,
+    worker_count: int = 1,
+    queue_size: int = 8,
 ) -> None:
     """Serve `/webhooks` and `/healthz` until interrupted."""
 
@@ -108,11 +189,9 @@ def serve_webhooks(
                 )
                 self.send_error(400, "invalid webhook")
                 return
-            threading.Thread(
-                target=_process_payload,
-                args=(service, provider, payload),
-                daemon=True,
-            ).start()
+            if not dispatcher.submit(payload):
+                self.send_error(503, "webhook queue full")
+                return
             self.send_response(204)
             self.end_headers()
 
@@ -121,7 +200,14 @@ def serve_webhooks(
                 "webhook request", extra={"event": "webhook_request", "detail": format % args}
             )
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    dispatcher = WebhookDispatcher(
+        service, provider, worker_count=worker_count, queue_size=queue_size
+    )
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except Exception:
+        dispatcher.shutdown()
+        raise
     logger.info(
         "webhook server started",
         extra={"event": "webhook_server_started", "host": host, "port": port},
@@ -130,6 +216,7 @@ def serve_webhooks(
         server.serve_forever()
     finally:
         server.server_close()
+        dispatcher.shutdown()
 
 
 def _process_payload(

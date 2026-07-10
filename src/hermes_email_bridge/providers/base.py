@@ -9,7 +9,11 @@ from ..models import NormalizedEmail, PollResult
 
 
 class EmailProvider(ABC):
-    """Minimum contract for inbound polling, inspection, webhooks, and replies."""
+    """Minimum contract for inbound polling, inspection, webhooks, and replies.
+
+    Adapters must set ``sender_authentication`` only from provider-trusted API
+    classification or a verified webhook event, never from raw email headers.
+    """
 
     name: str
 
@@ -26,6 +30,6 @@ class EmailProvider(ABC):
         """Reply in the provider's existing email thread and return its message ID."""
 
     def parse_webhook(self, payload: dict[str, Any]) -> NormalizedEmail | None:
-        """Normalize a webhook payload, or ignore unsupported event types."""
+        """Normalize a verified webhook payload, or ignore unsupported event types."""
 
         raise NotImplementedError(f"{self.name} does not support webhooks")

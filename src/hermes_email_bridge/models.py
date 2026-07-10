@@ -4,7 +4,24 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
+
+
+class SenderAuthentication(StrEnum):
+    """Provider-asserted sender authentication state."""
+
+    AUTHENTICATED = "authenticated"
+    UNAUTHENTICATED = "unauthenticated"
+    UNKNOWN = "unknown"
+
+
+class ResolutionStatus(StrEnum):
+    """Authorization-aware mapping resolution outcome."""
+
+    AUTHORIZED = "authorized"
+    DENIED = "denied"
+    NO_MATCH = "no_match"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +53,7 @@ class NormalizedEmail:
     thread_id: str | None = None
     attachments: tuple[Attachment, ...] = ()
     raw_payload: dict[str, Any] = field(default_factory=dict)
+    sender_authentication: SenderAuthentication = SenderAuthentication.UNKNOWN
 
     def as_dict(self, *, include_raw: bool = False) -> dict[str, Any]:
         value = asdict(self)
@@ -57,14 +75,16 @@ class ConversationMapping:
     subject_key: str | None
     participant_email: str | None
     bridge_marker: str
+    bridge_marker_expires_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
-class ResolvedMapping:
-    mapping: ConversationMapping
-    matched_by: str
+class MappingResolution:
+    status: ResolutionStatus
+    mapping: ConversationMapping | None = None
+    matched_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
