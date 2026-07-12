@@ -37,6 +37,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     wrapper_path = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
     fetcher_path = ROOT / "deploy/macos/fetch-hermes-email-agent.py"
     probe_path = ROOT / "deploy/macos/verify-hermes-email-agent.py"
+    runtime_installer_path = ROOT / "deploy/macos/install-hermes-email-runtime.py"
     installer_path = ROOT / "deploy/macos/install-hermes-email-agent.py"
     sudoers_path = ROOT / "deploy/macos/hermes-email-agent.sudoers"
     plist_text = plist_path.read_text()
@@ -55,6 +56,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
         assert wrapper_path.stat().st_mode & 0o111
         assert fetcher_path.stat().st_mode & 0o111
         assert probe_path.stat().st_mode & 0o111
+        assert runtime_installer_path.stat().st_mode & 0o111
         assert installer_path.stat().st_mode & 0o111
         assert not sudoers_path.stat().st_mode & 0o111
 
@@ -79,9 +81,14 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "ProxyHandler({})" in fetcher
     assert "MAX_DOWNLOAD_BYTES" in fetcher
     assert "PROVENANCE_FILE" in fetcher
-    probe = probe_path.read_text()
-    assert "get_tool_definitions" in probe
-    assert 'enabled_toolsets=["context_engine"]' in probe
+    runtime_installer = runtime_installer_path.read_text()
+    assert "get_tool_definitions" in runtime_installer
+    assert 'enabled_toolsets=["context_engine"]' in runtime_installer
+    assert "--no-editable" in runtime_installer
+    assert "LOCK_SHA256" in runtime_installer
+    assert "runtime-attestation.json" in runtime_installer
+    assert "temporary_probe_home" in runtime_installer
+    assert "/var/db/hermes-email-agent" not in runtime_installer
 
     plist = plistlib.loads(plist_path.read_bytes())
     assert plist["RunAtLoad"] is True
@@ -134,6 +141,8 @@ def test_macos_isolation_installation_requirements_are_documented() -> None:
     for pin in (
         "4281151ae859241351ba14d8c7682dc67ff4c126",
         "731f785d0373c81e7fb3d18ac5f4a1b6f9d6e3b94d2ae56a5b63133045bd2c68",
+        "8d03d04a404c641e1c9642f0482e2d8752c57da02da94d612a5f30883b25fbca",
+        "f63ec276fa13f8f392542a334c0f58f36833b24304831e5f4c221e2edf7a16f3",
     ):
         assert pin in readme
     assert "codeload.github.com/NousResearch/hermes-agent/tar.gz/" in readme
@@ -162,9 +171,18 @@ def test_macos_launcher_sources_realistic_protected_environment(tmp_path: Path) 
         f"EMAIL_BRIDGE_DB_PATH='{tmp_path / 'state/bridge.db'}'\n"
     )
     env_file.chmod(0o600)
+    launcher = tmp_path / "run-email-bridge.sh"
+    launcher_text = (ROOT / "deploy/macos/run-email-bridge.sh").read_text()
+    assert launcher_text.index("/usr/local/libexec/verify-hermes-email-agent.py") < (
+        launcher_text.index('. "$EMAIL_BRIDGE_ENV_FILE"')
+    )
+    launcher.write_text(
+        launcher_text.replace("/usr/local/libexec/verify-hermes-email-agent.py", "/usr/bin/true")
+    )
+    launcher.chmod(0o755)
 
     result = subprocess.run(
-        [str(ROOT / "deploy/macos/run-email-bridge.sh")],
+        [str(launcher)],
         env={
             "EMAIL_BRIDGE_ENV_FILE": str(env_file),
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),

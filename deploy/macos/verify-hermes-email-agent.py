@@ -1,44 +1,38 @@
 #!/usr/bin/python3
 # ruff: noqa: UP045 -- deployed system Python is macOS 3.9
-"""Verify pinned Hermes source, zero-schema runtime, wrapper contract, and optional live resume."""
+"""Verify the fixed Hermes runtime attestation and optionally run a live canary."""
 
 from __future__ import annotations
 
 import argparse
+import grp
+import importlib.util
 import json
+import pwd
 import re
 import runpy
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 INSTALL_ROOT = Path("/Library/Application Support/HermesEmailAgent/hermes-agent")
-SOURCE = INSTALL_ROOT / "source"
-VENV_PYTHON = INSTALL_ROOT / "venv/bin/python"
 WRAPPER = Path("/usr/local/libexec/hermes-email-agent")
-FETCHER = Path(__file__).with_name("fetch-hermes-email-agent.py")
+RUNTIME_INSTALLER = Path(__file__).with_name("install-hermes-email-runtime.py")
 _SESSION = re.compile(r"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9_-]{0,127})\s*$")
-_RUNTIME_CODE = r"""
-import json, sys
-sys.path.insert(0, sys.argv[1])
-import toolsets
-assert toolsets.validate_toolset("context_engine") is True
-assert toolsets.resolve_toolset("context_engine") == []
-from model_tools import get_tool_definitions
-definitions = get_tool_definitions(enabled_toolsets=["context_engine"], quiet_mode=True)
-assert definitions == []
-print(json.dumps({"tool_schemas": len(definitions), "toolset": "context_engine"}, sort_keys=True))
-"""
-_SOURCE_CODE = r"""
-import json, sys
-sys.path.insert(0, sys.argv[1])
-import toolsets
-assert toolsets.validate_toolset("context_engine") is True
-resolved = toolsets.resolve_toolset("context_engine")
-assert resolved == []
-print(json.dumps({"resolved_tools": len(resolved), "toolset": "context_engine"}, sort_keys=True))
-"""
+
+
+def _runtime_module() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "hermes_email_runtime_installer", RUNTIME_INSTALLER
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load fixed runtime verifier")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def verify_wrapper_shapes(wrapper: Path) -> None:
@@ -56,56 +50,11 @@ def verify_wrapper_shapes(wrapper: Path) -> None:
         raise ValueError("wrapper new/resume argument contract is invalid")
 
 
-def verify_runtime(
-    source: Path,
-    python: Path,
-    *,
-    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> None:
-    result = runner(
-        [str(python), "-I", "-c", _RUNTIME_CODE, str(source)],
-        capture_output=True,
-        check=False,
-        env={
-            "HOME": "/var/db/hermes-email-agent",
-            "HERMES_HOME": "/var/db/hermes-email-agent",
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "LANG": "C",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
-        text=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise ValueError("Hermes zero-schema runtime probe failed")
-    if result.stderr or json.loads(result.stdout) != {
-        "tool_schemas": 0,
-        "toolset": "context_engine",
-    }:
-        raise ValueError("Hermes zero-schema runtime probe returned unexpected output")
-
-
-def verify_source_toolset(
-    source: Path,
-    *,
-    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-) -> None:
-    result = runner(
-        ["/usr/bin/python3", "-I", "-c", _SOURCE_CODE, str(source)],
-        capture_output=True,
-        check=False,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "LANG": "C",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
-        text=True,
-        timeout=60,
-    )
-    if result.returncode != 0 or result.stderr:
-        raise ValueError("Hermes pinned-source toolset probe failed")
-    if json.loads(result.stdout) != {"resolved_tools": 0, "toolset": "context_engine"}:
-        raise ValueError("Hermes pinned-source toolset probe returned unexpected output")
+def verify_fixed_wrapper(runtime: Any, *, uid: int, gid: int) -> None:
+    runtime.verify_usr_local_chain(WRAPPER, uid=uid, gid=gid)
+    runtime._safe_details(WRAPPER, expected_uid=uid, expected_gid=gid, exact_mode=0o755)
+    runtime.reject_acls([WRAPPER])
+    verify_wrapper_shapes(WRAPPER)
 
 
 def _live_call(
@@ -148,51 +97,35 @@ def verify_live(
         raise ValueError("Hermes live resume did not preserve the session ID")
 
 
-def verify_provenance(source: Path) -> None:
-    result = subprocess.run(
-        ["/usr/bin/python3", str(FETCHER), "--target", str(source), "--verify"],
-        capture_output=True,
-        check=False,
-        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
-        text=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        raise ValueError("Hermes source provenance verification failed")
-
-
 def main(arguments: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", type=Path, default=SOURCE)
-    parser.add_argument("--python", type=Path, default=VENV_PYTHON)
-    parser.add_argument("--wrapper", type=Path, default=WRAPPER)
     parser.add_argument("--live", action="store_true")
-    parser.add_argument(
-        "--source-only",
-        action="store_true",
-        help="verify provenance/toolset source before the pinned venv is installed",
-    )
     args = parser.parse_args(arguments)
-    verify_provenance(args.source)
-    verify_wrapper_shapes(args.wrapper)
-    if args.source_only:
-        verify_source_toolset(args.source)
-    else:
-        verify_runtime(args.source, args.python)
+    runtime = _runtime_module()
+    uid = pwd.getpwnam("root").pw_uid
+    gid = grp.getgrnam("wheel").gr_gid
+    runtime.verify_source_cli()
+    evidence = runtime.verify_attestation(runtime.build_paths(), uid=uid, gid=gid)
+    verify_fixed_wrapper(runtime, uid=uid, gid=gid)
     if args.live:
         verify_live()
     print(
         json.dumps(
             {
-                "live": args.live,
-                "provenance": "verified",
-                "source_only": args.source_only,
-                "tool_schemas": None if args.source_only else 0,
-            }
+                "attestation": "verified",
+                "live_canary": args.live,
+                "tool_schemas": evidence["tool_schemas"],
+                "version": evidence["version"],
+            },
+            sort_keys=True,
         )
     )
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        print(f"Hermes runtime verification failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from None

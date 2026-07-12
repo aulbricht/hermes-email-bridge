@@ -4,9 +4,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tarfile
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -204,3 +206,109 @@ def test_fetcher_uses_fixed_proxy_free_https_origin(
         handler for handler in captured if isinstance(handler, urllib.request.ProxyHandler)
     )
     assert vars(proxy_handler).get("proxies") == {}
+
+
+def _fixed_root(tmp_path: Path) -> Path:
+    root = tmp_path / "system"
+    (root / "Library/Application Support").mkdir(parents=True)
+    for path in (root, root / "Library", root / "Library/Application Support"):
+        path.chmod(0o755)
+    return root
+
+
+def test_fixed_chain_creates_only_root_owned_production_directories(tmp_path: Path) -> None:
+    fetcher = _fetcher()
+    root = _fixed_root(tmp_path)
+    uid, gid = os.getuid(), os.getgid()
+    with fetcher.fixed_source_target(
+        root,
+        expected_uid=uid,
+        wheel_gid=gid,
+        admin_gid=gid,
+        acl_checker=lambda _path: False,
+    ) as target:
+        assert target == root / "Library/Application Support/HermesEmailAgent/hermes-agent/source"
+        assert target.parent.stat().st_mode & 0o777 == 0o755
+    assert (root / "Library/Application Support/HermesEmailAgent").stat().st_mode & 0o777 == 0o755
+
+
+def test_fixed_chain_rejects_writable_ancestor(tmp_path: Path) -> None:
+    fetcher = _fetcher()
+    root = _fixed_root(tmp_path)
+    (root / "Library").chmod(0o777)
+    with (
+        pytest.raises(ValueError, match="mode 0755"),
+        fetcher.fixed_source_target(
+            root,
+            expected_uid=os.getuid(),
+            wheel_gid=os.getgid(),
+            admin_gid=os.getgid(),
+            acl_checker=lambda _path: False,
+        ),
+    ):
+        pass
+
+
+def test_fixed_chain_rejects_symlink_substitution(tmp_path: Path) -> None:
+    fetcher = _fetcher()
+    root = tmp_path / "system"
+    root.mkdir(mode=0o755)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    (root / "Library").symlink_to(attacker, target_is_directory=True)
+    with (
+        pytest.raises(ValueError, match="non-symlink"),
+        fetcher.fixed_source_target(
+            root,
+            expected_uid=os.getuid(),
+            wheel_gid=os.getgid(),
+            admin_gid=os.getgid(),
+            acl_checker=lambda _path: False,
+        ),
+    ):
+        pass
+
+
+@pytest.mark.parametrize("acl_name", ["Application Support", "HermesEmailAgent"])
+def test_fixed_chain_rejects_existing_or_inherited_default_acl(
+    tmp_path: Path, acl_name: str
+) -> None:
+    fetcher = _fetcher()
+    root = _fixed_root(tmp_path)
+
+    def acl_checker(path: Path) -> bool:
+        return path.name == acl_name
+
+    with (
+        pytest.raises(ValueError, match="unexpected ACL"),
+        fetcher.fixed_source_target(
+            root,
+            expected_uid=os.getuid(),
+            wheel_gid=os.getgid(),
+            admin_gid=os.getgid(),
+            acl_checker=acl_checker,
+        ),
+    ):
+        pass
+
+
+def test_source_verification_rejects_inherited_file_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fetcher = _fetcher()
+    archive = tmp_path / "source.tar.gz"
+    monkeypatch.setattr(fetcher, "ARCHIVE_SHA256", _archive(archive))
+    target = tmp_path / "source"
+    fetcher.extract_verified(archive, target)
+
+    def reject_readme(paths: Sequence[Path]) -> None:
+        if any(path.name == "README.md" for path in paths):
+            raise ValueError("inherited ACL")
+
+    with pytest.raises(ValueError, match="inherited ACL"):
+        fetcher.verify_installed(target, acl_validator=reject_readme)
+
+
+def test_fetcher_cli_rejects_arbitrary_target(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        _fetcher().main(["--target", str(tmp_path / "source")])

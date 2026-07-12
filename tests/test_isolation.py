@@ -189,57 +189,6 @@ print(f"session_id: {session}", file=sys.stderr)
     assert "warning" not in (resumed.stdout + resumed.stderr).lower()
 
 
-def test_runtime_probe_uses_pinned_source_seam_and_zero_schema_contract(tmp_path: Path) -> None:
-    probe = _load_probe()
-    calls: list[tuple[list[str], dict[str, str]]] = []
-
-    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        calls.append((argv, kwargs["env"]))
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout='{"tool_schemas": 0, "toolset": "context_engine"}\n',
-            stderr="",
-        )
-
-    source = tmp_path / "source"
-    python = tmp_path / "venv/bin/python"
-    probe.verify_runtime(source, python, runner=runner)
-    assert calls[0][0][:4] == [str(python), "-I", "-c", probe._RUNTIME_CODE]
-    assert calls[0][0][4] == str(source)
-    assert calls[0][1] == {
-        "HOME": "/var/db/hermes-email-agent",
-        "HERMES_HOME": "/var/db/hermes-email-agent",
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-        "LANG": "C",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-
-
-def test_source_probe_suppresses_bytecode_writes(tmp_path: Path) -> None:
-    probe = _load_probe()
-    calls: list[tuple[list[str], dict[str, str]]] = []
-
-    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        calls.append((argv, kwargs["env"]))
-        return subprocess.CompletedProcess(
-            argv,
-            0,
-            stdout='{"resolved_tools": 0, "toolset": "context_engine"}\n',
-            stderr="",
-        )
-
-    source = tmp_path / "source"
-    probe.verify_source_toolset(source, runner=runner)
-    assert calls[0][0][:4] == ["/usr/bin/python3", "-I", "-c", probe._SOURCE_CODE]
-    assert calls[0][0][4] == str(source)
-    assert calls[0][1] == {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-        "LANG": "C",
-        "PYTHONDONTWRITEBYTECODE": "1",
-    }
-
-
 def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
     probe = _load_probe()
     probe.verify_wrapper_shapes(WRAPPER_PATH)
@@ -262,3 +211,16 @@ def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
     probe.verify_live(runner=runner)
     assert calls[0][-2] == "--query"
     assert calls[1][-4:-2] == ["--resume", "live_session"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--source", "/tmp/source"],
+        ["--python", "/tmp/venv/bin/python"],
+        ["--wrapper", "/tmp/wrapper"],
+    ],
+)
+def test_runtime_verifier_cli_rejects_arbitrary_runtime_paths(arguments: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        _load_probe().main(arguments)

@@ -3,6 +3,8 @@ set -eu
 
 umask 077
 
+/usr/local/libexec/verify-hermes-email-agent.py 1>&2
+
 : "${EMAIL_BRIDGE_ENV_FILE:?EMAIL_BRIDGE_ENV_FILE is required}"
 if [ ! -f "$EMAIL_BRIDGE_ENV_FILE" ]; then
     echo "email bridge environment file does not exist" >&2

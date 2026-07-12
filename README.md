@@ -275,10 +275,12 @@ component from the repository or from another Hermes user's state directory.
    `EMAIL_BRIDGE_VENV` to the Python 3.11+ environment, then set the file to mode `0600`.
 4. Replace every `__PLACEHOLDER__` in the plist, including a unique label, absolute paths,
    and a neutral bridge `HOME`. Keep the plist free of secrets.
-5. Run `init-db --start-now`, add initial exact addresses with `allowlist add`, then load
-   the plist as a user LaunchAgent.
+5. Run `init-db --start-now`, add initial exact addresses with `allowlist add`, run the fixed
+   runtime verifier and live canary below, then load the plist as a user LaunchAgent.
 
-The template uses umask `077`, a neutral working directory, stderr-only logging,
+The launcher runs the root-owned fixed runtime verifier before reading the bridge environment
+file, so a stale or modified runtime fails before bridge secrets enter the process. The template
+uses umask `077`, a neutral working directory, stderr-only logging,
 `RunAtLoad`, restart after unsuccessful exit, and a 30-second launchd throttle. The bridge
 does not internally retry permanent authentication, configuration, or malformed-response
 failures; launchd will still restart an unsuccessful process, so unload the LaunchAgent while
@@ -362,44 +364,85 @@ Its independently verified SHA-256 is
 that fixed HTTPS URL without environment proxies or redirects, caps transfer/extraction,
 rejects unsafe archive members, records commit/archive/source provenance, verifies source
 version 0.18.2, requires the staging parent and installed tree to remain owned by the
-installer account without group/other write access, and atomically stages the source:
+installer account without group/other write access, rejects named and inherited ACLs, and
+atomically stages the source. Its production CLI accepts only the fixed path. It anchors and
+validates `/` and `/Library` as root:wheel `0755`, `/Library/Application Support` as root:admin
+`0755`, and the created `HermesEmailAgent`, `hermes-agent`, and `source` directories as
+root:wheel `0755` using no-follow directory descriptors:
 
 ```bash
-install -d -o root -g wheel -m 0755 \
-  '/Library/Application Support/HermesEmailAgent/hermes-agent'
-sudo /usr/bin/python3 deploy/macos/fetch-hermes-email-agent.py \
-  --target '/Library/Application Support/HermesEmailAgent/hermes-agent/source'
-sudo /usr/bin/python3 deploy/macos/fetch-hermes-email-agent.py \
-  --target '/Library/Application Support/HermesEmailAgent/hermes-agent/source' --verify
+sudo /usr/bin/python3 deploy/macos/fetch-hermes-email-agent.py
+/usr/bin/python3 deploy/macos/fetch-hermes-email-agent.py --verify
 ```
 
-Create the pinned installation virtual environment at
-`/Library/Application Support/HermesEmailAgent/hermes-agent/venv` from that source:
+The reviewed source's `uv.lock` SHA-256 is
+`8d03d04a404c641e1c9642f0482e2d8752c57da02da94d612a5f30883b25fbca`. Install the
+reviewed arm64 macOS `uv` 0.11.16 binary at the one fixed root-owned path. The official archive
+SHA-256 is `2b25be1af546be330b340b0a76b99f989daa6d92678fdffb87438e661e9d88fb`; the extracted
+`uv` binary SHA-256 is `f63ec276fa13f8f392542a334c0f58f36833b24304831e5f4c221e2edf7a16f3`:
 
 ```bash
-sudo /usr/bin/env -i PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
-  uv venv --python 3.11 \
-  '/Library/Application Support/HermesEmailAgent/hermes-agent/venv'
-sudo /usr/bin/env -i PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
-  uv pip install \
-  --python '/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/python' \
-  --editable '/Library/Application Support/HermesEmailAgent/hermes-agent/source'
+uv_stage=$(mktemp -d)
+curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
+  https://github.com/astral-sh/uv/releases/download/0.11.16/uv-aarch64-apple-darwin.tar.gz \
+  --output "$uv_stage/uv.tar.gz"
+echo '2b25be1af546be330b340b0a76b99f989daa6d92678fdffb87438e661e9d88fb  uv.tar.gz' \
+  | (cd "$uv_stage" && shasum -a 256 -c -)
+tar -xzf "$uv_stage/uv.tar.gz" -C "$uv_stage"
+echo 'f63ec276fa13f8f392542a334c0f58f36833b24304831e5f4c221e2edf7a16f3  uv' \
+  | (cd "$uv_stage/uv-aarch64-apple-darwin" && shasum -a 256 -c -)
+sudo install -o root -g wheel -m 0755 \
+  "$uv_stage/uv-aarch64-apple-darwin/uv" /usr/local/libexec/hermes-email-uv
+rm -rf "$uv_stage"
 ```
+
+The Python 3.9-compatible runtime installer re-verifies source and lock provenance, then runs
+only that pinned `uv` as the unprivileged `_hermesmail` account with a minimal proxy-free
+environment. It uses `sync --frozen --no-dev --no-editable --python 3.11`, the exact fixed
+`UV_PROJECT_ENVIRONMENT`, and fixed managed-Python/cache/temp directories. Building as the
+unprivileged account prevents upstream build tooling from modifying the root-owned reviewed
+source. After a second source verification, it removes build state, changes the managed Python
+and venv trees to root:wheel, rejects writable paths, escaping symlinks, and ACLs, and installs
+the fixed verifier assets:
+
+```bash
+sudo /usr/bin/python3 deploy/macos/install-hermes-email-runtime.py --check
+sudo /usr/bin/python3 deploy/macos/install-hermes-email-runtime.py
+```
+
+The resulting root-owned `runtime-attestation.json` binds the archive, commit, source and lock
+digests, pinned `uv`, managed Python, console entrypoint, fixed verifier assets, and a canonical
+digest of every runtime file. Verification rejects editable installs, unexpected `direct_url`,
+imports outside the fixed venv's site-packages, wrong entrypoint/shebang, stale dependencies,
+writable paths, unsafe ownership/modes, ACLs, or changed runtime files.
 
 At the reviewed source, the wrapper's `--toolsets context_engine` validates, resolves to an empty
 tool list, and exposes zero schemas in safe mode. The values `none`, `no_mcp`, empty, and
 default fallbacks are forbidden.
 
-Before initial start and every Hermes upgrade, keep the LaunchAgent unloaded and rerun both
-the provenance verification and runtime contract probe against the installed source/venv:
+Before initial start and every Hermes upgrade, keep the LaunchAgent unloaded and verify the
+attestation. This read-only command is also executed automatically on every LaunchAgent start,
+before the environment file is sourced:
 
 ```bash
-sudo /usr/bin/python3 deploy/macos/verify-hermes-email-agent.py --live
+/usr/local/libexec/verify-hermes-email-agent.py
 ```
 
-Do not restart unless it reports verified codeload provenance, an answer on stdout, only
-`session_id:` metadata on stderr, exactly zero tool schemas, no warning, and successful new
-and resumed sessions. Resume remains enabled because the bridge requires persisted sessions.
+The verifier checks the actual fixed Python, `hermes` console script, non-editable distribution,
+import origins, lock/version, exactly zero tool schemas for `context_engine`, and offline
+new/resume parser shapes. Every offline install and startup probe creates its own invoking-user-owned
+mode `0700` temporary `HOME`/`HERMES_HOME` outside `/var/db/hermes-email-agent` and removes it on
+success or failure. Offline verification never reads or changes the real service home.
+It does not claim that a model answered. Before loading the LaunchAgent, separately run the live
+canary from the bridge account:
+
+```bash
+/usr/local/libexec/verify-hermes-email-agent.py --live
+```
+
+Do not load or restart unless attestation succeeds and the live canary returns the exact new and
+resumed answers with only `session_id:` metadata on stderr and no warning. Resume remains enabled
+because the bridge requires persisted sessions.
 
 The bridge command receives only `PATH` and present locale fields; it receives no bridge
 environment-file path, AgentMail/Composio/bridge variables, proxy variables, `PYTHONPATH`,
