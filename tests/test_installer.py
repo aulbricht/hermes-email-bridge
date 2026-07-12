@@ -341,6 +341,37 @@ def test_sudoers_replace_failure_restores_existing_authorized_files(tmp_path: Pa
     _assert_existing_restored(plan)
 
 
+@pytest.mark.parametrize("tampered", ["wrapper", "sudoers"])
+def test_final_byte_mismatch_restores_existing_authorized_files(
+    tmp_path: Path, tampered: str
+) -> None:
+    installer, plan, uid, gid = _fixture(tmp_path)
+    _existing_install(plan)
+
+    def replace_then_tamper(source: Path, destination: Path) -> None:
+        os.replace(source, destination)
+        if (tampered == "wrapper" and destination == plan.wrapper_destination) or (
+            tampered == "sudoers" and destination == plan.sudoers_destination
+        ):
+            destination.chmod(0o600)
+            destination.write_bytes(destination.read_bytes() + b" ")
+            destination.chmod(0o755 if tampered == "wrapper" else 0o440)
+
+    with pytest.raises(ValueError, match=r"installed .* bytes"):
+        installer.install(
+            plan,
+            "bridge_user",
+            expected_uid=uid,
+            expected_gid=gid,
+            mutate=True,
+            require_root=False,
+            acl_checker=_no_acl,
+            sudoers_validator=_valid_sudoers,
+            replacer=replace_then_tamper,
+        )
+    _assert_existing_restored(plan)
+
+
 def test_final_visudo_failure_restores_both_existing_files(tmp_path: Path) -> None:
     installer, plan, uid, gid = _fixture(tmp_path)
     _existing_install(plan)

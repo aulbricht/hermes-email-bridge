@@ -33,6 +33,13 @@ def _no_acl(_paths: Sequence[Path]) -> None:
     pass
 
 
+def _write_reviewed_build_metadata(source: Path) -> None:
+    (source / "pyproject.toml").write_text(
+        '[build-system]\nrequires = ["setuptools>=77.0,<83"]\n'
+        'build-backend = "setuptools.build_meta"\n'
+    )
+
+
 def _populate_generation(runtime: Any, paths: Any, label: str) -> None:
     python_real = paths.python_installs / "cpython-test/bin/python3.11"
     python_real.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +78,7 @@ def _fixture(
     runtime = _runtime()
     paths = runtime.build_paths(tmp_path / "Hermes Runtime/hermes-agent", tmp_path / "fixed-uv")
     paths.source.mkdir(parents=True)
+    _write_reviewed_build_metadata(paths.source)
     lock = paths.source / "uv.lock"
     lock.write_text("reviewed lock\n")
     monkeypatch.setattr(runtime, "LOCK_SHA256", hashlib.sha256(lock.read_bytes()).hexdigest())
@@ -131,6 +139,26 @@ def test_attestation_verifies_actual_import_and_entrypoint_seams(
     assert "--resume" not in parser_calls[0]
     resume_index = parser_calls[1].index("--resume")
     assert parser_calls[1][resume_index : resume_index + 2] == ["--resume", "probe_session"]
+
+
+def test_attestation_binds_build_identity_constraints_backend_and_boundary_hashes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, paths, _runner, _calls, _uid, _gid = _fixture(tmp_path, monkeypatch)
+    attestation = json.loads(paths.attestation.read_text())
+    assert attestation["build_account"] == "_hermesbuild"
+    assert attestation["build_backend"] == {
+        "artifact_sha256": runtime.BUILD_BACKEND_WHEEL_SHA256,
+        "name": "setuptools.build_meta",
+        "version": "81.0.0",
+    }
+    assert attestation["build_constraint_sha256"] == runtime.BUILD_CONSTRAINT_SHA256
+    assert attestation["build_isolation"] is True
+    assert attestation["build_require_hashes"] is True
+    assert attestation["dependency_sync_no_build"] is True
+    assert attestation["wrapper_sha256"] == runtime.WRAPPER_SHA256
+    assert attestation["sudoers_template_sha256"] == runtime.SUDOERS_TEMPLATE_SHA256
+    assert len(attestation["wheel_sha256"]) == 64
 
 
 def test_offline_probe_uses_private_temp_home_and_ignores_inaccessible_service_home(
@@ -308,30 +336,169 @@ def test_uv_command_is_frozen_fixed_and_secret_free(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime, paths, _runner, _calls, _uid, _gid = _fixture(tmp_path, monkeypatch)
-    command = runtime.uv_command(paths, "_hermesmail")
+    command = runtime.uv_command(paths, runtime.BUILD_ACCOUNT)
     assert command[:8] == [
         "/usr/bin/sudo",
         "-n",
         "-H",
         "-u",
-        "_hermesmail",
+        "_hermesbuild",
         "/usr/bin/env",
         "-i",
         "HOME=/var/empty",
     ]
-    assert command[-6:] == [
+    for required in (
         "--frozen",
         "--no-dev",
         "--no-editable",
         "--no-install-project",
+        "--no-build",
         "--python",
         "3.11",
-    ]
+    ):
+        assert required in command
+    build = runtime.uv_build_command(paths, runtime.BUILD_ACCOUNT)
+    assert "--force-pep517" in build
+    constraint_argument = build[build.index("--build-constraints") + 1]
+    assert constraint_argument == runtime.PRIVATE_BUILD_CONSTRAINT
+    assert not Path(constraint_argument).is_absolute()
+    assert " " not in constraint_argument
+    assert "--require-hashes" in build
+    assert "--no-build-isolation" not in build
+    assert build[build.index("--python") + 1] == "3.11"
+    install = runtime.uv_install_command(
+        paths, runtime.BUILD_ACCOUNT, paths.artifacts / "reviewed.whl"
+    )
+    assert "--no-deps" in install and "--no-build" in install
     assert "UV_PROJECT_ENVIRONMENT=" + str(paths.venv) in command
-    rendered = " ".join(command).lower()
+    rendered = " ".join([*command, *build, *install]).lower()
     assert "proxy" not in rendered
     assert "agentmail" not in rendered
     assert "composio" not in rendered
+    assert "_hermesmail" not in rendered
+
+
+@pytest.mark.parametrize(
+    "mutation,error",
+    [
+        ("backend", "backend"),
+        ("version", "constraint hash"),
+        ("hash", "constraint hash"),
+        ("missing", "missing"),
+        ("symlink", "missing or unsafe"),
+    ],
+)
+def test_reviewed_build_inputs_reject_unlisted_backend_and_changed_or_missing_hash(
+    tmp_path: Path, mutation: str, error: str
+) -> None:
+    runtime = _runtime()
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_reviewed_build_metadata(source)
+    constraint = tmp_path / runtime.BUILD_CONSTRAINT
+    constraint.write_bytes((ROOT / "deploy/macos" / runtime.BUILD_CONSTRAINT).read_bytes())
+    if mutation == "backend":
+        (source / "pyproject.toml").write_text(
+            '[build-system]\nrequires = ["hatchling==1.27.0"]\nbuild-backend = "hatchling.build"\n'
+        )
+    elif mutation == "version":
+        constraint.write_text(constraint.read_text().replace("81.0.0", "80.0.0"))
+    elif mutation == "hash":
+        constraint.write_text(constraint.read_text().replace("fdd925", "000000"))
+    elif mutation == "missing":
+        constraint.unlink()
+    else:
+        target = tmp_path / "attacker-constraint"
+        target.write_bytes(constraint.read_bytes())
+        constraint.unlink()
+        constraint.symlink_to(target)
+    with pytest.raises(ValueError, match=error):
+        runtime.verify_build_inputs(source, constraint)
+
+
+def test_private_build_constraint_requires_exact_owner_mode_and_no_acl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, paths, _runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    paths.build_source.mkdir(mode=0o700)
+    paths.build_constraint.write_bytes(
+        (ROOT / "deploy/macos" / runtime.BUILD_CONSTRAINT).read_bytes()
+    )
+    paths.build_constraint.chmod(0o600)
+    runtime.verify_private_build_constraint(
+        paths, build_uid=uid, build_gid=gid, acl_validator=_no_acl
+    )
+    paths.build_constraint.chmod(0o644)
+    with pytest.raises(ValueError, match="mode 0600"):
+        runtime.verify_private_build_constraint(
+            paths, build_uid=uid, build_gid=gid, acl_validator=_no_acl
+        )
+    paths.build_constraint.chmod(0o600)
+    with pytest.raises(ValueError, match="ownership"):
+        runtime.verify_private_build_constraint(
+            paths, build_uid=uid + 1, build_gid=gid, acl_validator=_no_acl
+        )
+
+    def reject(_paths: Sequence[Path]) -> None:
+        raise ValueError("injected build constraint ACL")
+
+    with pytest.raises(ValueError, match="constraint ACL"):
+        runtime.verify_private_build_constraint(
+            paths, build_uid=uid, build_gid=gid, acl_validator=reject
+        )
+
+
+def test_sdist_only_dependency_fails_closed_under_wheel_only_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, paths, _runner, _calls, _uid, _gid = _fixture(tmp_path, monkeypatch)
+    command = runtime.uv_command(paths, runtime.BUILD_ACCOUNT)
+    assert "--no-build" in command
+
+    def sdist_only(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert argv == command
+        return subprocess.CompletedProcess(
+            argv, 1, "", "no usable wheels; source distribution rejected by --no-build"
+        )
+
+    with pytest.raises(ValueError, match="generation command failed"):
+        runtime._run_build_command(command, runner=sdist_only)
+
+
+def test_build_account_requires_false_shell_empty_home_unique_group_and_no_supplementary_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    builder = pwd.struct_passwd(
+        ("_hermesbuild", "*", 9001, 9002, "", "/var/empty", "/usr/bin/false")
+    )
+    service = pwd.struct_passwd(
+        ("_hermesmail", "*", 9101, 9102, "", "/var/db/hermes-email-agent", "/usr/bin/false")
+    )
+    groups = {
+        "admin": runtime.grp.struct_group(("admin", "*", 80, [])),
+        "staff": runtime.grp.struct_group(("staff", "*", 20, [])),
+    }
+    monkeypatch.setattr(runtime.grp, "getgrnam", groups.__getitem__)
+    monkeypatch.setattr(
+        runtime.grp,
+        "getgrgid",
+        lambda _gid: runtime.grp.struct_group(("_hermesbuild", "*", 9002, [])),
+    )
+    monkeypatch.setattr(runtime.grp, "getgrall", lambda: [])
+
+    def hidden(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, "IsHidden: 1\n", "")
+
+    runtime.verify_build_account(builder, service, runner=hidden)
+
+    monkeypatch.setattr(
+        runtime.grp,
+        "getgrall",
+        lambda: [runtime.grp.struct_group(("extra", "*", 9999, ["_hermesbuild"]))],
+    )
+    with pytest.raises(ValueError, match="supplementary"):
+        runtime.verify_build_account(builder, service, runner=hidden)
 
 
 @pytest.mark.skipif(
@@ -399,6 +566,7 @@ def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -
     runtime = _runtime()
     paths = runtime.build_paths(tmp_path / "hermes-agent", tmp_path / "uv")
     paths.source.mkdir(parents=True)
+    _write_reviewed_build_metadata(paths.source)
     reviewed = paths.source / "uv.lock"
     reviewed.write_text("reviewed immutable source\n")
     paths.uv.write_text("reviewed uv\n")
@@ -444,7 +612,7 @@ def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -
                 paths,
                 root_uid=uid,
                 wheel_gid=gid,
-                build_user="_hermesmail",
+                build_user=runtime.BUILD_ACCOUNT,
                 build_uid=uid,
                 build_gid=gid,
                 runner=runner,
@@ -484,6 +652,7 @@ def test_rebase_resolves_tmp_alias_and_final_active_verification_passes(
     uid, gid = os.getuid(), os.getgid()
     try:
         paths.source.mkdir(parents=True)
+        _write_reviewed_build_metadata(paths.source)
         lock = paths.source / "uv.lock"
         lock.write_text("reviewed alias lock\n")
         monkeypatch.setattr(runtime, "LOCK_SHA256", hashlib.sha256(lock.read_bytes()).hexdigest())
@@ -567,7 +736,19 @@ def test_distinct_uid_builder_traverses_non_listable_stage_only_into_private_chi
     root.chmod(0o755)
     try:
         runtime, paths, runner, _calls, uid, gid = _fixture(root, monkeypatch)
-        builder = pwd.getpwnam("nobody")
+        try:
+            builder = pwd.getpwnam(runtime.BUILD_ACCOUNT)
+            service = pwd.getpwnam("_hermesmail")
+        except KeyError:
+            pytest.skip("fixed _hermesbuild and _hermesmail accounts are not installed")
+        runtime.verify_build_account(builder, service)
+        inference_home = root / "inference-auth"
+        inference_home.mkdir(mode=0o700)
+        os.chown(inference_home, service.pw_uid, service.pw_gid)
+        sentinel = inference_home / "auth-secret"
+        sentinel.write_text("must remain unreadable\n")
+        os.chown(sentinel, service.pw_uid, service.pw_gid)
+        sentinel.chmod(0o600)
         observed: dict[str, Any] = {}
 
         def build(stage: Any, **kwargs: Any) -> None:
@@ -612,9 +793,23 @@ def test_distinct_uid_builder_traverses_non_listable_stage_only_into_private_chi
                 check=False,
                 text=True,
             )
+            inference_read = subprocess.run(
+                [
+                    "/usr/bin/sudo",
+                    "-n",
+                    "-u",
+                    builder.pw_name,
+                    "/bin/cat",
+                    str(sentinel),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
             assert executed.returncode == 0 and output.read_text() == "passed"
             assert listed.returncode != 0
             assert sibling_read.returncode != 0
+            assert inference_read.returncode != 0
             observed["passed"] = True
             shutil.rmtree(private)
             shutil.rmtree(sibling)
@@ -696,7 +891,7 @@ def _install_with_fake_generation(
         paths,
         root_uid=uid,
         wheel_gid=gid,
-        build_user="_hermesmail",
+        build_user=runtime.BUILD_ACCOUNT,
         build_uid=uid,
         build_gid=gid,
         runner=runner,

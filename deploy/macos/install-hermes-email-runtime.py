@@ -37,12 +37,24 @@ LOCK_SHA256 = "8d03d04a404c641e1c9642f0482e2d8752c57da02da94d612a5f30883b25fbca"
 ARCHIVE_SHA256 = "731f785d0373c81e7fb3d18ac5f4a1b6f9d6e3b94d2ae56a5b63133045bd2c68"
 COMMIT = "4281151ae859241351ba14d8c7682dc67ff4c126"
 VERSION = "0.18.2"
+BUILD_ACCOUNT = "_hermesbuild"
+BUILD_CONSTRAINT = "hermes-email-build-constraints.txt"
+PRIVATE_BUILD_CONSTRAINT = ".hermes-email-build-constraints.txt"
+BUILD_CONSTRAINT_SHA256 = "a7d4688bc5ddc6d0bd3a0ee477b8f68c6bf7d4d27345cf9e54901d9e153e8f52"
+BUILD_BACKEND = "setuptools.build_meta"
+BUILD_BACKEND_VERSION = "81.0.0"
+BUILD_BACKEND_WHEEL_SHA256 = "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6"
+WRAPPER_SHA256 = "52c610e34d1156a0fa3bd60834940da56d10503d16b1d4589fe012ea6826d79c"
+SUDOERS_TEMPLATE_SHA256 = "f1e75514df00d4db04975426c2550762775f3adcf035f3dfa243e885bea1bb1b"
 FETCHER = Path(__file__).with_name("fetch-hermes-email-agent.py")
 PROVENANCE_FILE = ".hermes-email-agent-provenance.json"
 ATTESTATION_ASSETS = (
     "fetch-hermes-email-agent.py",
     "install-hermes-email-runtime.py",
     "verify-hermes-email-agent.py",
+    "hermes-email-agent-wrapper.py",
+    "hermes-email-agent.sudoers",
+    BUILD_CONSTRAINT,
 )
 BSD_MUTATION_FLAGS = sum(
     getattr(stat, name, 0) for name in ("UF_IMMUTABLE", "UF_APPEND", "SF_IMMUTABLE", "SF_APPEND")
@@ -97,6 +109,7 @@ class RuntimePaths:
     temporary: Path
     artifacts: Path
     build_source: Path
+    build_constraint: Path
 
 
 def build_paths(
@@ -117,6 +130,7 @@ def build_paths(
         temporary=generation / ".build-tmp",
         artifacts=generation / "artifacts",
         build_source=generation / ".build-source",
+        build_constraint=generation / ".build-source" / PRIVATE_BUILD_CONSTRAINT,
     )
 
 
@@ -126,6 +140,18 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def read_regular_nofollow(path: Path) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"required file is not a regular non-symlink: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            return stream.read()
+    finally:
+        os.close(descriptor)
 
 
 def _all_paths(root: Path) -> list[Path]:
@@ -309,6 +335,85 @@ def verify_lock(source: Path) -> None:
         raise ValueError("Hermes uv.lock does not match the reviewed lock")
 
 
+def verify_build_inputs(source: Path, constraint: Path) -> None:
+    try:
+        constraint_content = read_regular_nofollow(constraint)
+    except OSError as exc:
+        raise ValueError("reviewed build constraint is missing or unsafe") from exc
+    if hashlib.sha256(constraint_content).hexdigest() != BUILD_CONSTRAINT_SHA256:
+        raise ValueError("reviewed build constraint hash mismatch")
+    expected_constraint = (
+        f"setuptools=={BUILD_BACKEND_VERSION} \\\n    --hash=sha256:{BUILD_BACKEND_WHEEL_SHA256}\n"
+    )
+    try:
+        decoded_constraint = constraint_content.decode()
+    except UnicodeDecodeError as exc:
+        raise ValueError("reviewed build constraint must be UTF-8") from exc
+    if decoded_constraint != expected_constraint:
+        raise ValueError("reviewed build constraint content mismatch")
+    pyproject = source / "pyproject.toml"
+    if pyproject.is_symlink() or not pyproject.is_file():
+        raise ValueError("reviewed build metadata is missing or unsafe")
+    build_block = re.search(
+        r"(?ms)^\[build-system\]\s*\n"
+        r'requires = \["setuptools>=77\.0,<83"\]\s*\n'
+        r'build-backend = "([^"]+)"\s*$',
+        pyproject.read_text(),
+    )
+    if build_block is None or build_block.group(1) != BUILD_BACKEND:
+        raise ValueError("reviewed build backend is missing or unexpected")
+
+
+def verify_private_build_constraint(
+    paths: RuntimePaths,
+    *,
+    build_uid: int,
+    build_gid: int,
+    acl_validator: AclValidator,
+) -> None:
+    verify_build_inputs(paths.source, paths.build_constraint)
+    _safe_details(
+        paths.build_constraint,
+        expected_uid=build_uid,
+        expected_gid=build_gid,
+        exact_mode=0o600,
+    )
+    acl_validator([paths.build_constraint])
+
+
+def verify_build_account(
+    builder: pwd.struct_passwd,
+    service: pwd.struct_passwd,
+    *,
+    runner: Runner = subprocess.run,
+) -> None:
+    if builder.pw_name != BUILD_ACCOUNT or builder.pw_shell != "/usr/bin/false":
+        raise ValueError("fixed build account name or shell is unsafe")
+    if builder.pw_dir != "/var/empty" or builder.pw_uid in {0, service.pw_uid}:
+        raise ValueError("fixed build account home or UID is unsafe")
+    if builder.pw_gid in {
+        grp.getgrnam("admin").gr_gid,
+        grp.getgrnam("staff").gr_gid,
+        service.pw_gid,
+    }:
+        raise ValueError("fixed build account group is unsafe")
+    supplementary = [group.gr_name for group in grp.getgrall() if builder.pw_name in group.gr_mem]
+    if supplementary:
+        raise ValueError("fixed build account has supplementary group memberships")
+    if grp.getgrgid(builder.pw_gid).gr_name != BUILD_ACCOUNT:
+        raise ValueError("fixed build account primary group is unexpected")
+    hidden = runner(
+        ["/usr/bin/dscl", ".", "-read", f"/Users/{BUILD_ACCOUNT}", "IsHidden"],
+        capture_output=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
+        text=True,
+        timeout=30,
+    )
+    if hidden.returncode != 0 or hidden.stderr or hidden.stdout.strip() != "IsHidden: 1":
+        raise ValueError("fixed build account is not hidden")
+
+
 def verify_uv(
     uv: Path,
     *,
@@ -403,6 +508,7 @@ def uv_command(paths: RuntimePaths, build_user: str) -> list[str]:
         "--no-dev",
         "--no-editable",
         "--no-install-project",
+        "--no-build",
         "--python",
         "3.11",
     ]
@@ -414,6 +520,12 @@ def uv_build_command(paths: RuntimePaths, build_user: str) -> list[str]:
         "build",
         "--directory",
         str(paths.build_source),
+        "--force-pep517",
+        "--build-constraints",
+        PRIVATE_BUILD_CONSTRAINT,
+        "--require-hashes",
+        "--python",
+        "3.11",
         "--wheel",
         "--out-dir",
         str(paths.artifacts),
@@ -428,6 +540,7 @@ def uv_install_command(paths: RuntimePaths, build_user: str, wheel: Path) -> lis
         "--python",
         str(paths.venv / "bin/python"),
         "--no-deps",
+        "--no-build",
         str(wheel),
     ]
 
@@ -597,12 +710,28 @@ def expected_attestation(paths: RuntimePaths) -> dict[str, Any]:
         paths.install_root / "runtime" / python.relative_to(paths.runtime_root.resolve())
     )
     wheel = wheel_path(paths)
+    constraint = paths.runtime_root / BUILD_CONSTRAINT
+    verify_build_inputs(paths.source, constraint)
+    wrapper_hash = sha256_file(paths.runtime_root / "hermes-email-agent-wrapper.py")
+    sudoers_hash = sha256_file(paths.runtime_root / "hermes-email-agent.sudoers")
+    if wrapper_hash != WRAPPER_SHA256 or sudoers_hash != SUDOERS_TEMPLATE_SHA256:
+        raise ValueError("runtime boundary candidates do not match reviewed hashes")
     return {
         "archive_sha256": ARCHIVE_SHA256,
         "attestation_assets": {
             name: sha256_file(paths.runtime_root / name) for name in ATTESTATION_ASSETS
         },
         "commit": COMMIT,
+        "build_account": BUILD_ACCOUNT,
+        "build_backend": {
+            "artifact_sha256": BUILD_BACKEND_WHEEL_SHA256,
+            "name": BUILD_BACKEND,
+            "version": BUILD_BACKEND_VERSION,
+        },
+        "build_constraint_sha256": sha256_file(constraint),
+        "build_isolation": True,
+        "build_require_hashes": True,
+        "dependency_sync_no_build": True,
         "hermes_sha256": sha256_file(hermes),
         "lock_sha256": LOCK_SHA256,
         "python_path": str(active_python),
@@ -613,6 +742,8 @@ def expected_attestation(paths: RuntimePaths) -> dict[str, Any]:
         "uv_sha256": UV_SHA256,
         "uv_version": UV_VERSION,
         "version": VERSION,
+        "wrapper_sha256": wrapper_hash,
+        "sudoers_template_sha256": sudoers_hash,
         "wheel": wheel.name,
         "wheel_sha256": sha256_file(wheel),
     }
@@ -631,7 +762,7 @@ def install_attestation_assets(
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=destination)
         temporary = Path(temporary_name)
         try:
-            os.fchmod(descriptor, 0o755)
+            os.fchmod(descriptor, 0o755 if name.endswith(".py") else 0o644)
             os.fchown(descriptor, uid, gid)
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(content)
@@ -831,6 +962,7 @@ def build_generation(
 ) -> None:
     provenance_checker()
     verify_lock(paths.source)
+    verify_build_inputs(paths.source, asset_source / BUILD_CONSTRAINT)
     verify_uv(paths.uv, uid=root_uid, gid=wheel_gid, acl_validator=acl_validator, runner=runner)
     _safe_details(
         paths.runtime_root,
@@ -847,6 +979,15 @@ def build_generation(
     clear_disposable_flags(paths.build_source)
     normalize_tree(paths.build_source, uid=build_uid, gid=build_gid)
     paths.build_source.chmod(0o700)
+    shutil.copyfile(asset_source / BUILD_CONSTRAINT, paths.build_constraint)
+    os.chown(paths.build_constraint, build_uid, build_gid)
+    paths.build_constraint.chmod(0o600)
+    verify_private_build_constraint(
+        paths,
+        build_uid=build_uid,
+        build_gid=build_gid,
+        acl_validator=acl_validator,
+    )
     private_paths = [
         paths.venv,
         paths.python_installs,
@@ -862,6 +1003,12 @@ def build_generation(
         _safe_details(path, expected_uid=build_uid, expected_gid=build_gid)
     acl_validator([*private_paths[:-1], *copied_paths])
     _run_build_command(uv_command(paths, build_user), runner=runner)
+    verify_private_build_constraint(
+        paths,
+        build_uid=build_uid,
+        build_gid=build_gid,
+        acl_validator=acl_validator,
+    )
     _run_build_command(uv_build_command(paths, build_user), runner=runner)
     wheel = wheel_path(paths)
     _run_build_command(uv_install_command(paths, build_user, wheel), runner=runner)
@@ -968,6 +1115,8 @@ def install_runtime(
     active = build_paths(paths.install_root, paths.uv)
     if paths.runtime_root != active.runtime_root:
         raise ValueError("runtime installer accepts only the fixed active runtime")
+    if paths.install_root == INSTALL_ROOT and build_user != BUILD_ACCOUNT:
+        raise ValueError("production runtime builds require the fixed _hermesbuild account")
     verifier = (
         (lambda current: verify_fixed_active(current, runner=runner))
         if final_verifier is None
@@ -1095,9 +1244,12 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
     paths = build_paths()
     uid = pwd.getpwnam("root").pw_uid
     wheel = grp.getgrnam("wheel").gr_gid
-    builder = pwd.getpwnam("_hermesmail")
+    builder = pwd.getpwnam(BUILD_ACCOUNT)
+    service = pwd.getpwnam("_hermesmail")
+    verify_build_account(builder, service)
     verify_source_cli()
     verify_lock(paths.source)
+    verify_build_inputs(paths.source, Path(__file__).with_name(BUILD_CONSTRAINT))
     verify_uv(paths.uv, uid=uid, gid=wheel)
     if args.check:
         print("fixed runtime prerequisites verified")

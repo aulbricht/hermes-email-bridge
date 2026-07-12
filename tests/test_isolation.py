@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pwd
 import subprocess
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 ROOT = Path(__file__).parents[1]
 WRAPPER_PATH = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
 PROBE_PATH = ROOT / "deploy/macos/verify-hermes-email-agent.py"
+RUNTIME_PATH = ROOT / "deploy/macos/install-hermes-email-runtime.py"
 
 
 def _load_wrapper() -> Any:
@@ -26,6 +28,15 @@ def _load_probe() -> Any:
     spec = importlib.util.spec_from_file_location("hermes_email_agent_probe", PROBE_PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_runtime() -> Any:
+    spec = importlib.util.spec_from_file_location("hermes_email_runtime_boundary", RUNTIME_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -211,6 +222,90 @@ def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
     probe.verify_live(runner=runner)
     assert calls[0][-2] == "--query"
     assert calls[1][-4:-2] == ["--resume", "live_session"]
+
+
+def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path]:
+    probe = _load_probe()
+    runtime = _load_runtime()
+    candidates = tmp_path / "candidates"
+    boundary = tmp_path / "boundary"
+    candidates.mkdir(mode=0o755)
+    boundary.mkdir(mode=0o755)
+    candidate_wrapper = candidates / "hermes-email-agent-wrapper.py"
+    candidate_wrapper.write_bytes(WRAPPER_PATH.read_bytes())
+    candidate_template = candidates / "hermes-email-agent.sudoers"
+    candidate_template.write_bytes((ROOT / "deploy/macos/hermes-email-agent.sudoers").read_bytes())
+    wrapper = boundary / "hermes-email-agent"
+    wrapper.write_bytes(candidate_wrapper.read_bytes())
+    wrapper.chmod(0o755)
+    sudoers = boundary / "hermes-email-agent.sudoers"
+    user = pwd.getpwuid(os.getuid()).pw_name
+    sudoers.write_text(candidate_template.read_text().replace("__BRIDGE_USER__", user))
+    sudoers.chmod(0o440)
+    return probe, runtime, candidates, wrapper, sudoers
+
+
+def test_runtime_verifier_requires_exact_attested_wrapper_and_sudoers_bytes(
+    tmp_path: Path,
+) -> None:
+    probe, runtime, candidates, wrapper, sudoers = _boundary_fixture(tmp_path)
+    uid, gid = os.getuid(), os.getgid()
+    evidence = probe.verify_fixed_boundary(
+        runtime,
+        uid=uid,
+        gid=gid,
+        wrapper=wrapper,
+        sudoers=sudoers,
+        candidate_directory=candidates,
+    )
+    assert evidence["bridge_user"] == pwd.getpwuid(uid).pw_name
+    assert len(evidence["wrapper_sha256"]) == 64
+    assert len(evidence["sudoers_sha256"]) == 64
+
+
+@pytest.mark.parametrize(
+    "mutation,error",
+    [
+        ("wrapper-byte", "wrapper bytes"),
+        ("broader-policy", "policy shape"),
+        ("stale-wrapper", "wrapper bytes"),
+        ("wrong-user", "startup verifier user"),
+    ],
+)
+def test_runtime_verifier_rejects_tampered_boundary_bytes(
+    tmp_path: Path, mutation: str, error: str
+) -> None:
+    probe, runtime, candidates, wrapper, sudoers = _boundary_fixture(tmp_path)
+    if mutation == "wrapper-byte":
+        wrapper.write_bytes(wrapper.read_bytes() + b"\n")
+    elif mutation == "broader-policy":
+        sudoers.chmod(0o600)
+        sudoers.write_text(
+            sudoers.read_text().replace(
+                "/usr/local/libexec/hermes-email-agent",
+                "/usr/local/libexec/hermes-email-agent, /usr/bin/id",
+            )
+        )
+        sudoers.chmod(0o440)
+    elif mutation == "stale-wrapper":
+        wrapper.write_text(wrapper.read_text().replace('"gpt-5.5"', '"gpt-5.4"'))
+    else:
+        sudoers.chmod(0o600)
+        sudoers.write_text(
+            (candidates / "hermes-email-agent.sudoers")
+            .read_text()
+            .replace("__BRIDGE_USER__", "wrong_bridge_user")
+        )
+        sudoers.chmod(0o440)
+    with pytest.raises(ValueError, match=error):
+        probe.verify_fixed_boundary(
+            runtime,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            wrapper=wrapper,
+            sudoers=sudoers,
+            candidate_directory=candidates,
+        )
 
 
 @pytest.mark.parametrize(

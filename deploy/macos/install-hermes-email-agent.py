@@ -369,6 +369,10 @@ def install(
             acl_checker=acl_checker,
         )
         sudoers_validator(plan.sudoers_destination)
+        if _read_source(plan.wrapper_destination) != wrapper_content:
+            raise ValueError("installed wrapper bytes do not match the reviewed candidate")
+        if _read_source(plan.sudoers_destination) != rendered_sudoers.encode():
+            raise ValueError("installed sudoers bytes do not match the reviewed policy")
     except Exception:
         wrapper_replaced = wrapper_replaced or not wrapper_stage.exists()
         sudoers_replaced = sudoers_replaced or not sudoers_stage.exists()

@@ -40,6 +40,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     runtime_installer_path = ROOT / "deploy/macos/install-hermes-email-runtime.py"
     installer_path = ROOT / "deploy/macos/install-hermes-email-agent.py"
     sudoers_path = ROOT / "deploy/macos/hermes-email-agent.sudoers"
+    build_constraint_path = ROOT / "deploy/macos/hermes-email-build-constraints.txt"
     plist_text = plist_path.read_text()
     launcher = launcher_path.read_text()
     wrapper = wrapper_path.read_text()
@@ -59,6 +60,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
         assert runtime_installer_path.stat().st_mode & 0o111
         assert installer_path.stat().st_mode & 0o111
         assert not sudoers_path.stat().st_mode & 0o111
+        assert not build_constraint_path.stat().st_mode & 0o111
 
     assert "__BRIDGE_USER__ ALL = (_hermesmail) NOPASSWD:" in sudoers
     assert "/usr/local/libexec/hermes-email-agent" in sudoers
@@ -88,7 +90,14 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "LOCK_SHA256" in runtime_installer
     assert "runtime-attestation.json" in runtime_installer
     assert "temporary_probe_home" in runtime_installer
+    assert 'BUILD_ACCOUNT = "_hermesbuild"' in runtime_installer
+    assert "--build-constraints" in runtime_installer
+    assert "--require-hashes" in runtime_installer
+    assert "--no-build" in runtime_installer
     assert "/var/db/hermes-email-agent" not in runtime_installer
+    probe = probe_path.read_text()
+    assert "installed wrapper bytes do not match" in probe
+    assert "installed sudoers bytes do not match" in probe
 
     plist = plistlib.loads(plist_path.read_bytes())
     assert plist["RunAtLoad"] is True
@@ -136,6 +145,13 @@ def test_macos_isolation_installation_requirements_are_documented() -> None:
         "--toolsets context_engine",
         "inference-only",
         "never copy or reuse another user's profile",
+        "_hermesbuild",
+        "NFSHomeDirectory /var/empty",
+        "supplementary group membership",
+        "--build-constraints",
+        "--require-hashes",
+        "--no-build",
+        "byte-compare",
     ):
         assert required.lower() in normalized_readme
     for pin in (
@@ -143,6 +159,8 @@ def test_macos_isolation_installation_requirements_are_documented() -> None:
         "731f785d0373c81e7fb3d18ac5f4a1b6f9d6e3b94d2ae56a5b63133045bd2c68",
         "8d03d04a404c641e1c9642f0482e2d8752c57da02da94d612a5f30883b25fbca",
         "f63ec276fa13f8f392542a334c0f58f36833b24304831e5f4c221e2edf7a16f3",
+        "a7d4688bc5ddc6d0bd3a0ee477b8f68c6bf7d4d27345cf9e54901d9e153e8f52",
+        "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6",
     ):
         assert pin in readme
     assert "codeload.github.com/NousResearch/hermes-agent/tar.gz/" in readme

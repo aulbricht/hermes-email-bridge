@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import argparse
 import grp
+import hashlib
 import importlib.util
 import json
+import os
 import pwd
 import re
 import runpy
@@ -19,8 +21,16 @@ from typing import Any, Optional
 
 INSTALL_ROOT = Path("/Library/Application Support/HermesEmailAgent/hermes-agent")
 WRAPPER = Path("/usr/local/libexec/hermes-email-agent")
+SUDOERS = Path("/private/etc/sudoers.d/hermes-email-agent")
 RUNTIME_INSTALLER = Path(__file__).with_name("install-hermes-email-runtime.py")
 _SESSION = re.compile(r"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9_-]{0,127})\s*$")
+_POLICY = re.compile(
+    r"Defaults:(?P<user>[A-Za-z_][A-Za-z0-9_-]{0,31}) "
+    r"env_reset, secure_path=/usr/bin:/bin:/usr/sbin:/sbin\n"
+    r"(?P=user) ALL = \(_hermesmail\) NOPASSWD: "
+    r"/usr/local/libexec/hermes-email-agent\n"
+)
+_PLACEHOLDER = "__BRIDGE_USER__"
 
 
 def _runtime_module() -> Any:
@@ -50,11 +60,66 @@ def verify_wrapper_shapes(wrapper: Path) -> None:
         raise ValueError("wrapper new/resume argument contract is invalid")
 
 
-def verify_fixed_wrapper(runtime: Any, *, uid: int, gid: int) -> None:
-    runtime.verify_usr_local_chain(WRAPPER, uid=uid, gid=gid)
-    runtime._safe_details(WRAPPER, expected_uid=uid, expected_gid=gid, exact_mode=0o755)
-    runtime.reject_acls([WRAPPER])
-    verify_wrapper_shapes(WRAPPER)
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def verify_fixed_boundary(
+    runtime: Any,
+    *,
+    uid: int,
+    gid: int,
+    wrapper: Path = WRAPPER,
+    sudoers: Path = SUDOERS,
+    candidate_directory: Optional[Path] = None,
+    enforce_invoker: bool = True,
+) -> dict[str, str]:
+    candidates = Path(__file__).parent if candidate_directory is None else candidate_directory
+    candidate_wrapper = candidates / "hermes-email-agent-wrapper.py"
+    candidate_sudoers = candidates / "hermes-email-agent.sudoers"
+    candidate_wrapper_content = candidate_wrapper.read_bytes()
+    candidate_sudoers_content = candidate_sudoers.read_bytes()
+    if _sha256(candidate_wrapper_content) != runtime.WRAPPER_SHA256:
+        raise ValueError("attested wrapper candidate does not match the reviewed hash")
+    if _sha256(candidate_sudoers_content) != runtime.SUDOERS_TEMPLATE_SHA256:
+        raise ValueError("attested sudoers candidate does not match the reviewed hash")
+    if wrapper == WRAPPER:
+        runtime.verify_usr_local_chain(wrapper, uid=uid, gid=gid)
+    runtime._safe_details(wrapper, expected_uid=uid, expected_gid=gid, exact_mode=0o755)
+    wrapper_content = wrapper.read_bytes()
+    if wrapper_content != candidate_wrapper_content:
+        raise ValueError("installed wrapper bytes do not match the attested candidate")
+    runtime.reject_acls([wrapper])
+
+    sudoers_chain = (
+        [Path("/"), Path("/private"), Path("/private/etc"), sudoers.parent]
+        if sudoers == SUDOERS
+        else [sudoers.parent]
+    )
+    for directory in sudoers_chain:
+        runtime._safe_details(directory, expected_uid=uid, expected_gid=gid, exact_mode=0o755)
+    runtime._safe_details(sudoers, expected_uid=uid, expected_gid=gid, exact_mode=0o440)
+    runtime.reject_acls([*sudoers_chain, sudoers])
+    try:
+        policy = sudoers.read_text()
+        template = candidate_sudoers_content.decode()
+    except UnicodeDecodeError as exc:
+        raise ValueError("sudoers policy and candidate must be UTF-8") from exc
+    match = _POLICY.fullmatch(policy)
+    if match is None or template.count(_PLACEHOLDER) != 2:
+        raise ValueError("installed sudoers policy shape is not the reviewed policy")
+    bridge_user = match.group("user")
+    rendered = template.replace(_PLACEHOLDER, bridge_user)
+    if policy != rendered:
+        raise ValueError("installed sudoers bytes do not match the attested candidate")
+    if enforce_invoker and os.geteuid() != 0 and pwd.getpwuid(os.getuid()).pw_name != bridge_user:
+        raise ValueError("startup verifier user does not match the sudoers bridge user")
+    verify_wrapper_shapes(wrapper)
+    return {
+        "bridge_user": bridge_user,
+        "sudoers_sha256": _sha256(policy.encode()),
+        "wrapper_sha256": _sha256(wrapper_content),
+    }
 
 
 def _live_call(
@@ -106,7 +171,7 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
     gid = grp.getgrnam("wheel").gr_gid
     runtime.verify_source_cli()
     evidence = runtime.verify_attestation(runtime.build_paths(), uid=uid, gid=gid)
-    verify_fixed_wrapper(runtime, uid=uid, gid=gid)
+    boundary = verify_fixed_boundary(runtime, uid=uid, gid=gid)
     if args.live:
         verify_live()
     print(
@@ -114,6 +179,7 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
             {
                 "attestation": "verified",
                 "live_canary": args.live,
+                "bridge_user": boundary["bridge_user"],
                 "tool_schemas": evidence["tool_schemas"],
                 "version": evidence["version"],
             },

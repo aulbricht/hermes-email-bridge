@@ -292,9 +292,11 @@ the user unlocks and logs into the Mac after reboot.
 ### Isolated Hermes account and wrapper
 
 Before installation, list existing IDs with `dscl . -list /Users UniqueID` and
-`dscl . -list /Groups PrimaryGroupID`. Choose unused values for `__SERVICE_UID__` and
-`__SERVICE_GID__`, then rerun both checks immediately before creation. As root, create the
-hidden non-staff account and group:
+`dscl . -list /Groups PrimaryGroupID`. Choose four distinct unused values for
+`__SERVICE_UID__`, `__SERVICE_GID__`, `__BUILD_UID__`, and `__BUILD_GID__`, then rerun both
+checks immediately before creation. As root, create separate hidden non-staff runtime and build
+accounts. `_hermesmail` alone owns inference authentication and state; `_hermesbuild` has no
+writable home, authentication, secrets, or supplementary group membership:
 
 ```bash
 dscl . -create /Groups/_hermesmail
@@ -307,6 +309,19 @@ dscl . -create /Users/_hermesmail UserShell /usr/bin/false
 dscl . -create /Users/_hermesmail IsHidden 1
 install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent
 install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent/workspace
+dscl . -create /Groups/_hermesbuild
+dscl . -create /Groups/_hermesbuild PrimaryGroupID __BUILD_GID__
+dscl . -create /Users/_hermesbuild
+dscl . -create /Users/_hermesbuild UniqueID __BUILD_UID__
+dscl . -create /Users/_hermesbuild PrimaryGroupID __BUILD_GID__
+dscl . -create /Users/_hermesbuild NFSHomeDirectory /var/empty
+dscl . -create /Users/_hermesbuild UserShell /usr/bin/false
+dscl . -create /Users/_hermesbuild IsHidden 1
+test "$(dscl . -read /Users/_hermesbuild UserShell | awk '{print $2}')" = /usr/bin/false
+! dscl . -read /Groups/_hermesbuild GroupMembership
+dsmemberutil checkmembership -U _hermesbuild -G admin | grep -q 'not a member'
+dsmemberutil checkmembership -U _hermesbuild -G staff | grep -q 'not a member'
+sudo -n -u _hermesbuild /usr/bin/test ! -r /var/db/hermes-email-agent
 ```
 
 Verify the wrapper interpreter first with `test -x /usr/bin/python3`. Install Hermes Agent
@@ -325,7 +340,10 @@ visible through macOS's system `/etc` link); it rejects symlinks, wrong root:whe
 group/other write access, and unexpected ACLs. It safely creates a missing
 `/usr/local/libexec` as root:wheel `0755`, validates the rendered policy with `visudo`,
 then atomically installs the wrapper as root:wheel `0755` and sudoers policy as root:wheel
-`0440`. The installer intentionally supports macOS system Python 3.9.6. Validate its plan
+`0440`. Final installation and every recurring startup verification byte-compare the installed
+wrapper and exactly rendered, narrowly parsed sudoers policy with their reviewed, runtime-attested
+candidates; an extra byte, rule, command, user, run-as target, or stale wrapper fails closed. The
+installer intentionally supports macOS system Python 3.9.6. Validate its plan
 first, then install as root:
 
 Both files are staged and validated before replacement. Existing content, ownership, and
@@ -398,11 +416,22 @@ rm -rf "$uv_stage"
 
 Keep the LaunchAgent unloaded for the entire install or upgrade. The Python 3.9-compatible
 runtime installer re-verifies the separate immutable source and lock, copies them into a unique
-sibling build directory, and runs only that pinned `uv` as the unprivileged `_hermesmail`
-account with a minimal proxy-free environment. It installs frozen dependencies with
-`sync --frozen --no-dev --no-editable --no-install-project --python 3.11`, builds a wheel from
-the disposable verified source, and installs that wheel without dependencies. The active source
-is never made writable, removed, or used as a build-output directory.
+sibling build directory, and runs only that pinned `uv` as the unprivileged, secretless
+`_hermesbuild` account with a minimal proxy-free environment. It installs frozen wheel-only dependencies with
+`sync --frozen --no-dev --no-editable --no-install-project --no-build --python 3.11`. It builds
+the reviewed project in an isolated, forced PEP 517 environment using `setuptools.build_meta`
+81.0.0 and the tracked
+`hermes-email-build-constraints.txt` file with `--build-constraints`, `--require-hashes`, and only
+the reviewed setuptools wheel hash, then installs the resulting attested Hermes wheel with
+`--no-deps --no-build`. The constraint SHA-256 is
+`a7d4688bc5ddc6d0bd3a0ee477b8f68c6bf7d4d27345cf9e54901d9e153e8f52`; the allowed setuptools
+wheel SHA-256 is `fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6`.
+No sdist-only runtime dependency or unlisted build backend can execute. The active source
+is never made writable, removed, or used as a build-output directory. To avoid uv splitting the
+fixed `Application Support` path internally, the verified constraint is copied into the private
+`.build-source` directory as `.hermes-email-build-constraints.txt`; its no-follow type, exact hash,
+builder ownership, mode `0600`, and ACL-free state are rechecked immediately before uv receives
+that fixed relative basename.
 
 Every generation-coupled component lives under the one fixed
 `/Library/Application Support/HermesEmailAgent/hermes-agent/runtime` directory: managed Python,
@@ -410,7 +439,7 @@ venv, wheel artifact, attestation, fetcher, runtime installer, and startup verif
 generation is fully normalized to root:wheel, checked for writable paths, escaping symlinks and
 ACLs, probed, and attested in a sibling staging directory while the active generation remains
 untouched. During the build, the root-owned staging directory is searchable but non-listable and
-each top-level build directory is private to `_hermesmail`; the completed stage is then normalized
+each top-level build directory is private to `_hermesbuild`; the completed stage is then normalized
 to root:wheel before attestation. Activation atomically renames the prior runtime to a unique backup and the complete
 stage to `runtime`. The installer then verifies through the actual active verifier and fixed
 wrapper path. Any build, rename, attestation, verifier, or final entrypoint failure restores and
@@ -425,8 +454,9 @@ sudo /usr/bin/python3 deploy/macos/install-hermes-email-runtime.py
 ```
 
 The resulting root-owned `runtime/runtime-attestation.json` binds the archive, commit, source and
-lock digests, pinned `uv`, built wheel, managed Python, console entrypoint, fixed verifier assets,
-and a canonical digest of the entire generation. Verification rejects editable installs,
+lock digests, pinned `uv`, exact build account/backend/constraint/artifact hashes, built wheel,
+managed Python, console entrypoint, reviewed wrapper/sudoers candidate hashes, fixed verifier
+assets, and a canonical digest of the entire generation. Verification rejects editable installs,
 unexpected `direct_url`,
 imports outside the fixed venv's site-packages, wrong entrypoint/shebang, stale dependencies,
 writable paths, unsafe ownership/modes, ACLs, or changed runtime files.
