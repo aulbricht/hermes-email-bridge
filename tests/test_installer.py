@@ -36,7 +36,14 @@ def _fixture(tmp_path: Path) -> tuple[Any, Any, int, int]:
     for relative in ("usr/local", "private/etc/sudoers.d"):
         path = system_root / relative
         path.mkdir(parents=True)
-    for relative in ("usr", "usr/local", "private/etc", "private/etc/sudoers.d"):
+    system_root.chmod(0o755)
+    for relative in (
+        "usr",
+        "usr/local",
+        "private",
+        "private/etc",
+        "private/etc/sudoers.d",
+    ):
         (system_root / relative).chmod(0o755)
     return installer, installer.build_plan(system_root, assets), os.getuid(), os.getgid()
 
@@ -49,6 +56,21 @@ def _valid_sudoers(path: Path) -> None:
     rendered = path.read_text()
     assert "__BRIDGE_USER__" not in rendered
     assert rendered.count("bridge_user") == 2
+
+
+def _existing_install(plan: Any) -> None:
+    plan.libexec.mkdir(mode=0o755)
+    plan.wrapper_destination.write_text("old wrapper\n")
+    plan.wrapper_destination.chmod(0o755)
+    plan.sudoers_destination.write_text("old sudoers\n")
+    plan.sudoers_destination.chmod(0o440)
+
+
+def _assert_existing_restored(plan: Any) -> None:
+    assert plan.wrapper_destination.read_text() == "old wrapper\n"
+    assert stat.S_IMODE(plan.wrapper_destination.stat().st_mode) == 0o755
+    assert plan.sudoers_destination.read_text() == "old sudoers\n"
+    assert stat.S_IMODE(plan.sudoers_destination.stat().st_mode) == 0o440
 
 
 def test_installer_creates_missing_libexec_and_atomically_installs_files(tmp_path: Path) -> None:
@@ -158,7 +180,7 @@ def test_installer_rejects_symlinked_destination(tmp_path: Path) -> None:
 def test_installer_rejects_unsafe_mode_owner_and_acl(tmp_path: Path) -> None:
     installer, plan, uid, gid = _fixture(tmp_path)
     plan.usr_local.chmod(0o777)
-    with pytest.raises(ValueError, match="writable"):
+    with pytest.raises(ValueError, match="mode 0755"):
         installer.install(
             plan,
             "bridge_user",
@@ -209,6 +231,168 @@ def test_invalid_sudoers_fails_before_creating_libexec(tmp_path: Path) -> None:
             sudoers_validator=reject,
         )
     assert not plan.libexec.exists()
+
+
+def test_wrapper_replace_failure_leaves_no_partial_install(tmp_path: Path) -> None:
+    installer, plan, uid, gid = _fixture(tmp_path)
+
+    def fail_wrapper(_source: Path, destination: Path) -> None:
+        if destination == plan.wrapper_destination:
+            raise OSError("injected wrapper replace failure")
+        os.replace(_source, destination)
+
+    with pytest.raises(OSError, match="wrapper replace"):
+        installer.install(
+            plan,
+            "bridge_user",
+            expected_uid=uid,
+            expected_gid=gid,
+            mutate=True,
+            require_root=False,
+            acl_checker=_no_acl,
+            sudoers_validator=_valid_sudoers,
+            replacer=fail_wrapper,
+        )
+    assert not plan.libexec.exists()
+    assert not plan.sudoers_destination.exists()
+
+
+def test_libexec_chown_failure_rolls_back_new_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer, plan, uid, gid = _fixture(tmp_path)
+    before = (set(plan.usr_local.iterdir()), set(plan.sudoers_directory.iterdir()))
+    real_chown = installer.os.chown
+
+    def fail_libexec_chown(path: Path, owner: int, group: int) -> None:
+        if Path(path) == plan.libexec:
+            raise OSError("injected libexec chown failure")
+        real_chown(path, owner, group)
+
+    monkeypatch.setattr(installer.os, "chown", fail_libexec_chown)
+    with pytest.raises(OSError, match="libexec chown"):
+        installer.install(
+            plan,
+            "bridge_user",
+            expected_uid=uid,
+            expected_gid=gid,
+            mutate=True,
+            require_root=False,
+            acl_checker=_no_acl,
+            sudoers_validator=_valid_sudoers,
+        )
+    assert not plan.libexec.exists()
+    assert not plan.wrapper_destination.exists()
+    assert not plan.sudoers_destination.exists()
+    assert (set(plan.usr_local.iterdir()), set(plan.sudoers_directory.iterdir())) == before
+
+
+def test_libexec_chmod_failure_rolls_back_new_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installer, plan, uid, gid = _fixture(tmp_path)
+    before = (set(plan.usr_local.iterdir()), set(plan.sudoers_directory.iterdir()))
+    real_chmod = installer.os.chmod
+
+    def fail_libexec_chmod(path: Path, mode: int) -> None:
+        if Path(path) == plan.libexec:
+            raise OSError("injected libexec chmod failure")
+        real_chmod(path, mode)
+
+    monkeypatch.setattr(installer.os, "chmod", fail_libexec_chmod)
+    with pytest.raises(OSError, match="libexec chmod"):
+        installer.install(
+            plan,
+            "bridge_user",
+            expected_uid=uid,
+            expected_gid=gid,
+            mutate=True,
+            require_root=False,
+            acl_checker=_no_acl,
+            sudoers_validator=_valid_sudoers,
+        )
+    assert not plan.libexec.exists()
+    assert not plan.wrapper_destination.exists()
+    assert not plan.sudoers_destination.exists()
+    assert (set(plan.usr_local.iterdir()), set(plan.sudoers_directory.iterdir())) == before
+
+
+def test_sudoers_replace_failure_restores_existing_authorized_files(tmp_path: Path) -> None:
+    installer, plan, uid, gid = _fixture(tmp_path)
+    _existing_install(plan)
+
+    def fail_sudoers(source: Path, destination: Path) -> None:
+        if destination == plan.sudoers_destination:
+            raise OSError("injected sudoers replace failure")
+        os.replace(source, destination)
+
+    with pytest.raises(OSError, match="sudoers replace"):
+        installer.install(
+            plan,
+            "bridge_user",
+            expected_uid=uid,
+            expected_gid=gid,
+            mutate=True,
+            require_root=False,
+            acl_checker=_no_acl,
+            sudoers_validator=_valid_sudoers,
+            replacer=fail_sudoers,
+        )
+    _assert_existing_restored(plan)
+
+
+def test_final_visudo_failure_restores_both_existing_files(tmp_path: Path) -> None:
+    installer, plan, uid, gid = _fixture(tmp_path)
+    _existing_install(plan)
+    validations = 0
+
+    def fail_final(path: Path) -> None:
+        nonlocal validations
+        validations += 1
+        if validations == 3:
+            raise ValueError("injected final visudo failure")
+        if validations < 3:
+            _valid_sudoers(path)
+
+    with pytest.raises(ValueError, match="final visudo"):
+        installer.install(
+            plan,
+            "bridge_user",
+            expected_uid=uid,
+            expected_gid=gid,
+            mutate=True,
+            require_root=False,
+            acl_checker=_no_acl,
+            sudoers_validator=fail_final,
+        )
+    _assert_existing_restored(plan)
+
+
+def test_final_path_validation_failure_restores_existing_files(tmp_path: Path) -> None:
+    installer, plan, uid, gid = _fixture(tmp_path)
+    _existing_install(plan)
+
+    wrapper_checks = 0
+
+    def fail_final_acl(path: Path) -> bool:
+        nonlocal wrapper_checks
+        if path == plan.wrapper_destination:
+            wrapper_checks += 1
+            return wrapper_checks == 2
+        return False
+
+    with pytest.raises(ValueError, match="ACL"):
+        installer.install(
+            plan,
+            "bridge_user",
+            expected_uid=uid,
+            expected_gid=gid,
+            mutate=True,
+            require_root=False,
+            acl_checker=fail_final_acl,
+            sudoers_validator=_valid_sudoers,
+        )
+    _assert_existing_restored(plan)
 
 
 @pytest.mark.skipif(

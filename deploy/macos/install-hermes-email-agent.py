@@ -26,10 +26,12 @@ _PLACEHOLDER = "__BRIDGE_USER__"
 class InstallPlan:
     wrapper_source: Path
     sudoers_source: Path
+    filesystem_root: Path
     usr: Path
     usr_local: Path
     libexec: Path
     wrapper_destination: Path
+    private: Path
     etc: Path
     sudoers_directory: Path
     sudoers_destination: Path
@@ -46,10 +48,12 @@ def build_plan(root: Path = Path("/"), assets: Optional[Path] = None) -> Install
     return InstallPlan(
         wrapper_source=asset_directory / "hermes-email-agent-wrapper.py",
         sudoers_source=asset_directory / "hermes-email-agent.sudoers",
+        filesystem_root=root,
         usr=rooted("/usr"),
         usr_local=rooted("/usr/local"),
         libexec=libexec,
         wrapper_destination=libexec / "hermes-email-agent",
+        private=rooted("/private"),
         etc=rooted("/private/etc"),
         sudoers_directory=sudoers_directory,
         sudoers_destination=sudoers_directory / "hermes-email-agent",
@@ -157,8 +161,10 @@ def run_visudo(path: Path) -> None:
         raise ValueError("rendered sudoers policy failed visudo validation")
 
 
-def _atomic_install(path: Path, content: bytes, *, uid: int, gid: int, mode: int) -> None:
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def _stage_file(
+    directory: Path, name: str, content: bytes, *, uid: int, gid: int, mode: int
+) -> Path:
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
@@ -167,9 +173,24 @@ def _atomic_install(path: Path, content: bytes, *, uid: int, gid: int, mode: int
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
+        return temporary
+    except Exception:
         temporary.unlink(missing_ok=True)
+        raise
+
+
+def _restore(
+    destination: Path,
+    backup: Optional[Path],
+    *,
+    replaced: bool,
+) -> None:
+    if not replaced:
+        return
+    if backup is None:
+        destination.unlink(missing_ok=True)
+    else:
+        os.replace(backup, destination)
 
 
 def install(
@@ -182,6 +203,7 @@ def install(
     require_root: bool = True,
     acl_checker: Callable[[Path], bool] = has_unexpected_acl,
     sudoers_validator: Callable[[Path], None] = run_visudo,
+    replacer: Callable[[Path, Path], None] = os.replace,
 ) -> tuple[str, ...]:
     bridge_user = validate_bridge_user(bridge_user)
     wrapper_content = _read_source(plan.wrapper_source)
@@ -191,12 +213,20 @@ def install(
         raise ValueError("sudoers template must be UTF-8 text") from exc
     rendered_sudoers = render_sudoers(sudoers_template, bridge_user)
 
-    for trusted_directory in (plan.usr, plan.usr_local, plan.etc, plan.sudoers_directory):
+    for trusted_directory in (
+        plan.filesystem_root,
+        plan.usr,
+        plan.usr_local,
+        plan.private,
+        plan.etc,
+        plan.sudoers_directory,
+    ):
         validate_path(
             trusted_directory,
             expected_uid=expected_uid,
             expected_gid=expected_gid,
             directory=True,
+            exact_mode=0o755,
             acl_checker=acl_checker,
         )
     try:
@@ -211,6 +241,7 @@ def install(
             expected_uid=expected_uid,
             expected_gid=expected_gid,
             directory=True,
+            exact_mode=0o755,
             acl_checker=acl_checker,
         )
     for destination, mode in (
@@ -242,48 +273,119 @@ def install(
         return actions
     if require_root and os.geteuid() != 0:
         raise PermissionError("installation must run as root")
-    if libexec_missing:
-        plan.libexec.mkdir(mode=0o755)
-        os.chown(plan.libexec, expected_uid, expected_gid)
-        os.chmod(plan.libexec, 0o755)
-        validate_path(
-            plan.libexec,
-            expected_uid=expected_uid,
-            expected_gid=expected_gid,
-            directory=True,
-            exact_mode=0o755,
-            acl_checker=acl_checker,
-        )
-    _atomic_install(
-        plan.wrapper_destination,
+    wrapper_stage = _stage_file(
+        plan.usr_local,
+        "hermes-email-agent.new",
         wrapper_content,
         uid=expected_uid,
         gid=expected_gid,
         mode=0o755,
     )
-    _atomic_install(
-        plan.sudoers_destination,
-        rendered_sudoers.encode(),
-        uid=expected_uid,
-        gid=expected_gid,
-        mode=0o440,
-    )
-    validate_path(
-        plan.wrapper_destination,
-        expected_uid=expected_uid,
-        expected_gid=expected_gid,
-        directory=False,
-        exact_mode=0o755,
-        acl_checker=acl_checker,
-    )
-    validate_path(
-        plan.sudoers_destination,
-        expected_uid=expected_uid,
-        expected_gid=expected_gid,
-        directory=False,
-        exact_mode=0o440,
-        acl_checker=acl_checker,
-    )
+    try:
+        sudoers_stage = _stage_file(
+            plan.sudoers_directory,
+            "hermes-email-agent.new",
+            rendered_sudoers.encode(),
+            uid=expected_uid,
+            gid=expected_gid,
+            mode=0o440,
+        )
+    except Exception:
+        wrapper_stage.unlink(missing_ok=True)
+        raise
+    staged = (wrapper_stage, sudoers_stage)
+    wrapper_backup: Optional[Path] = None
+    sudoers_backup: Optional[Path] = None
+    created_libexec = False
+    wrapper_replaced = False
+    sudoers_replaced = False
+    try:
+        validate_path(
+            wrapper_stage,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            directory=False,
+            exact_mode=0o755,
+            acl_checker=acl_checker,
+        )
+        validate_path(
+            sudoers_stage,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            directory=False,
+            exact_mode=0o440,
+            acl_checker=acl_checker,
+        )
+        sudoers_validator(sudoers_stage)
+        if plan.wrapper_destination.exists():
+            wrapper_backup = _stage_file(
+                plan.usr_local,
+                "hermes-email-agent.backup",
+                _read_source(plan.wrapper_destination),
+                uid=expected_uid,
+                gid=expected_gid,
+                mode=0o755,
+            )
+        if plan.sudoers_destination.exists():
+            sudoers_backup = _stage_file(
+                plan.sudoers_directory,
+                "hermes-email-agent.backup",
+                _read_source(plan.sudoers_destination),
+                uid=expected_uid,
+                gid=expected_gid,
+                mode=0o440,
+            )
+        if libexec_missing:
+            plan.libexec.mkdir(mode=0o755)
+            created_libexec = True
+            os.chown(plan.libexec, expected_uid, expected_gid)
+            os.chmod(plan.libexec, 0o755)
+            validate_path(
+                plan.libexec,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+                directory=True,
+                exact_mode=0o755,
+                acl_checker=acl_checker,
+            )
+        replacer(wrapper_stage, plan.wrapper_destination)
+        wrapper_replaced = True
+        replacer(sudoers_stage, plan.sudoers_destination)
+        sudoers_replaced = True
+        validate_path(
+            plan.wrapper_destination,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            directory=False,
+            exact_mode=0o755,
+            acl_checker=acl_checker,
+        )
+        validate_path(
+            plan.sudoers_destination,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            directory=False,
+            exact_mode=0o440,
+            acl_checker=acl_checker,
+        )
+        sudoers_validator(plan.sudoers_destination)
+    except Exception:
+        wrapper_replaced = wrapper_replaced or not wrapper_stage.exists()
+        sudoers_replaced = sudoers_replaced or not sudoers_stage.exists()
+        try:
+            _restore(plan.sudoers_destination, sudoers_backup, replaced=sudoers_replaced)
+            _restore(plan.wrapper_destination, wrapper_backup, replaced=wrapper_replaced)
+            if created_libexec:
+                plan.libexec.rmdir()
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "installation failed and rollback was incomplete"
+            ) from rollback_error
+        raise
+    finally:
+        for temporary in (*staged, wrapper_backup, sudoers_backup):
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
     return actions
 
 

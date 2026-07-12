@@ -35,6 +35,9 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     plist_path = ROOT / "deploy/macos/com.example.hermes.email-bridge.plist"
     launcher_path = ROOT / "deploy/macos/run-email-bridge.sh"
     wrapper_path = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
+    fetcher_path = ROOT / "deploy/macos/fetch-hermes-email-agent.py"
+    probe_path = ROOT / "deploy/macos/verify-hermes-email-agent.py"
+    installer_path = ROOT / "deploy/macos/install-hermes-email-agent.py"
     sudoers_path = ROOT / "deploy/macos/hermes-email-agent.sudoers"
     plist_text = plist_path.read_text()
     launcher = launcher_path.read_text()
@@ -50,6 +53,9 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     if os.name == "posix":
         assert launcher_path.stat().st_mode & 0o111
         assert wrapper_path.stat().st_mode & 0o111
+        assert fetcher_path.stat().st_mode & 0o111
+        assert probe_path.stat().st_mode & 0o111
+        assert installer_path.stat().st_mode & 0o111
         assert not sudoers_path.stat().st_mode & 0o111
 
     assert "__BRIDGE_USER__ ALL = (_hermesmail) NOPASSWD:" in sudoers
@@ -68,6 +74,14 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert 'rooted("/private/etc/sudoers.d")' in installer
     assert "O_NOFOLLOW" in installer
     assert "visudo" in installer
+    fetcher = fetcher_path.read_text()
+    assert "codeload.github.com/NousResearch/hermes-agent/tar.gz/" in fetcher
+    assert "ProxyHandler({})" in fetcher
+    assert "MAX_DOWNLOAD_BYTES" in fetcher
+    assert "PROVENANCE_FILE" in fetcher
+    probe = probe_path.read_text()
+    assert "get_tool_definitions" in probe
+    assert 'enabled_toolsets=["context_engine"]' in probe
 
     plist = plistlib.loads(plist_path.read_bytes())
     assert plist["RunAtLoad"] is True
@@ -119,10 +133,11 @@ def test_macos_isolation_installation_requirements_are_documented() -> None:
         assert required.lower() in normalized_readme
     for pin in (
         "4281151ae859241351ba14d8c7682dc67ff4c126",
-        "735e875e12c18ebf3d6b2dd26928d72d155455d0",
-        "43def089739b8edaa01f05352cba869fe9d4013f3b5616ad627c14ba28888fc9",
+        "731f785d0373c81e7fb3d18ac5f4a1b6f9d6e3b94d2ae56a5b63133045bd2c68",
     ):
         assert pin in readme
+    assert "codeload.github.com/NousResearch/hermes-agent/tar.gz/" in readme
+    assert "locally generated `git archive`" in readme
     assert (
         "HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'"
     ) in example

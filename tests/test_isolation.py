@@ -11,10 +11,19 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 WRAPPER_PATH = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
+PROBE_PATH = ROOT / "deploy/macos/verify-hermes-email-agent.py"
 
 
 def _load_wrapper() -> Any:
     spec = importlib.util.spec_from_file_location("hermes_email_agent_wrapper", WRAPPER_PATH)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_probe() -> Any:
+    spec = importlib.util.spec_from_file_location("hermes_email_agent_probe", PROBE_PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -178,3 +187,78 @@ print(f"session_id: {session}", file=sys.stderr)
     assert resumed.stdout == "answer only\n"
     assert resumed.stderr == "session_id: session_123\n"
     assert "warning" not in (resumed.stdout + resumed.stderr).lower()
+
+
+def test_runtime_probe_uses_pinned_source_seam_and_zero_schema_contract(tmp_path: Path) -> None:
+    probe = _load_probe()
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs["env"]))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='{"tool_schemas": 0, "toolset": "context_engine"}\n',
+            stderr="",
+        )
+
+    source = tmp_path / "source"
+    python = tmp_path / "venv/bin/python"
+    probe.verify_runtime(source, python, runner=runner)
+    assert calls[0][0][:4] == [str(python), "-I", "-c", probe._RUNTIME_CODE]
+    assert calls[0][0][4] == str(source)
+    assert calls[0][1] == {
+        "HOME": "/var/db/hermes-email-agent",
+        "HERMES_HOME": "/var/db/hermes-email-agent",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def test_source_probe_suppresses_bytecode_writes(tmp_path: Path) -> None:
+    probe = _load_probe()
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs["env"]))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='{"resolved_tools": 0, "toolset": "context_engine"}\n',
+            stderr="",
+        )
+
+    source = tmp_path / "source"
+    probe.verify_source_toolset(source, runner=runner)
+    assert calls[0][0][:4] == ["/usr/bin/python3", "-I", "-c", probe._SOURCE_CODE]
+    assert calls[0][0][4] == str(source)
+    assert calls[0][1] == {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
+    probe = _load_probe()
+    probe.verify_wrapper_shapes(WRAPPER_PATH)
+    results = iter(
+        (
+            subprocess.CompletedProcess(
+                [], 0, stdout="EMAIL_BRIDGE_PROBE_OK\n", stderr="session_id: live_session\n"
+            ),
+            subprocess.CompletedProcess(
+                [], 0, stdout="EMAIL_BRIDGE_RESUME_OK\n", stderr="session_id: live_session\n"
+            ),
+        )
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return next(results)
+
+    probe.verify_live(runner=runner)
+    assert calls[0][-2] == "--query"
+    assert calls[1][-4:-2] == ["--resume", "live_session"]

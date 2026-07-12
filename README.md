@@ -326,6 +326,10 @@ then atomically installs the wrapper as root:wheel `0755` and sudoers policy as 
 `0440`. The installer intentionally supports macOS system Python 3.9.6. Validate its plan
 first, then install as root:
 
+Both files are staged and validated before replacement. Existing content, ownership, and
+modes are preserved as rollback snapshots; a replacement, final path, ACL, or final `visudo`
+failure restores both files and removes a newly-created empty `libexec` directory.
+
 ```bash
 /usr/bin/python3 deploy/macos/install-hermes-email-agent.py \
   --bridge-user YOUR_BRIDGE_ACCOUNT --dry-run
@@ -345,19 +349,57 @@ providers, models, tools, toolsets, hooks, skills, flags, or commands. Configure
 HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'
 ```
 
-Hermes 0.18.2 safe mode skips plugins, MCP configuration, hooks, rules, and skills. Pin exact
-commit `4281151ae859241351ba14d8c7682dc67ff4c126`, tree
-`735e875e12c18ebf3d6b2dd26928d72d155455d0`, and source-archive SHA-256
-`43def089739b8edaa01f05352cba869fe9d4013f3b5616ad627c14ba28888fc9`; do not trust the
-version banner alone. At that source, the wrapper's `--toolsets context_engine` validates,
-resolves to an empty tool list, and exposes zero schemas in safe mode. The values `none`, `no_mcp`,
-empty, and default fallbacks are forbidden.
+Hermes 0.18.2 safe mode skips plugins, MCP configuration, hooks, rules, and skills. The
+reviewed commit is unsigned, so do not trust a version banner, mutable branch, local clone,
+or locally generated `git archive`. Fetch only:
 
-Before initial start and every Hermes upgrade, keep the LaunchAgent unloaded; verify the
-exact HEAD, tree, and archive digest, then run the approved new-session and resumed-session
-zero-schema contract probe through this wrapper. Do not restart unless it reports an answer
-on stdout, only `session_id:` metadata on stderr, exactly zero tool schemas, and no warning.
-Resume remains enabled because the bridge requires persisted conversation sessions.
+```text
+https://codeload.github.com/NousResearch/hermes-agent/tar.gz/4281151ae859241351ba14d8c7682dc67ff4c126
+```
+
+Its independently verified SHA-256 is
+`731f785d0373c81e7fb3d18ac5f4a1b6f9d6e3b94d2ae56a5b63133045bd2c68`. The fetcher uses
+that fixed HTTPS URL without environment proxies or redirects, caps transfer/extraction,
+rejects unsafe archive members, records commit/archive/source provenance, verifies source
+version 0.18.2, requires the staging parent and installed tree to remain owned by the
+installer account without group/other write access, and atomically stages the source:
+
+```bash
+install -d -o root -g wheel -m 0755 \
+  '/Library/Application Support/HermesEmailAgent/hermes-agent'
+sudo /usr/bin/python3 deploy/macos/fetch-hermes-email-agent.py \
+  --target '/Library/Application Support/HermesEmailAgent/hermes-agent/source'
+sudo /usr/bin/python3 deploy/macos/fetch-hermes-email-agent.py \
+  --target '/Library/Application Support/HermesEmailAgent/hermes-agent/source' --verify
+```
+
+Create the pinned installation virtual environment at
+`/Library/Application Support/HermesEmailAgent/hermes-agent/venv` from that source:
+
+```bash
+sudo /usr/bin/env -i PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
+  uv venv --python 3.11 \
+  '/Library/Application Support/HermesEmailAgent/hermes-agent/venv'
+sudo /usr/bin/env -i PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin \
+  uv pip install \
+  --python '/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/python' \
+  --editable '/Library/Application Support/HermesEmailAgent/hermes-agent/source'
+```
+
+At the reviewed source, the wrapper's `--toolsets context_engine` validates, resolves to an empty
+tool list, and exposes zero schemas in safe mode. The values `none`, `no_mcp`, empty, and
+default fallbacks are forbidden.
+
+Before initial start and every Hermes upgrade, keep the LaunchAgent unloaded and rerun both
+the provenance verification and runtime contract probe against the installed source/venv:
+
+```bash
+sudo /usr/bin/python3 deploy/macos/verify-hermes-email-agent.py --live
+```
+
+Do not restart unless it reports verified codeload provenance, an answer on stdout, only
+`session_id:` metadata on stderr, exactly zero tool schemas, no warning, and successful new
+and resumed sessions. Resume remains enabled because the bridge requires persisted sessions.
 
 The bridge command receives only `PATH` and present locale fields; it receives no bridge
 environment-file path, AgentMail/Composio/bridge variables, proxy variables, `PYTHONPATH`,
