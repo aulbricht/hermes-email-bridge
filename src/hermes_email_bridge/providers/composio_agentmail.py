@@ -117,8 +117,12 @@ class ComposioAgentMailProvider(AgentMailProvider):
         decoded_message = unquote(message_part)
         if (
             not message_part
-            or "/" in decoded_message
-            or decoded_message in {".", ".."}
+            or decoded_message.startswith("/")
+            or decoded_message.endswith("/")
+            or "//" in decoded_message
+            or "\\" in decoded_message
+            or any(segment in {".", ".."} for segment in decoded_message.split("/"))
+            or any(ord(character) < 32 or ord(character) == 127 for character in decoded_message)
             or quote(decoded_message, safe="") != message_part
         ):
             raise ComposioAgentMailError("unsupported AgentMail proxy path")

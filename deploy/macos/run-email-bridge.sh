@@ -8,7 +8,8 @@ if [ ! -f "$EMAIL_BRIDGE_ENV_FILE" ]; then
     echo "email bridge environment file does not exist" >&2
     exit 78
 fi
-if [ "$(stat -f '%Lp' "$EMAIL_BRIDGE_ENV_FILE")" != "600" ]; then
+env_mode=$(stat -f '%Lp' "$EMAIL_BRIDGE_ENV_FILE" 2>/dev/null || stat -c '%a' "$EMAIL_BRIDGE_ENV_FILE")
+if [ "$env_mode" != "600" ]; then
     echo "email bridge environment file must have mode 0600" >&2
     exit 78
 fi

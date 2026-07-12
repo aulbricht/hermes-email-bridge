@@ -117,6 +117,7 @@ class AllowlistEntry:
     source_message_id: str | None
     created_at: datetime
     updated_at: datetime
+    revoked_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)

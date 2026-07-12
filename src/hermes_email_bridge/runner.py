@@ -79,6 +79,13 @@ class SubprocessHermesRunner(HermesRunner):
             argv.extend(["--resume", mapping.hermes_session])
         argv.extend(["--query", format_hermes_prompt(message, mapping)])
         env = os.environ.copy()
+        for secret_name in (
+            "EMAIL_BRIDGE_COMPOSIO_API_KEY",
+            "COMPOSIO_API_KEY",
+            "AGENTMAIL_API_KEY",
+            "AGENTMAIL_WEBHOOK_SECRET",
+        ):
+            env.pop(secret_name, None)
         env.update(
             {
                 "HERMES_PROFILE": self.profile,

@@ -69,7 +69,7 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_DRY_RUN` | `true` | Skip provider send even when replies are enabled |
 | `AGENTMAIL_BASE_URL` | `https://api.agentmail.to/v0` | HTTPS AgentMail API base URL |
 | `AGENTMAIL_ALLOW_INSECURE_LOCAL_HTTP` | `false` | Permit HTTP only to `localhost` or a loopback IP for local tests |
-| `COMPOSIO_API_KEY` | required for Composio | Project key scoped to Proxy Execute |
+| `EMAIL_BRIDGE_COMPOSIO_API_KEY` | required for Composio | Bridge-only project key scoped to Proxy Execute |
 | `COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID` | required for Composio | Active AgentMail connected account |
 | `COMPOSIO_AGENT_MAIL_INBOX_ID` | required for Composio | AgentMail inbox address or ID |
 | `EMAIL_BRIDGE_STORE_RAW` | `false` | Persist raw provider payloads for debugging |
@@ -271,10 +271,17 @@ do not run the service from the repository or Hermes state directory.
    the plist as a user LaunchAgent.
 
 The template uses umask `077`, a neutral working directory, stderr-only logging,
-`RunAtLoad`, restart only after unsuccessful exit, and a 30-second launchd throttle.
+`RunAtLoad`, restart after unsuccessful exit, and a 30-second launchd throttle. The bridge
+does not internally retry permanent authentication, configuration, or malformed-response
+failures; launchd will still restart an unsuccessful process, so unload the LaunchAgent while
+correcting a persistent configuration failure.
 Protect the database, SQLite sidecars, environment, workspace, and logs from other users.
 A user LaunchAgent starts only after login; with FileVault enabled, it cannot run before
 the user unlocks and logs into the Mac after reboot.
+
+The bridge removes its Composio and AgentMail credentials from the Hermes child environment.
+Production Hermes must load its own Composio connection from its protected `HERMES_HOME`;
+do not make Hermes depend on inheriting the bridge's Proxy Execute key.
 
 ## Release notes
 

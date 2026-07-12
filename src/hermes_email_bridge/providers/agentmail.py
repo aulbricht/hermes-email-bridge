@@ -103,6 +103,9 @@ def normalize_agentmail_sent_message(payload: dict[str, Any]) -> SentEmail:
     message_id = str(payload.get("message_id") or "")
     if not message_id:
         raise AgentMailError("AgentMail payload is missing message_id")
+    timestamp = payload.get("timestamp") or payload.get("created_at")
+    if not timestamp:
+        raise AgentMailError("AgentMail sent payload is missing timestamp")
     recipients: list[str] = []
     for field in ("to", "cc", "bcc"):
         raw_values = payload.get(field) or []
@@ -119,7 +122,7 @@ def normalize_agentmail_sent_message(payload: dict[str, Any]) -> SentEmail:
         provider="agentmail",
         provider_message_id=message_id,
         recipients=tuple(recipients),
-        sent_at=_parse_datetime(payload.get("timestamp") or payload.get("created_at")),
+        sent_at=_parse_datetime(timestamp),
     )
 
 

@@ -40,11 +40,6 @@ _LEGACY_SCHEMA = (
     )
     """,
     """
-    CREATE UNIQUE INDEX IF NOT EXISTS mappings_provider_thread
-        ON mappings(provider, provider_thread_id)
-        WHERE provider_thread_id IS NOT NULL
-    """,
-    """
     CREATE INDEX IF NOT EXISTS mappings_subject
         ON mappings(provider, subject_key, participant_email)
     """,
@@ -156,6 +151,7 @@ class MappingStore:
                         source_message_id TEXT,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL,
+                        revoked_at TEXT,
                         PRIMARY KEY (provider, address)
                     )
                     """
@@ -421,12 +417,13 @@ class MappingStore:
             self._connection.execute(
                 """
                 INSERT INTO email_allowlist(
-                    provider, address, source, source_message_id, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    provider, address, source, source_message_id, created_at, updated_at, revoked_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(provider, address) DO UPDATE SET
                     source = excluded.source,
                     source_message_id = excluded.source_message_id,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    revoked_at = NULL
                 """,
                 (provider, normalized, source, source_message_id, now, now),
             )
@@ -438,14 +435,35 @@ class MappingStore:
                 raise RuntimeError("allowlist insert failed")
             return self._row_to_allowlist(row)
 
-    def remove_allowed_address(self, provider: str, address: str) -> bool:
+    def remove_allowed_address(
+        self, provider: str, address: str, *, now: datetime | None = None
+    ) -> bool:
         normalized = normalize_email_address(address)
+        removed_at = (now or utc_now()).isoformat()
         with self._lock, self._connection:
-            cursor = self._connection.execute(
-                "DELETE FROM email_allowlist WHERE provider = ? AND address = ?",
+            row = self._connection.execute(
+                """
+                SELECT revoked_at FROM email_allowlist
+                WHERE provider = ? AND address = ?
+                """,
                 (provider, normalized),
+            ).fetchone()
+            was_active = row is not None and row["revoked_at"] is None
+            self._connection.execute(
+                """
+                INSERT INTO email_allowlist(
+                    provider, address, source, source_message_id,
+                    created_at, updated_at, revoked_at
+                ) VALUES (?, ?, 'revoked', NULL, ?, ?, ?)
+                ON CONFLICT(provider, address) DO UPDATE SET
+                    source = 'revoked',
+                    source_message_id = NULL,
+                    updated_at = excluded.updated_at,
+                    revoked_at = excluded.revoked_at
+                """,
+                (provider, normalized, removed_at, removed_at, removed_at),
             )
-            return cursor.rowcount == 1
+            return was_active
 
     def is_allowed(self, provider: str, address: str) -> bool:
         try:
@@ -454,7 +472,10 @@ class MappingStore:
             return False
         with self._lock:
             row = self._connection.execute(
-                "SELECT 1 FROM email_allowlist WHERE provider = ? AND address = ?",
+                """
+                SELECT 1 FROM email_allowlist
+                WHERE provider = ? AND address = ? AND revoked_at IS NULL
+                """,
                 (provider, normalized),
             ).fetchone()
             return row is not None
@@ -462,7 +483,11 @@ class MappingStore:
     def list_allowed_addresses(self, provider: str) -> list[AllowlistEntry]:
         with self._lock:
             rows = self._connection.execute(
-                "SELECT * FROM email_allowlist WHERE provider = ? ORDER BY address",
+                """
+                SELECT * FROM email_allowlist
+                WHERE provider = ? AND revoked_at IS NULL
+                ORDER BY address
+                """,
                 (provider,),
             ).fetchall()
             return [self._row_to_allowlist(row) for row in rows]
@@ -488,15 +513,28 @@ class MappingStore:
                     normalized = normalize_email_address(address)
                 except ValueError:
                     continue
+                existing = self._connection.execute(
+                    """
+                    SELECT revoked_at FROM email_allowlist
+                    WHERE provider = ? AND address = ?
+                    """,
+                    (message.provider, normalized),
+                ).fetchone()
+                if existing is not None and existing["revoked_at"] is not None:
+                    revoked_at = datetime.fromisoformat(str(existing["revoked_at"]))
+                    if message.sent_at <= revoked_at:
+                        continue
                 self._connection.execute(
                     """
                     INSERT INTO email_allowlist(
-                        provider, address, source, source_message_id, created_at, updated_at
-                    ) VALUES (?, ?, 'sent', ?, ?, ?)
+                        provider, address, source, source_message_id,
+                        created_at, updated_at, revoked_at
+                    ) VALUES (?, ?, 'sent', ?, ?, ?, NULL)
                     ON CONFLICT(provider, address) DO UPDATE SET
                         source = 'sent',
                         source_message_id = excluded.source_message_id,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        revoked_at = NULL
                     """,
                     (
                         message.provider,
@@ -652,6 +690,7 @@ class MappingStore:
             source_message_id=_optional_string(row["source_message_id"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            revoked_at=_optional_datetime(row["revoked_at"]),
         )
 
 

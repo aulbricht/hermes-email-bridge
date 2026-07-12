@@ -1,7 +1,10 @@
+import json
 import shlex
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from hermes_email_bridge.models import (
     ConversationMapping,
@@ -195,3 +198,35 @@ def test_subprocess_runner_uses_prompt_and_captures_session() -> None:
     assert "Hello from email" in result.reply
     assert "UNTRUSTED EMAIL USER CONTENT" in result.reply
     assert result.session_id == "session-new"
+
+
+def test_subprocess_runner_removes_only_bridge_provider_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret_names = (
+        "EMAIL_BRIDGE_COMPOSIO_API_KEY",
+        "COMPOSIO_API_KEY",
+        "AGENTMAIL_API_KEY",
+        "AGENTMAIL_WEBHOOK_SECRET",
+    )
+    for index, name in enumerate(secret_names):
+        monkeypatch.setenv(name, f"distinctive-secret-{index}")
+    monkeypatch.setenv("HERMES_HOME", "/safe/hermes-home")
+    monkeypatch.setenv("UNRELATED_PROVIDER_KEY", "preserve-me")
+    script = (
+        "import json, os; "
+        f"print(json.dumps({{name: os.getenv(name) for name in {secret_names!r}}} | "
+        "{'HERMES_HOME': os.getenv('HERMES_HOME'), "
+        "'HERMES_PROFILE': os.getenv('HERMES_PROFILE'), "
+        "'PATH_PRESENT': bool(os.getenv('PATH')), "
+        "'UNRELATED_PROVIDER_KEY': os.getenv('UNRELATED_PROVIDER_KEY')}))"
+    )
+    command = shlex.join([sys.executable, "-c", script])
+    result = SubprocessHermesRunner(command, profile="safe-profile").run(_message(), None)
+    child_env = json.loads(result.reply)
+
+    assert all(child_env[name] is None for name in secret_names)
+    assert child_env["HERMES_HOME"] == "/safe/hermes-home"
+    assert child_env["HERMES_PROFILE"] == "safe-profile"
+    assert child_env["PATH_PRESENT"] is True
+    assert child_env["UNRELATED_PROVIDER_KEY"] == "preserve-me"

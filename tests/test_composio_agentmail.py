@@ -114,7 +114,7 @@ def test_threaded_reply_uses_only_fixed_relative_endpoint_and_body() -> None:
     assert wrapped["body"] == {"text": "reply"}
 
 
-def test_composio_transport_preserves_agentmail_authentication_labels() -> None:
+def test_composio_poll_get_reply_support_encoded_slash_message_id() -> None:
     provider = ComposioAgentMailProvider(
         api_key="test-key",
         connected_account_id="ca_test",
@@ -124,22 +124,47 @@ def test_composio_transport_preserves_agentmail_authentication_labels() -> None:
         [
             {
                 "status": 200,
-                "data": {"messages": [{"message_id": "in-1", "labels": ["received"]}]},
+                "data": {
+                    "messages": [{"message_id": "<foo/bar@example.com>", "labels": ["received"]}]
+                },
             },
             {
                 "status": 200,
                 "data": {
-                    "message_id": "in-1",
+                    "message_id": "<foo/bar@example.com>",
                     "labels": ["received"],
                     "from": "person@example.test",
                     "to": ["bridge@agentmail.test"],
                     "timestamp": "2026-07-11T12:00:00Z",
                 },
             },
+            {
+                "status": 200,
+                "data": {
+                    "message_id": "<foo/bar@example.com>",
+                    "labels": ["received"],
+                    "from": "person@example.test",
+                    "to": ["bridge@agentmail.test"],
+                    "timestamp": "2026-07-11T12:00:00Z",
+                },
+            },
+            {"status": 200, "data": {"message_id": "reply-1"}},
         ]
     )
     messages = provider.poll(None).messages
     assert messages[0].sender_authentication is SenderAuthentication.AUTHENTICATED
+    assert provider.get("<foo/bar@example.com>").provider_message_id == "<foo/bar@example.com>"
+    assert provider.reply(messages[0], "reply") == "reply-1"
+    opener = provider._opener
+    assert isinstance(opener, QueueOpener)
+    endpoints = [json.loads(request.data)["endpoint"] for request in opener.requests]
+    encoded = "%3Cfoo%2Fbar%40example.com%3E"
+    assert endpoints == [
+        "/v0/inboxes/bridge%40agentmail.test/messages",
+        f"/v0/inboxes/bridge%40agentmail.test/messages/{encoded}",
+        f"/v0/inboxes/bridge%40agentmail.test/messages/{encoded}",
+        f"/v0/inboxes/bridge%40agentmail.test/messages/{encoded}/reply",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -148,7 +173,9 @@ def test_composio_transport_preserves_agentmail_authentication_labels() -> None:
         ("GET", "https://attacker.test/v0/messages"),
         ("GET", "/inboxes/other/messages"),
         ("GET", "/inboxes/bridge%40agentmail.test/messages/../secrets"),
-        ("GET", "/inboxes/bridge%40agentmail.test/messages/id%2Fsecrets"),
+        ("GET", "/inboxes/bridge%40agentmail.test/messages/..%2Fsecrets"),
+        ("GET", "/inboxes/bridge%40agentmail.test/messages/..%5Csecrets"),
+        ("GET", "/inboxes/bridge%40agentmail.test/messages/id%2F%2Fsecrets"),
         ("POST", "/inboxes/bridge%40agentmail.test/messages/id"),
     ],
 )

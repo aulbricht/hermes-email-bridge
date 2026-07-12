@@ -81,6 +81,16 @@ def test_normalizes_trusted_sent_recipients_across_to_cc_bcc() -> None:
     )
 
 
+def test_sent_message_without_provider_timestamp_fails_closed() -> None:
+    with pytest.raises(AgentMailError, match="timestamp"):
+        normalize_agentmail_sent_message(
+            {
+                "message_id": "old-sent-message",
+                "to": ["person@example.test"],
+            }
+        )
+
+
 class StubAgentMailProvider(AgentMailProvider):
     def __init__(self, detail_labels: list[str] | None = None) -> None:
         super().__init__(api_key="test", inbox_id="bridge@agentmail.to")
@@ -268,7 +278,7 @@ def test_composio_settings_require_only_key_account_and_inbox() -> None:
     settings = Settings.from_env(
         {
             "EMAIL_BRIDGE_PROVIDER": "composio-agentmail",
-            "COMPOSIO_API_KEY": "test-key",
+            "EMAIL_BRIDGE_COMPOSIO_API_KEY": "test-key",
             "COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID": "ca_test",
             "COMPOSIO_AGENT_MAIL_INBOX_ID": "bridge@example.test",
         }
@@ -279,9 +289,18 @@ def test_composio_settings_require_only_key_account_and_inbox() -> None:
         "bridge@example.test",
     )
     assert settings.logical_provider() == "agentmail"
-    with pytest.raises(ConfigError, match="COMPOSIO_API_KEY"):
+    with pytest.raises(ConfigError, match="EMAIL_BRIDGE_COMPOSIO_API_KEY"):
         Settings.from_env(
             {"EMAIL_BRIDGE_PROVIDER": "composio-agentmail"}
+        ).require_composio_agentmail()
+    with pytest.raises(ConfigError, match="EMAIL_BRIDGE_COMPOSIO_API_KEY"):
+        Settings.from_env(
+            {
+                "EMAIL_BRIDGE_PROVIDER": "composio-agentmail",
+                "COMPOSIO_API_KEY": "must-not-be-used-by-the-bridge",
+                "COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID": "ca_test",
+                "COMPOSIO_AGENT_MAIL_INBOX_ID": "bridge@example.test",
+            }
         ).require_composio_agentmail()
 
 

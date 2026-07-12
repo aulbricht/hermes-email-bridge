@@ -231,6 +231,44 @@ def test_v0_database_migrates_without_data_loss(tmp_path: Path) -> None:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
 
 
+def test_v1_database_with_shared_thread_across_participants_migrates(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE mappings (
+                id INTEGER PRIMARY KEY, provider TEXT NOT NULL, hermes_session TEXT NOT NULL,
+                hermes_topic TEXT, provider_thread_id TEXT, subject_key TEXT,
+                participant_email TEXT, bridge_marker TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                bridge_marker_expires_at TEXT
+            );
+            CREATE UNIQUE INDEX mappings_provider_thread_participant
+                ON mappings(provider, provider_thread_id, participant_email)
+                WHERE provider_thread_id IS NOT NULL AND participant_email IS NOT NULL;
+            INSERT INTO mappings VALUES
+                (1, 'agentmail', 'session-1', NULL, 'shared-thread', NULL,
+                 'one@example.test', 'abcdefghijklmnopqrstuvwxyz_123456',
+                 '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00', NULL),
+                (2, 'agentmail', 'session-2', NULL, 'shared-thread', NULL,
+                 'two@example.test', 'abcdefghijklmnopqrstuvwxyz_654321',
+                 '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00', NULL);
+            PRAGMA user_version = 1;
+            """
+        )
+
+    with MappingStore(path) as store:
+        assert [item.hermes_session for item in store.list_mappings()] == [
+            "session-1",
+            "session-2",
+        ]
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(mappings)").fetchall()}
+        assert "mappings_provider_thread" not in indexes
+        assert "mappings_provider_thread_participant" in indexes
+
+
 def test_rejects_newer_database_version(tmp_path: Path) -> None:
     path = tmp_path / "future.db"
     with sqlite3.connect(path) as connection:
@@ -313,12 +351,27 @@ def test_sent_enrollment_is_idempotent_and_removal_requires_a_new_message() -> N
         recipients=("to@example.test",),
         sent_at=datetime(2026, 7, 11, 13, tzinfo=UTC),
     )
+    unobserved_old = SentEmail(
+        provider="agentmail",
+        provider_message_id="sent-old-unobserved",
+        recipients=("to@example.test",),
+        sent_at=datetime(2026, 7, 11, 12, 15, tzinfo=UTC),
+    )
     with MappingStore(":memory:") as store:
         assert store.enroll_sent_message(first) == 3
         assert store.enroll_sent_message(first) == 0
-        assert store.remove_allowed_address("agentmail", "to@example.test")
+        assert store.remove_allowed_address(
+            "agentmail",
+            "to@example.test",
+            now=datetime(2026, 7, 11, 12, 30, tzinfo=UTC),
+        )
         assert store.enroll_sent_message(first) == 0
+        assert store.enroll_sent_message(unobserved_old) == 0
+        assert store.enroll_sent_message(unobserved_old) == 0
         assert not store.is_allowed("agentmail", "to@example.test")
+        assert all(
+            item.address != "to@example.test" for item in store.list_allowed_addresses("agentmail")
+        )
         assert store.enroll_sent_message(second) == 1
         assert store.is_allowed("agentmail", "to@example.test")
         entry = next(
@@ -327,6 +380,25 @@ def test_sent_enrollment_is_idempotent_and_removal_requires_a_new_message() -> N
             if item.address == "to@example.test"
         )
         assert entry.source_message_id == "sent-2"
+
+
+def test_removing_never_allowed_address_tombstones_old_sent_mail() -> None:
+    old = SentEmail(
+        provider="agentmail",
+        provider_message_id="sent-before-revocation",
+        recipients=("person@example.test",),
+        sent_at=datetime(2026, 7, 11, 11, tzinfo=UTC),
+    )
+    with MappingStore(":memory:") as store:
+        assert not store.remove_allowed_address(
+            "agentmail",
+            "person@example.test",
+            now=datetime(2026, 7, 11, 12, tzinfo=UTC),
+        )
+        assert store.enroll_sent_message(old) == 0
+        assert not store.is_allowed("agentmail", "person@example.test")
+        store.add_allowed_address("agentmail", "person@example.test")
+        assert store.is_allowed("agentmail", "person@example.test")
 
 
 def test_start_now_atomically_seeds_missing_cursors_without_overwrite() -> None:

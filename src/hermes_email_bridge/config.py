@@ -73,7 +73,7 @@ class Settings:
     agentmail_webhook_secret: str | None
     agentmail_base_url: str
     agentmail_allow_insecure_local_http: bool
-    composio_api_key: str | None
+    bridge_composio_api_key: str | None
     composio_connected_account_id: str | None
     composio_inbox_id: str | None
     webhook_host: str
@@ -145,7 +145,7 @@ class Settings:
             agentmail_webhook_secret=values.get("AGENTMAIL_WEBHOOK_SECRET"),
             agentmail_base_url=agentmail_base_url,
             agentmail_allow_insecure_local_http=allow_local_http,
-            composio_api_key=values.get("COMPOSIO_API_KEY"),
+            bridge_composio_api_key=values.get("EMAIL_BRIDGE_COMPOSIO_API_KEY"),
             composio_connected_account_id=values.get("COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID"),
             composio_inbox_id=values.get("COMPOSIO_AGENT_MAIL_INBOX_ID"),
             webhook_host=values.get("EMAIL_BRIDGE_WEBHOOK_HOST", "127.0.0.1"),
@@ -165,14 +165,14 @@ class Settings:
     def require_composio_agentmail(self) -> tuple[str, str, str]:
         if self.provider != "composio-agentmail":
             raise ConfigError(f"unsupported provider: {self.provider}")
-        if not self.composio_api_key:
-            raise ConfigError("COMPOSIO_API_KEY is required")
+        if not self.bridge_composio_api_key:
+            raise ConfigError("EMAIL_BRIDGE_COMPOSIO_API_KEY is required")
         if not self.composio_connected_account_id:
             raise ConfigError("COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID is required")
         if not self.composio_inbox_id:
             raise ConfigError("COMPOSIO_AGENT_MAIL_INBOX_ID is required")
         return (
-            self.composio_api_key,
+            self.bridge_composio_api_key,
             self.composio_connected_account_id,
             self.composio_inbox_id,
         )
