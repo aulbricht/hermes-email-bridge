@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import grp
+import hashlib
 import importlib.util
+import json
 import os
 import pwd
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,6 +17,7 @@ import pytest
 ROOT = Path(__file__).parents[1]
 WRAPPER_PATH = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
 PROBE_PATH = ROOT / "deploy/macos/verify-hermes-email-agent.py"
+BOUNDARY_HELPER_PATH = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
 RUNTIME_PATH = ROOT / "deploy/macos/install-hermes-email-runtime.py"
 
 
@@ -37,6 +42,16 @@ def _load_runtime() -> Any:
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_boundary_helper() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "hermes_email_boundary_helper", BOUNDARY_HELPER_PATH
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
@@ -224,7 +239,7 @@ def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
     assert calls[1][-4:-2] == ["--resume", "live_session"]
 
 
-def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path]:
+def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path, Path, Any]:
     probe = _load_probe()
     runtime = _load_runtime()
     candidates = tmp_path / "candidates"
@@ -235,28 +250,57 @@ def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path]:
     candidate_wrapper.write_bytes(WRAPPER_PATH.read_bytes())
     candidate_template = candidates / "hermes-email-agent.sudoers"
     candidate_template.write_bytes((ROOT / "deploy/macos/hermes-email-agent.sudoers").read_bytes())
+    candidate_helper = candidates / "hermes-email-boundary-verify.py"
+    candidate_helper.write_bytes(BOUNDARY_HELPER_PATH.read_bytes())
     wrapper = boundary / "hermes-email-agent"
     wrapper.write_bytes(candidate_wrapper.read_bytes())
     wrapper.chmod(0o755)
+    helper = boundary / "hermes-email-boundary-verify"
+    helper.write_bytes(candidate_helper.read_bytes())
+    helper.chmod(0o755)
     sudoers = boundary / "hermes-email-agent.sudoers"
     user = pwd.getpwuid(os.getuid()).pw_name
     sudoers.write_text(candidate_template.read_text().replace("__BRIDGE_USER__", user))
     sudoers.chmod(0o440)
-    return probe, runtime, candidates, wrapper, sudoers
+
+    def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        expected = (
+            [str(helper)]
+            if os.geteuid() == 0
+            else ["/usr/bin/sudo", "-n", "-H", "-u", "root", str(helper)]
+        )
+        assert argv == expected
+        policy = sudoers.read_text()
+        match = re.match(r"Defaults:([A-Za-z_][A-Za-z0-9_-]{0,31}) ", policy)
+        configured_user = "" if match is None else match.group(1)
+        rendered = candidate_template.read_text().replace("__BRIDGE_USER__", configured_user)
+        if policy != rendered:
+            return subprocess.CompletedProcess(argv, 1, "", "boundary failure")
+        evidence = {
+            "bridge_user": configured_user,
+            "sudoers_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
+            "wrapper_sha256": runtime.WRAPPER_SHA256,
+        }
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n", ""
+        )
+
+    return probe, runtime, candidates, wrapper, helper, sudoers, runner
 
 
 def test_runtime_verifier_requires_exact_attested_wrapper_and_sudoers_bytes(
     tmp_path: Path,
 ) -> None:
-    probe, runtime, candidates, wrapper, sudoers = _boundary_fixture(tmp_path)
+    probe, runtime, candidates, wrapper, helper, _sudoers, runner = _boundary_fixture(tmp_path)
     uid, gid = os.getuid(), os.getgid()
     evidence = probe.verify_fixed_boundary(
         runtime,
         uid=uid,
         gid=gid,
         wrapper=wrapper,
-        sudoers=sudoers,
+        helper=helper,
         candidate_directory=candidates,
+        runner=runner,
     )
     assert evidence["bridge_user"] == pwd.getpwuid(uid).pw_name
     assert len(evidence["wrapper_sha256"]) == 64
@@ -267,15 +311,16 @@ def test_runtime_verifier_requires_exact_attested_wrapper_and_sudoers_bytes(
     "mutation,error",
     [
         ("wrapper-byte", "wrapper bytes"),
-        ("broader-policy", "policy shape"),
+        ("broader-policy", "privileged boundary attestation failed"),
         ("stale-wrapper", "wrapper bytes"),
+        ("helper-byte", "helper bytes"),
         ("wrong-user", "startup verifier user"),
     ],
 )
 def test_runtime_verifier_rejects_tampered_boundary_bytes(
     tmp_path: Path, mutation: str, error: str
 ) -> None:
-    probe, runtime, candidates, wrapper, sudoers = _boundary_fixture(tmp_path)
+    probe, runtime, candidates, wrapper, helper, sudoers, runner = _boundary_fixture(tmp_path)
     if mutation == "wrapper-byte":
         wrapper.write_bytes(wrapper.read_bytes() + b"\n")
     elif mutation == "broader-policy":
@@ -289,6 +334,8 @@ def test_runtime_verifier_rejects_tampered_boundary_bytes(
         sudoers.chmod(0o440)
     elif mutation == "stale-wrapper":
         wrapper.write_text(wrapper.read_text().replace('"gpt-5.5"', '"gpt-5.4"'))
+    elif mutation == "helper-byte":
+        helper.write_bytes(helper.read_bytes() + b"\n")
     else:
         sudoers.chmod(0o600)
         sudoers.write_text(
@@ -303,8 +350,106 @@ def test_runtime_verifier_rejects_tampered_boundary_bytes(
             uid=os.getuid(),
             gid=os.getgid(),
             wrapper=wrapper,
-            sudoers=sudoers,
+            helper=helper,
             candidate_directory=candidates,
+            runner=runner,
+        )
+
+
+def test_privileged_helper_rejects_args_and_broadened_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper = _load_boundary_helper()
+    template = (ROOT / "deploy/macos/hermes-email-agent.sudoers").read_text()
+    policy = template.replace("__BRIDGE_USER__", "bridge_user").encode()
+    monkeypatch.setattr(helper.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(helper, "_validate_directory", lambda _path: None)
+    monkeypatch.setattr(
+        helper,
+        "_read_fixed",
+        lambda path, _mode: WRAPPER_PATH.read_bytes() if path == helper.WRAPPER else policy,
+    )
+    assert helper.verify()["bridge_user"] == "bridge_user"
+    with pytest.raises(ValueError, match="no arguments"):
+        helper.main(["--alternate-path"])
+    policy = policy.replace(b' ""\n', b' "", /usr/bin/id\n')
+    with pytest.raises(ValueError, match="reviewed bytes"):
+        helper.verify()
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.geteuid() != 0,
+    reason="requires root and the installed macOS boundary",
+)
+def test_distinct_bridge_uid_cannot_read_sudoers_but_exact_helper_succeeds_and_tamper_fails(
+    tmp_path: Path,
+) -> None:
+    probe = _load_probe()
+    runtime = _load_runtime()
+    if not (probe.WRAPPER.is_file() and probe.BOUNDARY_HELPER.is_file()):
+        pytest.skip("fixed production boundary is not installed")
+    direct = subprocess.run(
+        [str(probe.BOUNDARY_HELPER)], capture_output=True, check=False, text=True
+    )
+    assert direct.returncode == 0 and direct.stderr == ""
+    bridge_user = json.loads(direct.stdout)["bridge_user"]
+    assert bridge_user not in {"root", "_hermesmail"}
+    unreadable = subprocess.run(
+        ["/usr/bin/sudo", "-n", "-u", bridge_user, "/bin/cat", str(probe.SUDOERS)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert unreadable.returncode != 0
+    authorized = subprocess.run(
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "-u",
+            bridge_user,
+            "/usr/bin/sudo",
+            "-n",
+            "-H",
+            "-u",
+            "root",
+            str(probe.BOUNDARY_HELPER),
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert authorized.returncode == 0 and authorized.stdout == direct.stdout
+    extra_argument = subprocess.run(
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "-u",
+            bridge_user,
+            "/usr/bin/sudo",
+            "-n",
+            "-H",
+            "-u",
+            "root",
+            str(probe.BOUNDARY_HELPER),
+            "--alternate-path",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert extra_argument.returncode != 0
+
+    tampered = tmp_path / "hermes-email-boundary-verify"
+    tampered.write_bytes(probe.BOUNDARY_HELPER.read_bytes() + b"\n")
+    tampered.chmod(0o755)
+    with pytest.raises(ValueError, match="helper bytes"):
+        probe.verify_fixed_boundary(
+            runtime,
+            uid=0,
+            gid=grp.getgrnam("wheel").gr_gid,
+            helper=tampered,
+            candidate_directory=probe.INSTALL_ROOT / "runtime",
+            enforce_invoker=False,
         )
 
 
@@ -314,6 +459,7 @@ def test_runtime_verifier_rejects_tampered_boundary_bytes(
         ["--source", "/tmp/source"],
         ["--python", "/tmp/venv/bin/python"],
         ["--wrapper", "/tmp/wrapper"],
+        ["--helper", "/tmp/helper"],
     ],
 )
 def test_runtime_verifier_cli_rejects_arbitrary_runtime_paths(arguments: list[str]) -> None:

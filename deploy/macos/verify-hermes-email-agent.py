@@ -21,15 +21,11 @@ from typing import Any, Optional
 
 INSTALL_ROOT = Path("/Library/Application Support/HermesEmailAgent/hermes-agent")
 WRAPPER = Path("/usr/local/libexec/hermes-email-agent")
+BOUNDARY_HELPER = Path("/usr/local/libexec/hermes-email-boundary-verify")
 SUDOERS = Path("/private/etc/sudoers.d/hermes-email-agent")
 RUNTIME_INSTALLER = Path(__file__).with_name("install-hermes-email-runtime.py")
 _SESSION = re.compile(r"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9_-]{0,127})\s*$")
-_POLICY = re.compile(
-    r"Defaults:(?P<user>[A-Za-z_][A-Za-z0-9_-]{0,31}) "
-    r"env_reset, secure_path=/usr/bin:/bin:/usr/sbin:/sbin\n"
-    r"(?P=user) ALL = \(_hermesmail\) NOPASSWD: "
-    r"/usr/local/libexec/hermes-email-agent\n"
-)
+_BRIDGE_USER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
 _PLACEHOLDER = "__BRIDGE_USER__"
 
 
@@ -70,19 +66,24 @@ def verify_fixed_boundary(
     uid: int,
     gid: int,
     wrapper: Path = WRAPPER,
-    sudoers: Path = SUDOERS,
+    helper: Path = BOUNDARY_HELPER,
     candidate_directory: Optional[Path] = None,
     enforce_invoker: bool = True,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, str]:
     candidates = Path(__file__).parent if candidate_directory is None else candidate_directory
     candidate_wrapper = candidates / "hermes-email-agent-wrapper.py"
     candidate_sudoers = candidates / "hermes-email-agent.sudoers"
+    candidate_helper = candidates / "hermes-email-boundary-verify.py"
     candidate_wrapper_content = candidate_wrapper.read_bytes()
     candidate_sudoers_content = candidate_sudoers.read_bytes()
+    candidate_helper_content = candidate_helper.read_bytes()
     if _sha256(candidate_wrapper_content) != runtime.WRAPPER_SHA256:
         raise ValueError("attested wrapper candidate does not match the reviewed hash")
     if _sha256(candidate_sudoers_content) != runtime.SUDOERS_TEMPLATE_SHA256:
         raise ValueError("attested sudoers candidate does not match the reviewed hash")
+    if _sha256(candidate_helper_content) != runtime.BOUNDARY_HELPER_SHA256:
+        raise ValueError("attested boundary helper does not match the reviewed hash")
     if wrapper == WRAPPER:
         runtime.verify_usr_local_chain(wrapper, uid=uid, gid=gid)
     runtime._safe_details(wrapper, expected_uid=uid, expected_gid=gid, exact_mode=0o755)
@@ -90,35 +91,60 @@ def verify_fixed_boundary(
     if wrapper_content != candidate_wrapper_content:
         raise ValueError("installed wrapper bytes do not match the attested candidate")
     runtime.reject_acls([wrapper])
-
-    sudoers_chain = (
-        [Path("/"), Path("/private"), Path("/private/etc"), sudoers.parent]
-        if sudoers == SUDOERS
-        else [sudoers.parent]
+    if helper == BOUNDARY_HELPER:
+        runtime.verify_usr_local_chain(helper, uid=uid, gid=gid)
+    runtime._safe_details(helper, expected_uid=uid, expected_gid=gid, exact_mode=0o755)
+    if helper.read_bytes() != candidate_helper_content:
+        raise ValueError("installed boundary helper bytes do not match the attested candidate")
+    runtime.reject_acls([helper])
+    command = (
+        [str(helper)]
+        if os.geteuid() == 0
+        else ["/usr/bin/sudo", "-n", "-H", "-u", "root", str(helper)]
     )
-    for directory in sudoers_chain:
-        runtime._safe_details(directory, expected_uid=uid, expected_gid=gid, exact_mode=0o755)
-    runtime._safe_details(sudoers, expected_uid=uid, expected_gid=gid, exact_mode=0o440)
-    runtime.reject_acls([*sudoers_chain, sudoers])
+    result = runner(
+        command,
+        capture_output=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0 or result.stderr:
+        raise ValueError("privileged boundary attestation failed")
     try:
-        policy = sudoers.read_text()
         template = candidate_sudoers_content.decode()
-    except UnicodeDecodeError as exc:
-        raise ValueError("sudoers policy and candidate must be UTF-8") from exc
-    match = _POLICY.fullmatch(policy)
-    if match is None or template.count(_PLACEHOLDER) != 2:
-        raise ValueError("installed sudoers policy shape is not the reviewed policy")
-    bridge_user = match.group("user")
-    rendered = template.replace(_PLACEHOLDER, bridge_user)
-    if policy != rendered:
-        raise ValueError("installed sudoers bytes do not match the attested candidate")
+        evidence = json.loads(result.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("privileged boundary attestation is malformed") from exc
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "bridge_user",
+        "sudoers_sha256",
+        "wrapper_sha256",
+    }:
+        raise ValueError("privileged boundary attestation is incomplete")
+    bridge_user = evidence.get("bridge_user")
+    if not isinstance(bridge_user, str) or _BRIDGE_USER.fullmatch(bridge_user) is None:
+        raise ValueError("privileged boundary bridge user is malformed")
+    if template.count(_PLACEHOLDER) != 3:
+        raise ValueError("attested sudoers template is malformed")
+    expected = {
+        "bridge_user": bridge_user,
+        "sudoers_sha256": _sha256(template.replace(_PLACEHOLDER, bridge_user).encode()),
+        "wrapper_sha256": runtime.WRAPPER_SHA256,
+    }
+    if (
+        evidence != expected
+        or result.stdout != json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
+    ):
+        raise ValueError("privileged boundary attestation does not match reviewed bytes")
     if enforce_invoker and os.geteuid() != 0 and pwd.getpwuid(os.getuid()).pw_name != bridge_user:
         raise ValueError("startup verifier user does not match the sudoers bridge user")
     verify_wrapper_shapes(wrapper)
     return {
         "bridge_user": bridge_user,
-        "sudoers_sha256": _sha256(policy.encode()),
-        "wrapper_sha256": _sha256(wrapper_content),
+        "sudoers_sha256": expected["sudoers_sha256"],
+        "wrapper_sha256": expected["wrapper_sha256"],
     }
 
 

@@ -28,9 +28,12 @@ def _fixture(tmp_path: Path) -> tuple[Any, Any, int, int]:
     assets = tmp_path / "assets"
     assets.mkdir()
     (assets / "hermes-email-agent-wrapper.py").write_text("#!/usr/bin/python3\n")
+    (assets / "hermes-email-boundary-verify.py").write_text("#!/usr/bin/python3\n")
     (assets / "hermes-email-agent.sudoers").write_text(
         "Defaults:__BRIDGE_USER__ env_reset\n"
         "__BRIDGE_USER__ ALL = (_hermesmail) NOPASSWD: /usr/local/libexec/hermes-email-agent\n"
+        "__BRIDGE_USER__ ALL = (root) NOPASSWD: "
+        '/usr/local/libexec/hermes-email-boundary-verify ""\n'
     )
     system_root = tmp_path / "system"
     for relative in ("usr/local", "private/etc/sudoers.d"):
@@ -55,13 +58,15 @@ def _no_acl(_path: Path) -> bool:
 def _valid_sudoers(path: Path) -> None:
     rendered = path.read_text()
     assert "__BRIDGE_USER__" not in rendered
-    assert rendered.count("bridge_user") == 2
+    assert rendered.count("bridge_user") == 3
 
 
 def _existing_install(plan: Any) -> None:
     plan.libexec.mkdir(mode=0o755)
     plan.wrapper_destination.write_text("old wrapper\n")
     plan.wrapper_destination.chmod(0o755)
+    plan.helper_destination.write_text("old helper\n")
+    plan.helper_destination.chmod(0o755)
     plan.sudoers_destination.write_text("old sudoers\n")
     plan.sudoers_destination.chmod(0o440)
 
@@ -69,6 +74,8 @@ def _existing_install(plan: Any) -> None:
 def _assert_existing_restored(plan: Any) -> None:
     assert plan.wrapper_destination.read_text() == "old wrapper\n"
     assert stat.S_IMODE(plan.wrapper_destination.stat().st_mode) == 0o755
+    assert plan.helper_destination.read_text() == "old helper\n"
+    assert stat.S_IMODE(plan.helper_destination.stat().st_mode) == 0o755
     assert plan.sudoers_destination.read_text() == "old sudoers\n"
     assert stat.S_IMODE(plan.sudoers_destination.stat().st_mode) == 0o440
 
@@ -88,6 +95,7 @@ def test_installer_creates_missing_libexec_and_atomically_installs_files(tmp_pat
     assert actions[0].startswith("create ")
     assert stat.S_IMODE(plan.libexec.stat().st_mode) == 0o755
     assert plan.wrapper_destination.read_text() == "#!/usr/bin/python3\n"
+    assert plan.helper_destination.read_text() == "#!/usr/bin/python3\n"
     assert stat.S_IMODE(plan.wrapper_destination.stat().st_mode) == 0o755
     assert "bridge_user" in plan.sudoers_destination.read_text()
     assert stat.S_IMODE(plan.sudoers_destination.stat().st_mode) == 0o440
@@ -108,6 +116,7 @@ def test_installer_dry_plan_does_not_create_missing_directory(tmp_path: Path) ->
     assert actions == (
         f"create {plan.libexec} root:wheel 0755",
         f"install {plan.wrapper_destination} root:wheel 0755",
+        f"install {plan.helper_destination} root:wheel 0755",
         f"install {plan.sudoers_destination} root:wheel 0440",
     )
 
@@ -120,11 +129,12 @@ def test_installer_rejects_unsafe_bridge_user(name: str) -> None:
 
 def test_installer_requires_exact_placeholder_count() -> None:
     installer = _installer()
-    with pytest.raises(ValueError, match="exactly two"):
+    with pytest.raises(ValueError, match="exactly three"):
         installer.render_sudoers("__BRIDGE_USER__ only once", "bridge_user")
     with pytest.raises(ValueError, match="rendering failed"):
         installer.render_sudoers(
-            "__BRIDGE_USER__ and __BRIDGE_USER__ and __UNRESOLVED__", "bridge_user"
+            "__BRIDGE_USER__ and __BRIDGE_USER__ and __BRIDGE_USER__ and __UNRESOLVED__",
+            "bridge_user",
         )
 
 
@@ -341,7 +351,7 @@ def test_sudoers_replace_failure_restores_existing_authorized_files(tmp_path: Pa
     _assert_existing_restored(plan)
 
 
-@pytest.mark.parametrize("tampered", ["wrapper", "sudoers"])
+@pytest.mark.parametrize("tampered", ["wrapper", "helper", "sudoers"])
 def test_final_byte_mismatch_restores_existing_authorized_files(
     tmp_path: Path, tampered: str
 ) -> None:
@@ -350,12 +360,14 @@ def test_final_byte_mismatch_restores_existing_authorized_files(
 
     def replace_then_tamper(source: Path, destination: Path) -> None:
         os.replace(source, destination)
-        if (tampered == "wrapper" and destination == plan.wrapper_destination) or (
-            tampered == "sudoers" and destination == plan.sudoers_destination
+        if (
+            (tampered == "wrapper" and destination == plan.wrapper_destination)
+            or (tampered == "helper" and destination == plan.helper_destination)
+            or (tampered == "sudoers" and destination == plan.sudoers_destination)
         ):
             destination.chmod(0o600)
             destination.write_bytes(destination.read_bytes() + b" ")
-            destination.chmod(0o755 if tampered == "wrapper" else 0o440)
+            destination.chmod(0o440 if tampered == "sudoers" else 0o755)
 
     with pytest.raises(ValueError, match=r"installed .* bytes"):
         installer.install(

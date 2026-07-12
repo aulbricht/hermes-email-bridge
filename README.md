@@ -339,16 +339,17 @@ The stdlib-only installer preflights `/usr`, `/usr/local`, `/usr/local/libexec`,
 visible through macOS's system `/etc` link); it rejects symlinks, wrong root:wheel ownership,
 group/other write access, and unexpected ACLs. It safely creates a missing
 `/usr/local/libexec` as root:wheel `0755`, validates the rendered policy with `visudo`,
-then atomically installs the wrapper as root:wheel `0755` and sudoers policy as root:wheel
-`0440`. Final installation and every recurring startup verification byte-compare the installed
-wrapper and exactly rendered, narrowly parsed sudoers policy with their reviewed, runtime-attested
-candidates; an extra byte, rule, command, user, run-as target, or stale wrapper fails closed. The
+then atomically installs the wrapper and no-argument boundary verifier as root:wheel `0755` and
+the sudoers policy as root:wheel `0440`. Final installation and every recurring startup
+verification byte-compare the installed helper and wrapper and attest the exactly rendered,
+narrowly parsed sudoers policy against their reviewed runtime candidates; an extra byte, argument,
+rule, command, user, run-as target, stale wrapper, or changed helper fails closed. The
 installer intentionally supports macOS system Python 3.9.6. Validate its plan
 first, then install as root:
 
-Both files are staged and validated before replacement. Existing content, ownership, and
+All three files are staged and validated before replacement. Existing content, ownership, and
 modes are preserved as rollback snapshots; a replacement, final path, ACL, or final `visudo`
-failure restores both files and removes a newly-created empty `libexec` directory.
+failure restores all three files and removes a newly-created empty `libexec` directory.
 
 ```bash
 /usr/bin/python3 deploy/macos/install-hermes-email-agent.py \
@@ -359,8 +360,13 @@ sudo /usr/bin/python3 deploy/macos/install-hermes-email-agent.py \
   --bridge-user YOUR_BRIDGE_ACCOUNT
 ```
 
-The sudoers rule grants the bridge account only the exact root-owned wrapper as
-`_hermesmail`. The wrapper accepts only `--query TEXT` with one optional safe `--resume
+The sudoers policy grants the bridge account only the exact root-owned wrapper as `_hermesmail`
+and the root-owned `/usr/local/libexec/hermes-email-boundary-verify` helper as root with an
+explicit empty argument list. The helper itself rejects all arguments and reads only the fixed
+wrapper and `0440` policy, returning canonical identity and hash evidence. The unprivileged
+LaunchAgent never reads sudoers directly; it exact-byte checks the readable attested helper and
+accepts only the fixed helper command and exact evidence for its own configured bridge identity.
+The wrapper accepts only `--query TEXT` with one optional safe `--resume
 SESSION_ID`; it fixes the working directory, environment, executable, and Hermes arguments:
 safe mode, `context_engine`, `openai-codex`, `gpt-5.5`, and one turn. It cannot select arbitrary
 providers, models, tools, toolsets, hooks, skills, flags, or commands. Configure the bridge:
@@ -455,7 +461,7 @@ sudo /usr/bin/python3 deploy/macos/install-hermes-email-runtime.py
 
 The resulting root-owned `runtime/runtime-attestation.json` binds the archive, commit, source and
 lock digests, pinned `uv`, exact build account/backend/constraint/artifact hashes, built wheel,
-managed Python, console entrypoint, reviewed wrapper/sudoers candidate hashes, fixed verifier
+managed Python, console entrypoint, reviewed helper/wrapper/sudoers candidate hashes, fixed verifier
 assets, and a canonical digest of the entire generation. Verification rejects editable installs,
 unexpected `direct_url`,
 imports outside the fixed venv's site-packages, wrong entrypoint/shebang, stale dependencies,
@@ -473,8 +479,9 @@ before the environment file is sourced:
 '/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/verify-hermes-email-agent.py'
 ```
 
-The verifier checks the actual fixed Python, `hermes` console script, non-editable distribution,
-import origins, lock/version, exactly zero tool schemas for `context_engine`, and offline
+The verifier checks the exact root helper/wrapper boundary and privileged sudoers hash evidence,
+the actual fixed Python, `hermes` console script, non-editable distribution, import origins,
+lock/version, exactly zero tool schemas for `context_engine`, and offline
 new/resume parser shapes. Every offline install and startup probe creates its own invoking-user-owned
 mode `0700` temporary `HOME`/`HERMES_HOME` outside `/var/db/hermes-email-agent` and removes it on
 success or failure. Offline verification never reads or changes the real service home.

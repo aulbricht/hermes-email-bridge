@@ -35,6 +35,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     plist_path = ROOT / "deploy/macos/com.example.hermes.email-bridge.plist"
     launcher_path = ROOT / "deploy/macos/run-email-bridge.sh"
     wrapper_path = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
+    helper_path = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
     fetcher_path = ROOT / "deploy/macos/fetch-hermes-email-agent.py"
     probe_path = ROOT / "deploy/macos/verify-hermes-email-agent.py"
     runtime_installer_path = ROOT / "deploy/macos/install-hermes-email-runtime.py"
@@ -45,7 +46,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     launcher = launcher_path.read_text()
     wrapper = wrapper_path.read_text()
     sudoers = sudoers_path.read_text()
-    combined = plist_text + launcher + wrapper + sudoers
+    combined = plist_text + launcher + wrapper + helper_path.read_text() + sudoers
     assert "snowcapconsulting" not in combined
     assert "aulbricht" not in combined
     assert "/Users/" not in combined
@@ -55,6 +56,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     if os.name == "posix":
         assert launcher_path.stat().st_mode & 0o111
         assert wrapper_path.stat().st_mode & 0o111
+        assert helper_path.stat().st_mode & 0o111
         assert fetcher_path.stat().st_mode & 0o111
         assert probe_path.stat().st_mode & 0o111
         assert runtime_installer_path.stat().st_mode & 0o111
@@ -64,6 +66,9 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
 
     assert "__BRIDGE_USER__ ALL = (_hermesmail) NOPASSWD:" in sudoers
     assert "/usr/local/libexec/hermes-email-agent" in sudoers
+    assert (
+        '__BRIDGE_USER__ ALL = (root) NOPASSWD: /usr/local/libexec/hermes-email-boundary-verify ""'
+    ) in sudoers
     for fixed in (
         "/var/db/hermes-email-agent/workspace",
         "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes",
@@ -97,7 +102,8 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "/var/db/hermes-email-agent" not in runtime_installer
     probe = probe_path.read_text()
     assert "installed wrapper bytes do not match" in probe
-    assert "installed sudoers bytes do not match" in probe
+    assert "privileged boundary attestation" in probe
+    assert "installed boundary helper bytes do not match" in probe
 
     plist = plistlib.loads(plist_path.read_bytes())
     assert plist["RunAtLoad"] is True

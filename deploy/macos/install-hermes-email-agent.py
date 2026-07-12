@@ -25,12 +25,14 @@ _PLACEHOLDER = "__BRIDGE_USER__"
 @dataclass(frozen=True)
 class InstallPlan:
     wrapper_source: Path
+    helper_source: Path
     sudoers_source: Path
     filesystem_root: Path
     usr: Path
     usr_local: Path
     libexec: Path
     wrapper_destination: Path
+    helper_destination: Path
     private: Path
     etc: Path
     sudoers_directory: Path
@@ -47,12 +49,14 @@ def build_plan(root: Path = Path("/"), assets: Optional[Path] = None) -> Install
     sudoers_directory = rooted("/private/etc/sudoers.d")
     return InstallPlan(
         wrapper_source=asset_directory / "hermes-email-agent-wrapper.py",
+        helper_source=asset_directory / "hermes-email-boundary-verify.py",
         sudoers_source=asset_directory / "hermes-email-agent.sudoers",
         filesystem_root=root,
         usr=rooted("/usr"),
         usr_local=rooted("/usr/local"),
         libexec=libexec,
         wrapper_destination=libexec / "hermes-email-agent",
+        helper_destination=libexec / "hermes-email-boundary-verify",
         private=rooted("/private"),
         etc=rooted("/private/etc"),
         sudoers_directory=sudoers_directory,
@@ -68,8 +72,8 @@ def validate_bridge_user(value: str) -> str:
 
 def render_sudoers(template: str, bridge_user: str) -> str:
     validate_bridge_user(bridge_user)
-    if template.count(_PLACEHOLDER) != 2:
-        raise ValueError("sudoers template must contain exactly two bridge-user placeholders")
+    if template.count(_PLACEHOLDER) != 3:
+        raise ValueError("sudoers template must contain exactly three bridge-user placeholders")
     rendered = template.replace(_PLACEHOLDER, bridge_user)
     if _PLACEHOLDER in rendered or re.search(r"__[A-Z0-9_]+__", rendered):
         raise ValueError("sudoers placeholder rendering failed")
@@ -207,6 +211,7 @@ def install(
 ) -> tuple[str, ...]:
     bridge_user = validate_bridge_user(bridge_user)
     wrapper_content = _read_source(plan.wrapper_source)
+    helper_content = _read_source(plan.helper_source)
     try:
         sudoers_template = _read_source(plan.sudoers_source).decode()
     except UnicodeDecodeError as exc:
@@ -246,6 +251,7 @@ def install(
         )
     for destination, mode in (
         (plan.wrapper_destination, 0o755),
+        (plan.helper_destination, 0o755),
         (plan.sudoers_destination, 0o440),
     ):
         if destination.exists() or destination.is_symlink():
@@ -265,6 +271,7 @@ def install(
     actions_list.extend(
         (
             f"install {plan.wrapper_destination} root:wheel 0755",
+            f"install {plan.helper_destination} root:wheel 0755",
             f"install {plan.sudoers_destination} root:wheel 0440",
         )
     )
@@ -282,6 +289,18 @@ def install(
         mode=0o755,
     )
     try:
+        helper_stage = _stage_file(
+            plan.usr_local,
+            "hermes-email-boundary-verify.new",
+            helper_content,
+            uid=expected_uid,
+            gid=expected_gid,
+            mode=0o755,
+        )
+    except Exception:
+        wrapper_stage.unlink(missing_ok=True)
+        raise
+    try:
         sudoers_stage = _stage_file(
             plan.sudoers_directory,
             "hermes-email-agent.new",
@@ -292,16 +311,27 @@ def install(
         )
     except Exception:
         wrapper_stage.unlink(missing_ok=True)
+        helper_stage.unlink(missing_ok=True)
         raise
-    staged = (wrapper_stage, sudoers_stage)
+    staged = (wrapper_stage, helper_stage, sudoers_stage)
     wrapper_backup: Optional[Path] = None
+    helper_backup: Optional[Path] = None
     sudoers_backup: Optional[Path] = None
     created_libexec = False
     wrapper_replaced = False
+    helper_replaced = False
     sudoers_replaced = False
     try:
         validate_path(
             wrapper_stage,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            directory=False,
+            exact_mode=0o755,
+            acl_checker=acl_checker,
+        )
+        validate_path(
+            helper_stage,
             expected_uid=expected_uid,
             expected_gid=expected_gid,
             directory=False,
@@ -335,6 +365,15 @@ def install(
                 gid=expected_gid,
                 mode=0o440,
             )
+        if plan.helper_destination.exists():
+            helper_backup = _stage_file(
+                plan.usr_local,
+                "hermes-email-boundary-verify.backup",
+                _read_source(plan.helper_destination),
+                uid=expected_uid,
+                gid=expected_gid,
+                mode=0o755,
+            )
         if libexec_missing:
             plan.libexec.mkdir(mode=0o755)
             created_libexec = True
@@ -350,10 +389,20 @@ def install(
             )
         replacer(wrapper_stage, plan.wrapper_destination)
         wrapper_replaced = True
+        replacer(helper_stage, plan.helper_destination)
+        helper_replaced = True
         replacer(sudoers_stage, plan.sudoers_destination)
         sudoers_replaced = True
         validate_path(
             plan.wrapper_destination,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            directory=False,
+            exact_mode=0o755,
+            acl_checker=acl_checker,
+        )
+        validate_path(
+            plan.helper_destination,
             expected_uid=expected_uid,
             expected_gid=expected_gid,
             directory=False,
@@ -371,13 +420,17 @@ def install(
         sudoers_validator(plan.sudoers_destination)
         if _read_source(plan.wrapper_destination) != wrapper_content:
             raise ValueError("installed wrapper bytes do not match the reviewed candidate")
+        if _read_source(plan.helper_destination) != helper_content:
+            raise ValueError("installed helper bytes do not match the reviewed candidate")
         if _read_source(plan.sudoers_destination) != rendered_sudoers.encode():
             raise ValueError("installed sudoers bytes do not match the reviewed policy")
     except Exception:
         wrapper_replaced = wrapper_replaced or not wrapper_stage.exists()
+        helper_replaced = helper_replaced or not helper_stage.exists()
         sudoers_replaced = sudoers_replaced or not sudoers_stage.exists()
         try:
             _restore(plan.sudoers_destination, sudoers_backup, replaced=sudoers_replaced)
+            _restore(plan.helper_destination, helper_backup, replaced=helper_replaced)
             _restore(plan.wrapper_destination, wrapper_backup, replaced=wrapper_replaced)
             if created_libexec:
                 plan.libexec.rmdir()
@@ -387,7 +440,7 @@ def install(
             ) from rollback_error
         raise
     finally:
-        for temporary in (*staged, wrapper_backup, sudoers_backup):
+        for temporary in (*staged, wrapper_backup, helper_backup, sudoers_backup):
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
     return actions

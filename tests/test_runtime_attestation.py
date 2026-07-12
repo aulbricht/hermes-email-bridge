@@ -157,6 +157,7 @@ def test_attestation_binds_build_identity_constraints_backend_and_boundary_hashe
     assert attestation["build_require_hashes"] is True
     assert attestation["dependency_sync_no_build"] is True
     assert attestation["wrapper_sha256"] == runtime.WRAPPER_SHA256
+    assert attestation["boundary_helper_sha256"] == runtime.BOUNDARY_HELPER_SHA256
     assert attestation["sudoers_template_sha256"] == runtime.SUDOERS_TEMPLATE_SHA256
     assert len(attestation["wheel_sha256"]) == 64
 

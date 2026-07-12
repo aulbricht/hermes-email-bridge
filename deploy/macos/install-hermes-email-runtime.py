@@ -45,7 +45,8 @@ BUILD_BACKEND = "setuptools.build_meta"
 BUILD_BACKEND_VERSION = "81.0.0"
 BUILD_BACKEND_WHEEL_SHA256 = "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6"
 WRAPPER_SHA256 = "52c610e34d1156a0fa3bd60834940da56d10503d16b1d4589fe012ea6826d79c"
-SUDOERS_TEMPLATE_SHA256 = "f1e75514df00d4db04975426c2550762775f3adcf035f3dfa243e885bea1bb1b"
+SUDOERS_TEMPLATE_SHA256 = "493400bf54b26c1c988b43e0c5edcbd599d9a7a6e555e8eabdd2a25d3717da55"
+BOUNDARY_HELPER_SHA256 = "1556cc9088f19e955b9df549e368236a523d2814e0fafb28b32826a973b04ad0"
 FETCHER = Path(__file__).with_name("fetch-hermes-email-agent.py")
 PROVENANCE_FILE = ".hermes-email-agent-provenance.json"
 ATTESTATION_ASSETS = (
@@ -53,6 +54,7 @@ ATTESTATION_ASSETS = (
     "install-hermes-email-runtime.py",
     "verify-hermes-email-agent.py",
     "hermes-email-agent-wrapper.py",
+    "hermes-email-boundary-verify.py",
     "hermes-email-agent.sudoers",
     BUILD_CONSTRAINT,
 )
@@ -713,8 +715,13 @@ def expected_attestation(paths: RuntimePaths) -> dict[str, Any]:
     constraint = paths.runtime_root / BUILD_CONSTRAINT
     verify_build_inputs(paths.source, constraint)
     wrapper_hash = sha256_file(paths.runtime_root / "hermes-email-agent-wrapper.py")
+    helper_hash = sha256_file(paths.runtime_root / "hermes-email-boundary-verify.py")
     sudoers_hash = sha256_file(paths.runtime_root / "hermes-email-agent.sudoers")
-    if wrapper_hash != WRAPPER_SHA256 or sudoers_hash != SUDOERS_TEMPLATE_SHA256:
+    if (
+        wrapper_hash != WRAPPER_SHA256
+        or helper_hash != BOUNDARY_HELPER_SHA256
+        or sudoers_hash != SUDOERS_TEMPLATE_SHA256
+    ):
         raise ValueError("runtime boundary candidates do not match reviewed hashes")
     return {
         "archive_sha256": ARCHIVE_SHA256,
@@ -743,6 +750,7 @@ def expected_attestation(paths: RuntimePaths) -> dict[str, Any]:
         "uv_version": UV_VERSION,
         "version": VERSION,
         "wrapper_sha256": wrapper_hash,
+        "boundary_helper_sha256": helper_hash,
         "sudoers_template_sha256": sudoers_hash,
         "wheel": wheel.name,
         "wheel_sha256": sha256_file(wheel),
