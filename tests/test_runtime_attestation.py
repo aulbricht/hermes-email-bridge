@@ -4,10 +4,12 @@ import hashlib
 import importlib.util
 import json
 import os
+import pwd
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -32,10 +34,13 @@ def _no_acl(_paths: Sequence[Path]) -> None:
 
 
 def _populate_generation(runtime: Any, paths: Any, label: str) -> None:
-    python_real = paths.python_installs / "cpython/bin/python3.11"
+    python_real = paths.python_installs / "cpython-test/bin/python3.11"
     python_real.parent.mkdir(parents=True, exist_ok=True)
     python_real.write_text("reviewed python " + label + "\n")
     python_real.chmod(0o755)
+    dylib = python_real.parents[1] / "lib/libpython3.11.dylib"
+    dylib.parent.mkdir()
+    dylib.write_text("reviewed dylib " + label + "\n")
     bin_directory = paths.venv / "bin"
     site = paths.venv / "lib/python3.11/site-packages"
     bin_directory.mkdir(parents=True, exist_ok=True)
@@ -417,6 +422,10 @@ def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -
             if "sync" in argv:
                 copied = Path(argv[argv.index("--directory") + 1])
                 copied_lock = copied / "uv.lock"
+                assert stat.S_IMODE(copied.parent.lstat().st_mode) == 0o711
+                assert stat.S_IMODE(copied.lstat().st_mode) == 0o700
+                for sibling in ("venv", "python", ".uv-cache", ".build-tmp", "artifacts"):
+                    assert stat.S_IMODE((copied.parent / sibling).lstat().st_mode) == 0o700
                 assert not copied.lstat().st_flags & flag
                 assert not copied_lock.lstat().st_flags & flag
                 copied_lock.write_text("build seam is writable\n")
@@ -458,6 +467,191 @@ def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -
 def test_runtime_installer_cli_rejects_arbitrary_root() -> None:
     with pytest.raises(SystemExit):
         _runtime().main(["--root", "/tmp/runtime"])
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or Path("/tmp").resolve() == Path("/tmp"),
+    reason="requires the macOS /tmp to /private/tmp alias",
+)
+def test_rebase_resolves_tmp_alias_and_final_active_verification_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    root = Path(tempfile.mkdtemp(prefix="hermes-runtime-alias.", dir="/tmp"))
+    install_root = root / "hermes-agent"
+    stage_root = install_root / ".runtime-stage.alias"
+    paths = runtime.build_paths(install_root, root / "uv", stage_root)
+    uid, gid = os.getuid(), os.getgid()
+    try:
+        paths.source.mkdir(parents=True)
+        lock = paths.source / "uv.lock"
+        lock.write_text("reviewed alias lock\n")
+        monkeypatch.setattr(runtime, "LOCK_SHA256", hashlib.sha256(lock.read_bytes()).hexdigest())
+        (paths.source / runtime.PROVENANCE_FILE).write_text(
+            json.dumps({"source_sha256": "reviewed-alias-source"}) + "\n"
+        )
+        paths.uv.write_text("reviewed alias uv\n")
+        os.chown(paths.uv, uid, gid)
+        paths.uv.chmod(0o755)
+        monkeypatch.setattr(runtime, "UV_SHA256", hashlib.sha256(paths.uv.read_bytes()).hexdigest())
+        stage_root.mkdir()
+        _populate_generation(runtime, paths, "alias")
+        absolute_link = stage_root / "absolute-internal-python"
+        absolute_link.symlink_to((paths.python_installs / "cpython-test/bin/python3.11").resolve())
+        marker = stage_root / "resolved-stage-marker.txt"
+        marker.write_text(str(stage_root.resolve()) + "\n")
+
+        runtime.rebase_generation(paths)
+        runtime.normalize_tree(stage_root, uid=uid, gid=gid)
+        runtime.write_attestation(paths, runtime.expected_attestation(paths), uid=uid, gid=gid)
+        active = runtime.build_paths(install_root, paths.uv)
+        os.replace(stage_root, active.runtime_root)
+
+        active_link = active.runtime_root / absolute_link.name
+        assert not Path(os.readlink(active_link)).is_absolute()
+        for path in runtime._all_paths(active.runtime_root):
+            if path.is_symlink():
+                assert not Path(os.readlink(path)).is_absolute()
+                assert path.resolve(strict=True).is_relative_to(active.runtime_root.resolve())
+                assert ".runtime-stage." not in os.readlink(path)
+            elif path.is_file():
+                try:
+                    content = path.read_text()
+                except UnicodeDecodeError:
+                    continue
+                assert ".runtime-stage." not in content
+
+        def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if argv == [str(paths.uv), "--version"]:
+                return subprocess.CompletedProcess(argv, 0, runtime.UV_VERSION + "\n", "")
+            if len(argv) > 1 and argv[1] == "-I":
+                code_index = argv.index("-c")
+                venv = Path(argv[code_index + 2])
+                site = venv / "lib/python3.11/site-packages"
+                evidence = {
+                    "direct_url": json.loads(argv[code_index + 4]),
+                    "origins": {
+                        name: str(site / (name + ".py"))
+                        for name in ("hermes_cli", "run_agent", "model_tools", "toolsets")
+                    },
+                    "tool_schemas": 0,
+                    "version": runtime.VERSION,
+                }
+                return subprocess.CompletedProcess(argv, 0, json.dumps(evidence) + "\n", "")
+            if argv[-1:] == ["--version"]:
+                return subprocess.CompletedProcess(argv, 0, "Hermes Agent v0.18.2\n", "")
+            if argv[-1:] == ["--help"]:
+                return subprocess.CompletedProcess(argv, 0, "usage --quiet --resume --query\n", "")
+            raise AssertionError(argv)
+
+        runtime.verify_attestation(
+            active,
+            uid=uid,
+            gid=gid,
+            acl_validator=_no_acl,
+            runner=runner,
+            probe_parent=root,
+        )
+    finally:
+        shutil.rmtree(root)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.geteuid() != 0,
+    reason="requires a root-run macOS integration gate with a distinct account",
+)
+def test_distinct_uid_builder_traverses_non_listable_stage_only_into_private_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(tempfile.mkdtemp(prefix="hermes-runtime-distinct-uid.", dir="/private/tmp"))
+    root.chmod(0o755)
+    try:
+        runtime, paths, runner, _calls, uid, gid = _fixture(root, monkeypatch)
+        builder = pwd.getpwnam("nobody")
+        observed: dict[str, Any] = {}
+
+        def build(stage: Any, **kwargs: Any) -> None:
+            details = stage.runtime_root.lstat()
+            assert details.st_uid == uid
+            assert details.st_gid == gid
+            assert stat.S_IMODE(details.st_mode) == 0o711
+            private = stage.runtime_root / "builder-private"
+            sibling = stage.runtime_root / "root-private"
+            private.mkdir(mode=0o700)
+            os.chown(private, builder.pw_uid, builder.pw_gid)
+            script = private / "run-seam"
+            script.write_text('#!/bin/sh\nprintf passed > "$1"\n')
+            os.chown(script, builder.pw_uid, builder.pw_gid)
+            script.chmod(0o700)
+            sibling.mkdir(mode=0o700)
+            (sibling / "secret").write_text("root only\n")
+            output = private / "result"
+
+            executed = subprocess.run(
+                ["/usr/bin/sudo", "-n", "-u", builder.pw_name, str(script), str(output)],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            listed = subprocess.run(
+                ["/usr/bin/sudo", "-n", "-u", builder.pw_name, "/bin/ls", str(stage.runtime_root)],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            sibling_read = subprocess.run(
+                [
+                    "/usr/bin/sudo",
+                    "-n",
+                    "-u",
+                    builder.pw_name,
+                    "/bin/cat",
+                    str(sibling / "secret"),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            assert executed.returncode == 0 and output.read_text() == "passed"
+            assert listed.returncode != 0
+            assert sibling_read.returncode != 0
+            observed["passed"] = True
+            shutil.rmtree(private)
+            shutil.rmtree(sibling)
+            _populate_generation(runtime, stage, "distinct-uid")
+            runtime.normalize_tree(stage.runtime_root, uid=uid, gid=gid)
+            runtime.write_attestation(stage, runtime.expected_attestation(stage), uid=uid, gid=gid)
+
+        monkeypatch.setattr(runtime, "build_generation", build)
+
+        def final_verifier(active: Any) -> None:
+            runtime.verify_attestation(
+                active,
+                uid=uid,
+                gid=gid,
+                acl_validator=_no_acl,
+                runner=runner,
+                probe_parent=root,
+            )
+
+        runtime.install_runtime(
+            paths,
+            root_uid=uid,
+            wheel_gid=gid,
+            build_user=builder.pw_name,
+            build_uid=builder.pw_uid,
+            build_gid=builder.pw_gid,
+            runner=runner,
+            acl_validator=_no_acl,
+            provenance_checker=lambda: None,
+            probe_parent=root,
+            final_verifier=final_verifier,
+        )
+        assert observed == {"passed": True}
+        assert stat.S_IMODE(paths.runtime_root.lstat().st_mode) == 0o755
+        assert not list(paths.install_root.glob(".runtime-*"))
+    finally:
+        shutil.rmtree(root)
 
 
 def _fake_generation_builder(runtime: Any, uid: int, gid: int) -> Any:
@@ -514,7 +708,7 @@ def _install_with_fake_generation(
     )
 
 
-FAULT_STEPS = [
+PRE_COMMIT_FAULT_STEPS = [
     "after_stage_creation",
     "after_build",
     *(
@@ -532,12 +726,15 @@ FAULT_STEPS = [
     "after_backup_rename",
     "after_activation_rename",
     "after_final_verifier",
+]
+POST_COMMIT_FAULT_STEPS = [
     "after_final_entrypoint",
     "backup_cleanup",
 ]
+FAULT_STEPS = PRE_COMMIT_FAULT_STEPS + POST_COMMIT_FAULT_STEPS
 
 
-@pytest.mark.parametrize("fault_step", FAULT_STEPS)
+@pytest.mark.parametrize("fault_step", PRE_COMMIT_FAULT_STEPS)
 def test_upgrade_faults_restore_byte_identical_executable_old_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_step: str
 ) -> None:
@@ -567,9 +764,40 @@ def test_upgrade_faults_restore_byte_identical_executable_old_runtime(
     assert not list(paths.install_root.glob(".runtime-*"))
 
 
+@pytest.mark.parametrize("fault_step", POST_COMMIT_FAULT_STEPS)
+def test_post_commit_faults_retain_verified_new_runtime_and_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_step: str
+) -> None:
+    runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    old_inode = paths.runtime_root.stat().st_ino
+
+    def fail(step: str) -> None:
+        if step == fault_step:
+            raise OSError("injected post-commit " + step)
+
+    with pytest.raises(RuntimeError, match="activation committed; backup cleanup required"):
+        _install_with_fake_generation(
+            runtime, paths, runner, uid, gid, monkeypatch, checkpoint=fail
+        )
+    assert paths.runtime_root.stat().st_ino != old_inode
+    assert (
+        "reviewed new" in (paths.venv / "lib/python3.11/site-packages/model_tools.py").read_text()
+    )
+    runtime.verify_attestation(
+        paths,
+        uid=uid,
+        gid=gid,
+        acl_validator=_no_acl,
+        runner=runner,
+        probe_parent=paths.install_root,
+    )
+    assert len(list(paths.install_root.glob(".runtime-backup.*"))) == 1
+    assert not list(paths.install_root.glob(".runtime-failed.*"))
+
+
 @pytest.mark.parametrize(
     "fault_step",
-    ["after_build", "after_attestation_write", "after_activation_rename", "after_final_entrypoint"],
+    ["after_build", "after_attestation_write", "after_activation_rename"],
 )
 def test_failed_first_install_leaves_no_active_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_step: str
@@ -587,6 +815,79 @@ def test_failed_first_install_leaves_no_active_runtime(
         )
     assert not paths.runtime_root.exists()
     assert not list(paths.install_root.glob(".runtime-*"))
+
+
+def test_post_commit_first_install_retains_verified_active_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    shutil.rmtree(paths.runtime_root)
+
+    def fail(step: str) -> None:
+        if step == "after_final_entrypoint":
+            raise OSError("injected committed first install")
+
+    with pytest.raises(RuntimeError, match="activation committed; post-commit operation failed"):
+        _install_with_fake_generation(
+            runtime, paths, runner, uid, gid, monkeypatch, checkpoint=fail
+        )
+    assert (
+        "reviewed new" in (paths.venv / "lib/python3.11/site-packages/model_tools.py").read_text()
+    )
+    runtime.verify_attestation(
+        paths,
+        uid=uid,
+        gid=gid,
+        acl_validator=_no_acl,
+        runner=runner,
+        probe_parent=paths.install_root,
+    )
+    assert not list(paths.install_root.glob(".runtime-*"))
+
+
+def test_partial_backup_cleanup_failure_never_rolls_back_committed_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    real_rmtree = runtime.shutil.rmtree
+    committed: dict[str, Any] = {}
+    removed: list[Path] = []
+
+    def observe(step: str) -> None:
+        if step == "backup_cleanup":
+            committed["inode"] = paths.runtime_root.stat().st_ino
+            committed["digest"] = runtime.filesystem_state_digest(paths.runtime_root)
+
+    def partial_rmtree(path: Path, *args: Any, **kwargs: Any) -> None:
+        candidate = Path(path)
+        if candidate.name.startswith(".runtime-backup."):
+            victim = next(item for item in runtime._all_paths(candidate) if item.is_file())
+            victim.unlink()
+            removed.append(victim)
+            raise OSError("injected partial backup deletion")
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(runtime.shutil, "rmtree", partial_rmtree)
+    with pytest.raises(RuntimeError, match="activation committed; backup cleanup required"):
+        _install_with_fake_generation(
+            runtime, paths, runner, uid, gid, monkeypatch, checkpoint=observe
+        )
+    assert removed and not removed[0].exists()
+    assert paths.runtime_root.stat().st_ino == committed["inode"]
+    assert runtime.filesystem_state_digest(paths.runtime_root) == committed["digest"]
+    assert (
+        "reviewed new" in (paths.venv / "lib/python3.11/site-packages/model_tools.py").read_text()
+    )
+    runtime.verify_attestation(
+        paths,
+        uid=uid,
+        gid=gid,
+        acl_validator=_no_acl,
+        runner=runner,
+        probe_parent=paths.install_root,
+    )
+    assert len(list(paths.install_root.glob(".runtime-backup.*"))) == 1
+    assert not list(paths.install_root.glob(".runtime-failed.*"))
 
 
 def test_successful_upgrade_activates_new_generation_without_debris(

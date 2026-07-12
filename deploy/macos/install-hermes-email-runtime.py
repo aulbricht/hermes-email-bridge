@@ -47,6 +47,7 @@ ATTESTATION_ASSETS = (
 BSD_MUTATION_FLAGS = sum(
     getattr(stat, name, 0) for name in ("UF_IMMUTABLE", "UF_APPEND", "SF_IMMUTABLE", "SF_APPEND")
 )
+STAGE_PREFIX = ".runtime-" + "stage."
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 AclValidator = Callable[[Sequence[Path]], None]
@@ -739,40 +740,78 @@ def rebase_generation(paths: RuntimePaths) -> None:
             shutil.rmtree(cache)
     for bytecode in paths.runtime_root.rglob("*.pyc"):
         bytecode.unlink()
-    stage_bytes = str(paths.runtime_root).encode()
     active_root = paths.install_root / "runtime"
+    resolved_stage_root = paths.runtime_root.resolve()
+    resolved_active_root = paths.install_root.resolve() / "runtime"
+    replacements = (
+        (str(paths.runtime_root), str(active_root)),
+        (str(resolved_stage_root), str(resolved_active_root)),
+    )
     for path in _all_paths(paths.runtime_root):
         if path.is_symlink():
             target = path.resolve(strict=True)
-            if target.is_relative_to(paths.runtime_root):
+            if target.is_relative_to(resolved_stage_root):
                 path.unlink()
-                path.symlink_to(os.path.relpath(target, path.parent))
+                path.symlink_to(os.path.relpath(target, path.parent.resolve()))
             continue
         if not path.is_file() or path.is_relative_to(paths.artifacts):
             continue
         content = path.read_bytes()
-        if stage_bytes not in content:
+        if not any(old.encode() in content for old, _new in replacements):
             continue
         try:
-            rewritten = content.decode().replace(str(paths.runtime_root), str(active_root)).encode()
+            rewritten_text = content.decode()
         except UnicodeDecodeError:
             continue
-        path.write_bytes(rewritten)
+        for old, new in replacements:
+            rewritten_text = rewritten_text.replace(old, new)
+        path.write_bytes(rewritten_text.encode())
     direct_urls = list(
         paths.venv.glob("lib/python*/site-packages/hermes_agent-*.dist-info/direct_url.json")
     )
     if len(direct_urls) != 1:
         raise ValueError("Hermes direct_url metadata is missing from the staged runtime")
     direct_urls[0].write_text(json.dumps(expected_direct_url(paths, active=True), sort_keys=True))
+    dylibs = {
+        candidate.resolve(strict=True)
+        for candidate in paths.python_installs.glob("cpython-*/lib/libpython3.11.dylib")
+    }
+    if len(dylibs) != 1:
+        raise ValueError("managed Python runtime dylib is missing or unsafe")
+    dylib = dylibs.pop()
+    if not dylib.is_relative_to(resolved_stage_root) or not dylib.is_file():
+        raise ValueError("managed Python runtime dylib escapes the staged runtime")
+    if any(old.encode() in dylib.read_bytes() for old, _new in replacements):
+        active_dylib = resolved_active_root / dylib.relative_to(resolved_stage_root)
+        install_name = subprocess.run(
+            ["/usr/bin/install_name_tool", "-id", str(active_dylib), str(dylib)],
+            capture_output=True,
+            check=False,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+            text=True,
+            timeout=30,
+        )
+        if install_name.returncode != 0 or install_name.stderr:
+            raise ValueError("managed Python dylib install name could not be rebased")
+        verified = subprocess.run(
+            ["/usr/bin/codesign", "--verify", str(dylib)],
+            capture_output=True,
+            check=False,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+            text=True,
+            timeout=30,
+        )
+        if verified.returncode != 0 or verified.stderr:
+            raise ValueError("rebased managed Python dylib signature is invalid")
     for path in _all_paths(paths.runtime_root):
         if not path.is_file() or path.is_symlink():
             continue
-        try:
-            text_content = path.read_text()
-        except UnicodeDecodeError:
-            continue
-        if str(paths.runtime_root) in text_content:
-            raise ValueError(f"runtime generation retains textual staging path: {path}")
+        content = path.read_bytes()
+        if (
+            any(old.encode() in content for old, _new in replacements)
+            or STAGE_PREFIX.encode() in content
+        ):
+            raise ValueError(f"runtime generation retains staging bytes: {path}")
 
 
 def build_generation(
@@ -793,6 +832,13 @@ def build_generation(
     provenance_checker()
     verify_lock(paths.source)
     verify_uv(paths.uv, uid=root_uid, gid=wheel_gid, acl_validator=acl_validator, runner=runner)
+    _safe_details(
+        paths.runtime_root,
+        expected_uid=root_uid,
+        expected_gid=wheel_gid,
+        exact_mode=0o711,
+    )
+    acl_validator([paths.runtime_root])
     for path in (paths.venv, paths.python_installs, paths.cache, paths.temporary, paths.artifacts):
         path.mkdir(mode=0o700)
         os.chown(path, build_uid, build_gid)
@@ -800,6 +846,21 @@ def build_generation(
     shutil.copytree(paths.source, paths.build_source, symlinks=False)
     clear_disposable_flags(paths.build_source)
     normalize_tree(paths.build_source, uid=build_uid, gid=build_gid)
+    paths.build_source.chmod(0o700)
+    private_paths = [
+        paths.venv,
+        paths.python_installs,
+        paths.cache,
+        paths.temporary,
+        paths.artifacts,
+        paths.build_source,
+    ]
+    for path in private_paths:
+        _safe_details(path, expected_uid=build_uid, expected_gid=build_gid, exact_mode=0o700)
+    copied_paths = _all_paths(paths.build_source)
+    for path in copied_paths:
+        _safe_details(path, expected_uid=build_uid, expected_gid=build_gid)
+    acl_validator([*private_paths[:-1], *copied_paths])
     _run_build_command(uv_command(paths, build_user), runner=runner)
     _run_build_command(uv_build_command(paths, build_user), runner=runner)
     wheel = wheel_path(paths)
@@ -923,13 +984,23 @@ def install_runtime(
             probe_parent=probe_parent,
         )
         old_digest = filesystem_state_digest(active.runtime_root)
-    stage_root = Path(tempfile.mkdtemp(prefix=".runtime-stage.", dir=paths.install_root))
+    stage_root = Path(tempfile.mkdtemp(prefix=STAGE_PREFIX, dir=paths.install_root))
     stage = build_paths(paths.install_root, paths.uv, stage_root)
     backup = paths.install_root / (".runtime-backup." + secrets.token_hex(12))
     failed = paths.install_root / (".runtime-failed." + secrets.token_hex(12))
     backed_up = False
     activated = False
+    committed = False
     try:
+        os.chown(stage.runtime_root, root_uid, wheel_gid)
+        os.chmod(stage.runtime_root, 0o711)
+        _safe_details(
+            stage.runtime_root,
+            expected_uid=root_uid,
+            expected_gid=wheel_gid,
+            exact_mode=0o711,
+        )
+        acl_validator([stage.runtime_root])
         checkpoint("after_stage_creation")
         build_generation(
             stage,
@@ -965,12 +1036,21 @@ def install_runtime(
             probe_parent=probe_parent,
             run_probe=False,
         )
+        committed = True
         checkpoint("after_final_entrypoint")
         if backed_up:
             checkpoint("backup_cleanup")
             _cleanup_generation(backup)
             backed_up = False
     except Exception as original_error:
+        if committed:
+            if backup.exists():
+                raise RuntimeError(
+                    f"runtime activation committed; backup cleanup required: {backup}"
+                ) from original_error
+            raise RuntimeError(
+                "runtime activation committed; post-commit operation failed"
+            ) from original_error
         try:
             if activated and active.runtime_root.exists():
                 os.replace(active.runtime_root, failed)

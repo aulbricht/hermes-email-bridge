@@ -409,11 +409,15 @@ Every generation-coupled component lives under the one fixed
 venv, wheel artifact, attestation, fetcher, runtime installer, and startup verifier. A new
 generation is fully normalized to root:wheel, checked for writable paths, escaping symlinks and
 ACLs, probed, and attested in a sibling staging directory while the active generation remains
-untouched. Activation atomically renames the prior runtime to a unique backup and the complete
+untouched. During the build, the root-owned staging directory is searchable but non-listable and
+each top-level build directory is private to `_hermesmail`; the completed stage is then normalized
+to root:wheel before attestation. Activation atomically renames the prior runtime to a unique backup and the complete
 stage to `runtime`. The installer then verifies through the actual active verifier and fixed
 wrapper path. Any build, rename, attestation, verifier, or final entrypoint failure restores and
 re-proves the byte/mode/owner-identical previous runtime; a failed first install leaves no active
-runtime. The backup is removed only after final verification succeeds:
+runtime. Successful final active verification is the commit point. The backup is removed only
+after that commit; a partial backup-cleanup failure retains the verified new active runtime and
+remaining backup for explicit cleanup instead of attempting rollback from a damaged backup:
 
 ```bash
 sudo /usr/bin/python3 deploy/macos/install-hermes-email-runtime.py --check
