@@ -10,7 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,6 +18,8 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 RUNTIME_PATH = ROOT / "deploy/macos/install-hermes-email-runtime.py"
+_BSD_FLAGS_ATTRIBUTE = "st_flags"
+_CHFLAGS_ATTRIBUTE = "chflags"
 
 
 def _runtime() -> Any:
@@ -31,6 +33,15 @@ def _runtime() -> Any:
 
 def _no_acl(_paths: Sequence[Path]) -> None:
     pass
+
+
+def _bsd_flags(path: Path) -> int:
+    return cast(int, getattr(path.lstat(), _BSD_FLAGS_ATTRIBUTE))
+
+
+def _set_bsd_flags(path: Path, flags: int) -> None:
+    chflags = cast(Callable[..., None], getattr(os, _CHFLAGS_ATTRIBUTE))
+    chflags(path, flags, follow_symlinks=False)
 
 
 def _write_reviewed_build_metadata(source: Path) -> None:
@@ -516,10 +527,10 @@ def test_disposable_source_copy_clears_uchg_without_mutating_canonical(
     reviewed.write_text("reviewed canonical source\n")
     reviewed.chmod(0o644)
     flag = stat.UF_IMMUTABLE
-    original_flags = {path: path.lstat().st_flags for path in (source, reviewed)}
+    original_flags = {path: _bsd_flags(path) for path in (source, reviewed)}
     try:
-        os.chflags(reviewed, original_flags[reviewed] | flag, follow_symlinks=False)
-        os.chflags(source, original_flags[source] | flag, follow_symlinks=False)
+        _set_bsd_flags(reviewed, original_flags[reviewed] | flag)
+        _set_bsd_flags(source, original_flags[source] | flag)
         before_digest = runtime.filesystem_state_digest(source)
         before = {
             path: (
@@ -527,7 +538,7 @@ def test_disposable_source_copy_clears_uchg_without_mutating_canonical(
                 stat.S_IMODE(path.lstat().st_mode),
                 path.lstat().st_uid,
                 path.lstat().st_gid,
-                path.lstat().st_flags,
+                _bsd_flags(path),
             )
             for path in (source, reviewed)
         }
@@ -535,8 +546,8 @@ def test_disposable_source_copy_clears_uchg_without_mutating_canonical(
         disposable = tmp_path / ".build-source"
         shutil.copytree(source, disposable, symlinks=False)
         copied = disposable / reviewed.name
-        assert disposable.lstat().st_flags & flag
-        assert copied.lstat().st_flags & flag
+        assert _bsd_flags(disposable) & flag
+        assert _bsd_flags(copied) & flag
 
         runtime.clear_disposable_flags(disposable)
         runtime.normalize_tree(disposable, uid=os.getuid(), gid=os.getgid())
@@ -550,13 +561,13 @@ def test_disposable_source_copy_clears_uchg_without_mutating_canonical(
                 stat.S_IMODE(path.lstat().st_mode),
                 path.lstat().st_uid,
                 path.lstat().st_gid,
-                path.lstat().st_flags,
+                _bsd_flags(path),
             )
             for path in (source, reviewed)
         } == before
     finally:
-        os.chflags(source, original_flags[source], follow_symlinks=False)
-        os.chflags(reviewed, original_flags[reviewed], follow_symlinks=False)
+        _set_bsd_flags(source, original_flags[source])
+        _set_bsd_flags(reviewed, original_flags[reviewed])
 
 
 @pytest.mark.skipif(
@@ -576,11 +587,11 @@ def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -
     runtime.UV_SHA256 = hashlib.sha256(paths.uv.read_bytes()).hexdigest()
     uid, gid = os.getuid(), os.getgid()
     flag = stat.UF_IMMUTABLE
-    original_flags = {path: path.lstat().st_flags for path in (paths.source, reviewed)}
+    original_flags = {path: _bsd_flags(path) for path in (paths.source, reviewed)}
     observed_build_copy = False
     try:
-        os.chflags(reviewed, original_flags[reviewed] | flag, follow_symlinks=False)
-        os.chflags(paths.source, original_flags[paths.source] | flag, follow_symlinks=False)
+        _set_bsd_flags(reviewed, original_flags[reviewed] | flag)
+        _set_bsd_flags(paths.source, original_flags[paths.source] | flag)
         before_digest = runtime.filesystem_state_digest(paths.source)
         before_mode = stat.S_IMODE(reviewed.lstat().st_mode)
 
@@ -595,16 +606,12 @@ def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -
                 assert stat.S_IMODE(copied.lstat().st_mode) == 0o700
                 for sibling in ("venv", "python", ".uv-cache", ".build-tmp", "artifacts"):
                     assert stat.S_IMODE((copied.parent / sibling).lstat().st_mode) == 0o700
-                assert not copied.lstat().st_flags & flag
-                assert not copied_lock.lstat().st_flags & flag
+                assert not _bsd_flags(copied) & flag
+                assert not _bsd_flags(copied_lock) & flag
                 copied_lock.write_text("build seam is writable\n")
                 observed_build_copy = True
-                os.chflags(
-                    copied_lock,
-                    copied_lock.lstat().st_flags | flag,
-                    follow_symlinks=False,
-                )
-                os.chflags(copied, copied.lstat().st_flags | flag, follow_symlinks=False)
+                _set_bsd_flags(copied_lock, _bsd_flags(copied_lock) | flag)
+                _set_bsd_flags(copied, _bsd_flags(copied) | flag)
                 return subprocess.CompletedProcess(argv, 1, "", "injected build failure")
             raise AssertionError(argv)
 
@@ -624,13 +631,13 @@ def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -
         assert observed_build_copy
         assert runtime.filesystem_state_digest(paths.source) == before_digest
         assert stat.S_IMODE(reviewed.lstat().st_mode) == before_mode
-        assert reviewed.lstat().st_flags & flag
-        assert paths.source.lstat().st_flags & flag
+        assert _bsd_flags(reviewed) & flag
+        assert _bsd_flags(paths.source) & flag
         assert not paths.runtime_root.exists()
         assert not list(paths.install_root.glob(".runtime-*"))
     finally:
-        os.chflags(paths.source, original_flags[paths.source], follow_symlinks=False)
-        os.chflags(reviewed, original_flags[reviewed], follow_symlinks=False)
+        _set_bsd_flags(paths.source, original_flags[paths.source])
+        _set_bsd_flags(reviewed, original_flags[reviewed])
 
 
 def test_runtime_installer_cli_rejects_arbitrary_root() -> None:
@@ -1123,8 +1130,8 @@ def test_flagged_backup_is_preserved_on_rollback_then_cleaned_after_success(
 ) -> None:
     runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
     old_file = paths.venv / "lib/python3.11/site-packages/model_tools.py"
-    original_flags = old_file.lstat().st_flags
-    os.chflags(old_file, original_flags | stat.UF_IMMUTABLE, follow_symlinks=False)
+    original_flags = _bsd_flags(old_file)
+    _set_bsd_flags(old_file, original_flags | stat.UF_IMMUTABLE)
 
     def fail_after_activation(step: str) -> None:
         if step == "after_activation_rename":
@@ -1141,12 +1148,12 @@ def test_flagged_backup_is_preserved_on_rollback_then_cleaned_after_success(
                 monkeypatch,
                 checkpoint=fail_after_activation,
             )
-        assert old_file.lstat().st_flags & stat.UF_IMMUTABLE
+        assert _bsd_flags(old_file) & stat.UF_IMMUTABLE
 
         _install_with_fake_generation(runtime, paths, runner, uid, gid, monkeypatch)
         assert "reviewed new" in old_file.read_text()
-        assert not old_file.lstat().st_flags & stat.UF_IMMUTABLE
+        assert not _bsd_flags(old_file) & stat.UF_IMMUTABLE
         assert not list(paths.install_root.glob(".runtime-*"))
     finally:
         if old_file.exists():
-            os.chflags(old_file, original_flags, follow_symlinks=False)
+            _set_bsd_flags(old_file, original_flags)
