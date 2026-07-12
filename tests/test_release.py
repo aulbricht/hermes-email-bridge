@@ -1,8 +1,11 @@
 import os
 import plistlib
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
+
+import pytest
 
 from hermes_email_bridge import __version__
 
@@ -176,6 +179,7 @@ def test_macos_isolation_installation_requirements_are_documented() -> None:
     ) in example
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="launcher uses BSD stat")
 def test_macos_launcher_sources_realistic_protected_environment(tmp_path: Path) -> None:
     venv_bin = tmp_path / "venv/bin"
     venv_bin.mkdir(parents=True)

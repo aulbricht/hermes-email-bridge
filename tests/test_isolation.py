@@ -242,6 +242,7 @@ def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
 def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path, Path, Any]:
     probe = _load_probe()
     runtime = _load_runtime()
+    runtime.reject_acls = lambda _paths: None
     candidates = tmp_path / "candidates"
     boundary = tmp_path / "boundary"
     candidates.mkdir(mode=0o755)
