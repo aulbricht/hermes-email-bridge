@@ -258,7 +258,7 @@ allows only the AgentMail message-list, message-get, and threaded-reply paths. I
 no SDK dependency and does not require a Composio user ID or auth-config ID.
 
 Create a dedicated Composio project API key with only the **Proxy Execute** permission.
-Do not reuse Jarvis's broad automation key. The connected account and inbox must already
+Do not reuse another application's broad automation key. The connected account and inbox must already
 exist and be active. Polling defaults to 30 seconds; transient network, HTTP 429, and 5xx
 failures use capped exponential backoff and safe `Retry-After` values. Authentication,
 configuration, and malformed-response failures stop rather than retry forever.
@@ -317,34 +317,47 @@ environment files must not be writable by `_hermesmail`. Configure only the infe
 `/var/db/hermes-email-agent`. Never copy or reuse another user's profile, auth files, home,
 Composio connection, hooks, plugins, rules, skills, or `HERMES_HOME`.
 
-Install and validate the enforcement assets as root:
+The stdlib-only installer preflights `/usr`, `/usr/local`, `/usr/local/libexec`,
+`/private/etc`, and canonical `/private/etc/sudoers.d` with `lstat` (the policy remains
+visible through macOS's system `/etc` link); it rejects symlinks, wrong root:wheel ownership,
+group/other write access, and unexpected ACLs. It safely creates a missing
+`/usr/local/libexec` as root:wheel `0755`, validates the rendered policy with `visudo`,
+then atomically installs the wrapper as root:wheel `0755` and sudoers policy as root:wheel
+`0440`. The installer intentionally supports macOS system Python 3.9.6. Validate its plan
+first, then install as root:
 
 ```bash
-install -o root -g wheel -m 0755 deploy/macos/hermes-email-agent-wrapper.py \
-  /usr/local/libexec/hermes-email-agent
-sed 's/__BRIDGE_USER__/YOUR_BRIDGE_ACCOUNT/g' deploy/macos/hermes-email-agent.sudoers \
-  > /tmp/hermes-email-agent.sudoers
-visudo -cf /tmp/hermes-email-agent.sudoers
-install -o root -g wheel -m 0440 /tmp/hermes-email-agent.sudoers \
-  /etc/sudoers.d/hermes-email-agent
+/usr/bin/python3 deploy/macos/install-hermes-email-agent.py \
+  --bridge-user YOUR_BRIDGE_ACCOUNT --dry-run
+sudo /usr/bin/python3 deploy/macos/install-hermes-email-agent.py \
+  --bridge-user YOUR_BRIDGE_ACCOUNT --check
+sudo /usr/bin/python3 deploy/macos/install-hermes-email-agent.py \
+  --bridge-user YOUR_BRIDGE_ACCOUNT
 ```
 
 The sudoers rule grants the bridge account only the exact root-owned wrapper as
 `_hermesmail`. The wrapper accepts only `--query TEXT` with one optional safe `--resume
 SESSION_ID`; it fixes the working directory, environment, executable, and Hermes arguments:
-safe mode, `no_mcp`, `openai-codex`, `gpt-5.5`, and one turn. It cannot select arbitrary
+safe mode, `context_engine`, `openai-codex`, `gpt-5.5`, and one turn. It cannot select arbitrary
 providers, models, tools, toolsets, hooks, skills, flags, or commands. Configure the bridge:
 
 ```bash
 HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'
 ```
 
-Hermes 0.18.2 safe mode skips plugins, MCP configuration, hooks, rules, and skills, but
-built-in tool compatibility still depends on `--toolsets no_mcp`. Before every Hermes
-upgrade, keep the LaunchAgent unloaded and run the approved zero-schema probe through this
-wrapper. Do not restart unless the probe verifies that Hermes advertises exactly zero tool
-schemas and the wrapper still rejects unknown flags. Resume remains enabled because the
-bridge requires persisted conversation sessions.
+Hermes 0.18.2 safe mode skips plugins, MCP configuration, hooks, rules, and skills. Pin exact
+commit `4281151ae859241351ba14d8c7682dc67ff4c126`, tree
+`735e875e12c18ebf3d6b2dd26928d72d155455d0`, and source-archive SHA-256
+`43def089739b8edaa01f05352cba869fe9d4013f3b5616ad627c14ba28888fc9`; do not trust the
+version banner alone. At that source, the wrapper's `--toolsets context_engine` validates,
+resolves to an empty tool list, and exposes zero schemas in safe mode. The values `none`, `no_mcp`,
+empty, and default fallbacks are forbidden.
+
+Before initial start and every Hermes upgrade, keep the LaunchAgent unloaded; verify the
+exact HEAD, tree, and archive digest, then run the approved new-session and resumed-session
+zero-schema contract probe through this wrapper. Do not restart unless it reports an answer
+on stdout, only `session_id:` metadata on stderr, exactly zero tool schemas, and no warning.
+Resume remains enabled because the bridge requires persisted conversation sessions.
 
 The bridge command receives only `PATH` and present locale fields; it receives no bridge
 environment-file path, AgentMail/Composio/bridge variables, proxy variables, `PYTHONPATH`,

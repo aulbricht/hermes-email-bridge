@@ -95,7 +95,7 @@ def test_wrapper_executes_only_fixed_cwd_argv_and_environment(
         "tool",
         "--safe-mode",
         "--toolsets",
-        "no_mcp",
+        "context_engine",
         "--provider",
         "openai-codex",
         "--model",
@@ -120,3 +120,61 @@ def test_wrapper_executable_rejects_unknown_shape_without_echoing_input() -> Non
     )
     assert result.returncode == 64
     assert secret_argument not in result.stderr
+
+
+def test_wrapper_contract_new_and_resume_have_zero_schemas_and_clean_streams(
+    tmp_path: Path,
+) -> None:
+    wrapper = _load_wrapper()
+    stub = tmp_path / "pinned-hermes-stub.py"
+    stub.write_text(
+        """import sys
+
+PINNED_COMMIT = "4281151ae859241351ba14d8c7682dc67ff4c126"
+TOOL_DEFINITIONS = {"context_engine": []}
+def get_tool_definitions(toolset, *, quiet_mode):
+    assert quiet_mode is True
+    return TOOL_DEFINITIONS[toolset]
+expected = [
+    "chat", "--quiet", "--source", "tool", "--safe-mode",
+    "--toolsets", "context_engine", "--provider", "openai-codex",
+    "--model", "gpt-5.5", "--max-turns", "1",
+]
+arguments = sys.argv[1:]
+assert arguments[:len(expected)] == expected
+tail = arguments[len(expected):]
+if tail[:1] == ["--resume"]:
+    session = tail[1]
+    tail = tail[2:]
+else:
+    session = "new-session"
+assert tail[0] == "--query" and len(tail) == 2
+assert get_tool_definitions("context_engine", quiet_mode=True) == []
+print("answer only")
+print(f"session_id: {session}", file=sys.stderr)
+"""
+    )
+
+    def run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        _cwd, fixed_argv, env = wrapper.build_invocation(arguments)
+        assert fixed_argv[fixed_argv.index("--toolsets") + 1] == "context_engine"
+        assert not {"none", "no_mcp", "", "default"} & set(fixed_argv)
+        return subprocess.run(
+            [sys.executable, str(stub), *fixed_argv[1:]],
+            capture_output=True,
+            check=False,
+            env=env,
+            text=True,
+        )
+
+    fresh = run(["--query", "new email"])
+    assert fresh.returncode == 0
+    assert fresh.stdout == "answer only\n"
+    assert fresh.stderr == "session_id: new-session\n"
+    assert "warning" not in (fresh.stdout + fresh.stderr).lower()
+
+    resumed = run(["--resume", "session_123", "--query", "reply email"])
+    assert resumed.returncode == 0
+    assert resumed.stdout == "answer only\n"
+    assert resumed.stderr == "session_id: session_123\n"
+    assert "warning" not in (resumed.stdout + resumed.stderr).lower()

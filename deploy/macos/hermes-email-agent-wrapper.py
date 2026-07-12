@@ -20,7 +20,7 @@ _BASE_ARGV = (
     "tool",
     "--safe-mode",
     "--toolsets",
-    "no_mcp",
+    "context_engine",
     "--provider",
     "openai-codex",
     "--model",

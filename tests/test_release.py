@@ -58,11 +58,16 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
         "/var/db/hermes-email-agent/workspace",
         "/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/hermes",
         '"--safe-mode"',
-        '"no_mcp"',
+        '"context_engine"',
         '"openai-codex"',
         '"gpt-5.5"',
     ):
         assert fixed in wrapper
+    installer = (ROOT / "deploy/macos/install-hermes-email-agent.py").read_text()
+    assert 'rooted("/usr/local/libexec")' in installer
+    assert 'rooted("/private/etc/sudoers.d")' in installer
+    assert "O_NOFOLLOW" in installer
+    assert "visudo" in installer
 
     plist = plistlib.loads(plist_path.read_bytes())
     assert plist["RunAtLoad"] is True
@@ -71,6 +76,20 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert plist["Umask"] == 0o77
     assert plist["WorkingDirectory"] == "__WORKSPACE__"
     assert "HERMES_HOME" not in plist["EnvironmentVariables"]
+
+
+def test_shipping_docs_and_assets_have_no_deployment_personalization() -> None:
+    paths = [ROOT / "README.md", ROOT / ".env.example", *(ROOT / "deploy").rglob("*")]
+    content = "\n".join(
+        path.read_text() for path in paths if path.is_file() and "__pycache__" not in path.parts
+    ).lower()
+    for forbidden in (
+        "jarvis",
+        "snowcapconsulting",
+        "@gmail.com",
+        "/users/allen",
+    ):
+        assert forbidden not in content
 
 
 def test_macos_isolation_installation_requirements_are_documented() -> None:
@@ -85,15 +104,25 @@ def test_macos_isolation_installation_requirements_are_documented() -> None:
         "-m 0700 /var/db/hermes-email-agent",
         "-m 0700 /var/db/hermes-email-agent/workspace",
         "test -x /usr/bin/python3",
-        "-o root -g wheel -m 0755",
-        "visudo -cf",
-        "-o root -g wheel -m 0440",
+        "root:wheel `0755`",
+        "visudo",
+        "root:wheel `0440`",
+        "install-hermes-email-agent.py",
+        "system Python 3.9.6",
+        "--dry-run",
+        "--check",
         "exactly zero tool schemas",
-        "--toolsets no_mcp",
+        "--toolsets context_engine",
         "inference-only",
         "never copy or reuse another user's profile",
     ):
         assert required.lower() in normalized_readme
+    for pin in (
+        "4281151ae859241351ba14d8c7682dc67ff4c126",
+        "735e875e12c18ebf3d6b2dd26928d72d155455d0",
+        "43def089739b8edaa01f05352cba869fe9d4013f3b5616ad627c14ba28888fc9",
+    ):
+        assert pin in readme
     assert (
         "HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'"
     ) in example
