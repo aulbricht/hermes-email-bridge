@@ -313,7 +313,7 @@ Verify the wrapper interpreter first with `test -x /usr/bin/python3`. Install He
 **0.18.2** into the fixed, root-owned
 `/Library/Application Support/HermesEmailAgent/hermes-agent` tree and verify the pinned
 version before continuing. Its virtual-environment executable must be exactly
-`/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/hermes`; code and
+`/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes`; code and
 environment files must not be writable by `_hermesmail`. Configure only the inference-only
 `openai-codex` authentication required for model `gpt-5.5` under
 `/var/db/hermes-email-agent`. Never copy or reuse another user's profile, auth files, home,
@@ -396,23 +396,34 @@ sudo install -o root -g wheel -m 0755 \
 rm -rf "$uv_stage"
 ```
 
-The Python 3.9-compatible runtime installer re-verifies source and lock provenance, then runs
-only that pinned `uv` as the unprivileged `_hermesmail` account with a minimal proxy-free
-environment. It uses `sync --frozen --no-dev --no-editable --python 3.11`, the exact fixed
-`UV_PROJECT_ENVIRONMENT`, and fixed managed-Python/cache/temp directories. Building as the
-unprivileged account prevents upstream build tooling from modifying the root-owned reviewed
-source. After a second source verification, it removes build state, changes the managed Python
-and venv trees to root:wheel, rejects writable paths, escaping symlinks, and ACLs, and installs
-the fixed verifier assets:
+Keep the LaunchAgent unloaded for the entire install or upgrade. The Python 3.9-compatible
+runtime installer re-verifies the separate immutable source and lock, copies them into a unique
+sibling build directory, and runs only that pinned `uv` as the unprivileged `_hermesmail`
+account with a minimal proxy-free environment. It installs frozen dependencies with
+`sync --frozen --no-dev --no-editable --no-install-project --python 3.11`, builds a wheel from
+the disposable verified source, and installs that wheel without dependencies. The active source
+is never made writable, removed, or used as a build-output directory.
+
+Every generation-coupled component lives under the one fixed
+`/Library/Application Support/HermesEmailAgent/hermes-agent/runtime` directory: managed Python,
+venv, wheel artifact, attestation, fetcher, runtime installer, and startup verifier. A new
+generation is fully normalized to root:wheel, checked for writable paths, escaping symlinks and
+ACLs, probed, and attested in a sibling staging directory while the active generation remains
+untouched. Activation atomically renames the prior runtime to a unique backup and the complete
+stage to `runtime`. The installer then verifies through the actual active verifier and fixed
+wrapper path. Any build, rename, attestation, verifier, or final entrypoint failure restores and
+re-proves the byte/mode/owner-identical previous runtime; a failed first install leaves no active
+runtime. The backup is removed only after final verification succeeds:
 
 ```bash
 sudo /usr/bin/python3 deploy/macos/install-hermes-email-runtime.py --check
 sudo /usr/bin/python3 deploy/macos/install-hermes-email-runtime.py
 ```
 
-The resulting root-owned `runtime-attestation.json` binds the archive, commit, source and lock
-digests, pinned `uv`, managed Python, console entrypoint, fixed verifier assets, and a canonical
-digest of every runtime file. Verification rejects editable installs, unexpected `direct_url`,
+The resulting root-owned `runtime/runtime-attestation.json` binds the archive, commit, source and
+lock digests, pinned `uv`, built wheel, managed Python, console entrypoint, fixed verifier assets,
+and a canonical digest of the entire generation. Verification rejects editable installs,
+unexpected `direct_url`,
 imports outside the fixed venv's site-packages, wrong entrypoint/shebang, stale dependencies,
 writable paths, unsafe ownership/modes, ACLs, or changed runtime files.
 
@@ -425,7 +436,7 @@ attestation. This read-only command is also executed automatically on every Laun
 before the environment file is sourced:
 
 ```bash
-/usr/local/libexec/verify-hermes-email-agent.py
+'/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/verify-hermes-email-agent.py'
 ```
 
 The verifier checks the actual fixed Python, `hermes` console script, non-editable distribution,
@@ -437,7 +448,8 @@ It does not claim that a model answered. Before loading the LaunchAgent, separat
 canary from the bridge account:
 
 ```bash
-/usr/local/libexec/verify-hermes-email-agent.py --live
+'/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/verify-hermes-email-agent.py' \
+  --live
 ```
 
 Do not load or restart unless attestation succeeds and the live canary returns the exact new and

@@ -8,7 +8,7 @@ import re
 import sys
 from collections.abc import Sequence
 
-HERMES = "/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/hermes"
+HERMES = "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes"
 STATE_DIR = "/var/db/hermes-email-agent"
 WORKSPACE = "/var/db/hermes-email-agent/workspace"
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")

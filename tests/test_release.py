@@ -64,7 +64,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "/usr/local/libexec/hermes-email-agent" in sudoers
     for fixed in (
         "/var/db/hermes-email-agent/workspace",
-        "/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/hermes",
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes",
         '"--safe-mode"',
         '"context_engine"',
         '"openai-codex"',
@@ -173,12 +173,12 @@ def test_macos_launcher_sources_realistic_protected_environment(tmp_path: Path) 
     env_file.chmod(0o600)
     launcher = tmp_path / "run-email-bridge.sh"
     launcher_text = (ROOT / "deploy/macos/run-email-bridge.sh").read_text()
-    assert launcher_text.index("/usr/local/libexec/verify-hermes-email-agent.py") < (
-        launcher_text.index('. "$EMAIL_BRIDGE_ENV_FILE"')
+    fixed_verifier = (
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/"
+        "runtime/verify-hermes-email-agent.py"
     )
-    launcher.write_text(
-        launcher_text.replace("/usr/local/libexec/verify-hermes-email-agent.py", "/usr/bin/true")
-    )
+    assert launcher_text.index(fixed_verifier) < (launcher_text.index('. "$EMAIL_BRIDGE_ENV_FILE"'))
+    launcher.write_text(launcher_text.replace(fixed_verifier, "/usr/bin/true"))
     launcher.chmod(0o755)
 
     result = subprocess.run(

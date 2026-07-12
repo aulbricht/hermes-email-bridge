@@ -11,6 +11,7 @@ import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -24,9 +25,10 @@ from typing import Any, Optional, cast
 
 INSTALL_ROOT = Path("/Library/Application Support/HermesEmailAgent/hermes-agent")
 SOURCE = INSTALL_ROOT / "source"
-VENV = INSTALL_ROOT / "venv"
-PYTHON_INSTALLS = INSTALL_ROOT / "python"
-ATTESTATION = INSTALL_ROOT / "runtime-attestation.json"
+ACTIVE_RUNTIME = INSTALL_ROOT / "runtime"
+VENV = ACTIVE_RUNTIME / "venv"
+PYTHON_INSTALLS = ACTIVE_RUNTIME / "python"
+ATTESTATION = ACTIVE_RUNTIME / "runtime-attestation.json"
 PROBE_PARENT = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")
 UV = Path("/usr/local/libexec/hermes-email-uv")
 UV_VERSION = "uv 0.11.16 (135a36367 2026-05-21 aarch64-apple-darwin)"
@@ -42,6 +44,9 @@ ATTESTATION_ASSETS = (
     "install-hermes-email-runtime.py",
     "verify-hermes-email-agent.py",
 )
+BSD_MUTATION_FLAGS = sum(
+    getattr(stat, name, 0) for name in ("UF_IMMUTABLE", "UF_APPEND", "SF_IMMUTABLE", "SF_APPEND")
+)
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 AclValidator = Callable[[Sequence[Path]], None]
@@ -50,13 +55,14 @@ _RUNTIME_CODE = r"""
 import importlib.metadata, importlib.util, json, pathlib, sys
 venv = pathlib.Path(sys.argv[1]).resolve()
 source = pathlib.Path(sys.argv[2]).resolve()
+expected_direct = json.loads(sys.argv[3])
 assert sys.version_info[:2] == (3, 11)
 site = pathlib.Path(importlib.metadata.distribution("hermes-agent").locate_file("")).resolve()
 assert site.is_relative_to(venv)
 distribution = importlib.metadata.distribution("hermes-agent")
 assert distribution.version == "0.18.2"
 direct = json.loads(distribution.read_text("direct_url.json"))
-assert direct == {"url": source.as_uri(), "dir_info": {"editable": False}}
+assert direct == expected_direct
 entries = {entry.name: entry.value for entry in distribution.entry_points}
 assert entries.get("hermes") == "hermes_cli.main:main"
 origins = {}
@@ -80,6 +86,7 @@ print(json.dumps({"direct_url": direct, "origins": origins, "tool_schemas": 0,
 @dataclass(frozen=True)
 class RuntimePaths:
     install_root: Path
+    runtime_root: Path
     source: Path
     venv: Path
     python_installs: Path
@@ -87,18 +94,28 @@ class RuntimePaths:
     uv: Path
     cache: Path
     temporary: Path
+    artifacts: Path
+    build_source: Path
 
 
-def build_paths(install_root: Path = INSTALL_ROOT, uv: Path = UV) -> RuntimePaths:
+def build_paths(
+    install_root: Path = INSTALL_ROOT,
+    uv: Path = UV,
+    runtime_root: Optional[Path] = None,
+) -> RuntimePaths:
+    generation = install_root / "runtime" if runtime_root is None else runtime_root
     return RuntimePaths(
         install_root=install_root,
+        runtime_root=generation,
         source=install_root / "source",
-        venv=install_root / "venv",
-        python_installs=install_root / "python",
-        attestation=install_root / "runtime-attestation.json",
+        venv=generation / "venv",
+        python_installs=generation / "python",
+        attestation=generation / "runtime-attestation.json",
         uv=uv,
-        cache=install_root / ".uv-cache",
-        temporary=install_root / ".build-tmp",
+        cache=generation / ".uv-cache",
+        temporary=generation / ".build-tmp",
+        artifacts=generation / "artifacts",
+        build_source=generation / ".build-source",
     )
 
 
@@ -198,6 +215,21 @@ def normalize_tree(root: Path, *, uid: int, gid: int) -> None:
         os.chmod(path, 0o755 if path.is_dir() or mode & 0o111 else 0o644)
 
 
+def clear_disposable_flags(root: Path) -> None:
+    """Make a transaction-owned tree mutable without following symlinks."""
+    if root.is_symlink():
+        raise ValueError(f"refusing to mutate symlinked runtime path: {root}")
+    if not root.exists():
+        return
+    for path in _all_paths(root):
+        details = path.lstat()
+        if path.is_symlink():
+            continue
+        flags = getattr(details, "st_flags", 0)
+        if flags & BSD_MUTATION_FLAGS:
+            os.chflags(path, flags & ~BSD_MUTATION_FLAGS, follow_symlinks=False)
+
+
 def tree_digest(roots: Sequence[Path]) -> str:
     digest = hashlib.sha256()
     for root in roots:
@@ -214,6 +246,46 @@ def tree_digest(roots: Sequence[Path]) -> str:
                 with path.open("rb") as stream:
                     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                         digest.update(chunk)
+    return digest.hexdigest()
+
+
+def wheel_path(paths: RuntimePaths) -> Path:
+    wheels = sorted(paths.artifacts.glob("hermes_agent-0.18.2-*.whl"))
+    if len(wheels) != 1 or wheels[0].is_symlink() or not wheels[0].is_file():
+        raise ValueError("runtime generation must contain exactly one Hermes wheel")
+    return wheels[0]
+
+
+def expected_direct_url(paths: RuntimePaths, *, active: bool) -> dict[str, Any]:
+    wheel = wheel_path(paths)
+    if not active:
+        return {"url": wheel.as_uri(), "archive_info": {}}
+    target = paths.install_root / "runtime" / "artifacts" / wheel.name
+    digest = sha256_file(wheel)
+    return {
+        "url": target.as_uri(),
+        "archive_info": {"hash": "sha256=" + digest, "hashes": {"sha256": digest}},
+    }
+
+
+def generation_digest(paths: RuntimePaths) -> str:
+    digest = hashlib.sha256()
+    for path in _all_paths(paths.runtime_root):
+        if path == paths.attestation:
+            continue
+        details = path.lstat()
+        relative = path.relative_to(paths.runtime_root).as_posix()
+        kind = "L" if path.is_symlink() else "D" if path.is_dir() else "F"
+        digest.update(
+            f"{kind}\0{relative}\0{details.st_uid}\0{details.st_gid}\0"
+            f"{stat.S_IMODE(details.st_mode):04o}\0".encode()
+        )
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_file():
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
     return digest.hexdigest()
 
 
@@ -294,8 +366,8 @@ def verify_usr_local_chain(
             os.close(descriptor)
 
 
-def uv_command(paths: RuntimePaths, build_user: str) -> list[str]:
-    environment = (
+def _uv_prefix(paths: RuntimePaths, build_user: str) -> list[str]:
+    environment = [
         "HOME=/var/empty",
         "LANG=C",
         "PATH=/usr/bin:/bin",
@@ -306,7 +378,7 @@ def uv_command(paths: RuntimePaths, build_user: str) -> list[str]:
         "UV_PROJECT_ENVIRONMENT=" + str(paths.venv),
         "UV_PYTHON_INSTALL_DIR=" + str(paths.python_installs),
         "UV_PYTHON_PREFERENCE=managed",
-    )
+    ]
     return [
         "/usr/bin/sudo",
         "-n",
@@ -317,14 +389,45 @@ def uv_command(paths: RuntimePaths, build_user: str) -> list[str]:
         "-i",
         *environment,
         str(paths.uv),
+    ]
+
+
+def uv_command(paths: RuntimePaths, build_user: str) -> list[str]:
+    return [
+        *_uv_prefix(paths, build_user),
         "sync",
         "--directory",
-        str(paths.source),
+        str(paths.build_source),
         "--frozen",
         "--no-dev",
         "--no-editable",
+        "--no-install-project",
         "--python",
         "3.11",
+    ]
+
+
+def uv_build_command(paths: RuntimePaths, build_user: str) -> list[str]:
+    return [
+        *_uv_prefix(paths, build_user),
+        "build",
+        "--directory",
+        str(paths.build_source),
+        "--wheel",
+        "--out-dir",
+        str(paths.artifacts),
+    ]
+
+
+def uv_install_command(paths: RuntimePaths, build_user: str, wheel: Path) -> list[str]:
+    return [
+        *_uv_prefix(paths, build_user),
+        "pip",
+        "install",
+        "--python",
+        str(paths.venv / "bin/python"),
+        "--no-deps",
+        str(wheel),
     ]
 
 
@@ -367,6 +470,7 @@ def probe_runtime(
     *,
     runner: Runner = subprocess.run,
     probe_parent: Path = PROBE_PARENT,
+    executable_entrypoint: bool = True,
 ) -> dict[str, Any]:
     python = paths.venv / "bin/python"
     hermes = paths.venv / "bin/hermes"
@@ -383,10 +487,27 @@ def probe_runtime(
     )
     if not (direct_shebang or shell_trampoline):
         raise ValueError("Hermes console entrypoint shebang is not fixed to the runtime")
+    direct_urls = list(
+        paths.venv.glob("lib/python*/site-packages/hermes_agent-*.dist-info/direct_url.json")
+    )
+    expected_direct = expected_direct_url(paths, active=executable_entrypoint)
+    if len(direct_urls) != 1 or json.loads(direct_urls[0].read_text()) != expected_direct:
+        raise ValueError("installed Hermes direct_url provenance is editable or unexpected")
     with temporary_probe_home(probe_parent) as home:
         environment = _runtime_environment(home)
         result = runner(
-            [str(python), "-I", "-c", _RUNTIME_CODE, str(paths.venv), str(paths.source)],
+            [
+                str(python),
+                "-I",
+                "-B",
+                "-c",
+                _RUNTIME_CODE,
+                str(paths.venv),
+                str(paths.source),
+                json.dumps(
+                    expected_direct_url(paths, active=executable_entrypoint), sort_keys=True
+                ),
+            ],
             capture_output=True,
             check=False,
             env=environment,
@@ -401,10 +522,6 @@ def probe_runtime(
             raise ValueError("installed Hermes probe returned malformed evidence") from exc
         if evidence.get("tool_schemas") != 0 or evidence.get("version") != VERSION:
             raise ValueError("installed Hermes probe returned unexpected evidence")
-        expected_direct = {
-            "url": paths.source.resolve().as_uri(),
-            "dir_info": {"editable": False},
-        }
         if evidence.get("direct_url") != expected_direct:
             raise ValueError("installed Hermes direct_url provenance is editable or unexpected")
         origins = evidence.get("origins")
@@ -421,8 +538,9 @@ def probe_runtime(
             origin = Path(value).resolve()
             if not origin.is_file() or not origin.is_relative_to(paths.venv.resolve()):
                 raise ValueError("installed Hermes import origin escapes the fixed runtime")
+        entrypoint = [str(hermes)] if executable_entrypoint else [str(python), str(hermes)]
         version = runner(
-            [str(hermes), "--version"],
+            [*entrypoint, "--version"],
             capture_output=True,
             check=False,
             env=environment,
@@ -436,7 +554,7 @@ def probe_runtime(
         ):
             raise ValueError("installed Hermes console version contract failed")
         base = [
-            str(hermes),
+            *entrypoint,
             "chat",
             "--quiet",
             "--source",
@@ -474,26 +592,39 @@ def expected_attestation(paths: RuntimePaths) -> dict[str, Any]:
     if not python.is_relative_to(paths.python_installs.resolve()):
         raise ValueError("Hermes venv Python escapes the fixed managed-Python tree")
     hermes = paths.venv / "bin/hermes"
+    active_python = (
+        paths.install_root / "runtime" / python.relative_to(paths.runtime_root.resolve())
+    )
+    wheel = wheel_path(paths)
     return {
         "archive_sha256": ARCHIVE_SHA256,
         "attestation_assets": {
-            name: sha256_file(Path(__file__).parent / name) for name in ATTESTATION_ASSETS
+            name: sha256_file(paths.runtime_root / name) for name in ATTESTATION_ASSETS
         },
         "commit": COMMIT,
         "hermes_sha256": sha256_file(hermes),
         "lock_sha256": LOCK_SHA256,
-        "python_path": str(python),
+        "python_path": str(active_python),
         "python_sha256": sha256_file(python),
-        "runtime_sha256": tree_digest([paths.python_installs, paths.venv]),
+        "runtime_sha256": generation_digest(paths),
         "source_sha256": provenance.get("source_sha256"),
         "uv_path": str(paths.uv),
         "uv_sha256": UV_SHA256,
         "uv_version": UV_VERSION,
         "version": VERSION,
+        "wheel": wheel.name,
+        "wheel_sha256": sha256_file(wheel),
     }
 
 
-def install_attestation_assets(source: Path, destination: Path, *, uid: int, gid: int) -> None:
+def install_attestation_assets(
+    source: Path,
+    destination: Path,
+    *,
+    uid: int,
+    gid: int,
+    checkpoint: Callable[[str], None] = lambda _step: None,
+) -> None:
     for name in ATTESTATION_ASSETS:
         content = (source / name).read_bytes()
         descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=destination)
@@ -506,6 +637,7 @@ def install_attestation_assets(source: Path, destination: Path, *, uid: int, gid
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, destination / name)
+            checkpoint("after_asset:" + name)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -538,17 +670,18 @@ def verify_attestation(
     acl_validator: AclValidator = reject_acls,
     runner: Runner = subprocess.run,
     probe_parent: Path = PROBE_PARENT,
+    run_probe: bool = True,
+    executable_entrypoint: bool = True,
 ) -> dict[str, Any]:
     verify_lock(paths.source)
     verify_uv(paths.uv, uid=uid, gid=gid, acl_validator=acl_validator, runner=runner)
-    for root in (paths.python_installs, paths.venv):
-        validate_tree(
-            root,
-            expected_uid=uid,
-            expected_gid=gid,
-            install_root=paths.install_root,
-            acl_validator=acl_validator,
-        )
+    validate_tree(
+        paths.runtime_root,
+        expected_uid=uid,
+        expected_gid=gid,
+        install_root=paths.install_root,
+        acl_validator=acl_validator,
+    )
     _safe_details(paths.venv / "bin/python", expected_uid=uid, expected_gid=gid)
     _safe_details(paths.venv / "bin/hermes", expected_uid=uid, expected_gid=gid, exact_mode=0o755)
     _safe_details(paths.attestation, expected_uid=uid, expected_gid=gid, exact_mode=0o644)
@@ -560,13 +693,24 @@ def verify_attestation(
     expected = expected_attestation(paths)
     if actual != expected:
         raise ValueError("Hermes runtime attestation is stale or tampered")
-    return probe_runtime(paths, runner=runner, probe_parent=probe_parent)
+    if not run_probe:
+        return {"tool_schemas": 0, "version": VERSION}
+    evidence = probe_runtime(
+        paths,
+        runner=runner,
+        probe_parent=probe_parent,
+        executable_entrypoint=executable_entrypoint,
+    )
+    if json.loads(paths.attestation.read_text()) != expected_attestation(paths):
+        raise ValueError("offline probe mutated the attested runtime generation")
+    return evidence
 
 
 def _remove_tree(path: Path) -> None:
     if path.is_symlink():
         raise ValueError(f"refusing to remove symlinked runtime path: {path}")
     if path.exists():
+        clear_disposable_flags(path)
         shutil.rmtree(path)
 
 
@@ -574,6 +718,174 @@ def _remove_incomplete_runtime(paths: RuntimePaths) -> None:
     paths.attestation.unlink(missing_ok=True)
     for path in (paths.venv, paths.python_installs, paths.cache, paths.temporary):
         _remove_tree(path)
+
+
+def _run_build_command(command: list[str], *, runner: Runner) -> None:
+    result = runner(
+        command,
+        capture_output=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
+        text=True,
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        raise ValueError("frozen Hermes runtime generation command failed")
+
+
+def rebase_generation(paths: RuntimePaths) -> None:
+    for cache in sorted(paths.runtime_root.rglob("__pycache__"), reverse=True):
+        if cache.is_dir() and not cache.is_symlink():
+            shutil.rmtree(cache)
+    for bytecode in paths.runtime_root.rglob("*.pyc"):
+        bytecode.unlink()
+    stage_bytes = str(paths.runtime_root).encode()
+    active_root = paths.install_root / "runtime"
+    for path in _all_paths(paths.runtime_root):
+        if path.is_symlink():
+            target = path.resolve(strict=True)
+            if target.is_relative_to(paths.runtime_root):
+                path.unlink()
+                path.symlink_to(os.path.relpath(target, path.parent))
+            continue
+        if not path.is_file() or path.is_relative_to(paths.artifacts):
+            continue
+        content = path.read_bytes()
+        if stage_bytes not in content:
+            continue
+        try:
+            rewritten = content.decode().replace(str(paths.runtime_root), str(active_root)).encode()
+        except UnicodeDecodeError:
+            continue
+        path.write_bytes(rewritten)
+    direct_urls = list(
+        paths.venv.glob("lib/python*/site-packages/hermes_agent-*.dist-info/direct_url.json")
+    )
+    if len(direct_urls) != 1:
+        raise ValueError("Hermes direct_url metadata is missing from the staged runtime")
+    direct_urls[0].write_text(json.dumps(expected_direct_url(paths, active=True), sort_keys=True))
+    for path in _all_paths(paths.runtime_root):
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            text_content = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        if str(paths.runtime_root) in text_content:
+            raise ValueError(f"runtime generation retains textual staging path: {path}")
+
+
+def build_generation(
+    paths: RuntimePaths,
+    *,
+    asset_source: Path,
+    root_uid: int,
+    wheel_gid: int,
+    build_user: str,
+    build_uid: int,
+    build_gid: int,
+    runner: Runner,
+    acl_validator: AclValidator,
+    provenance_checker: Callable[[], None],
+    probe_parent: Path,
+    checkpoint: Callable[[str], None],
+) -> None:
+    provenance_checker()
+    verify_lock(paths.source)
+    verify_uv(paths.uv, uid=root_uid, gid=wheel_gid, acl_validator=acl_validator, runner=runner)
+    for path in (paths.venv, paths.python_installs, paths.cache, paths.temporary, paths.artifacts):
+        path.mkdir(mode=0o700)
+        os.chown(path, build_uid, build_gid)
+        os.chmod(path, 0o700)
+    shutil.copytree(paths.source, paths.build_source, symlinks=False)
+    clear_disposable_flags(paths.build_source)
+    normalize_tree(paths.build_source, uid=build_uid, gid=build_gid)
+    _run_build_command(uv_command(paths, build_user), runner=runner)
+    _run_build_command(uv_build_command(paths, build_user), runner=runner)
+    wheel = wheel_path(paths)
+    _run_build_command(uv_install_command(paths, build_user, wheel), runner=runner)
+    checkpoint("after_build")
+    provenance_checker()
+    verify_lock(paths.source)
+    for path in (paths.build_source, paths.cache, paths.temporary):
+        _remove_tree(path)
+    install_attestation_assets(
+        asset_source,
+        paths.runtime_root,
+        uid=root_uid,
+        gid=wheel_gid,
+        checkpoint=checkpoint,
+    )
+    normalize_tree(paths.runtime_root, uid=root_uid, gid=wheel_gid)
+    validate_tree(
+        paths.runtime_root,
+        expected_uid=root_uid,
+        expected_gid=wheel_gid,
+        install_root=paths.install_root,
+        acl_validator=acl_validator,
+    )
+    checkpoint("after_normalization")
+    probe_runtime(
+        paths,
+        runner=runner,
+        probe_parent=probe_parent,
+        executable_entrypoint=False,
+    )
+    checkpoint("after_probe")
+    rebase_generation(paths)
+    normalize_tree(paths.runtime_root, uid=root_uid, gid=wheel_gid)
+    write_attestation(paths, expected_attestation(paths), uid=root_uid, gid=wheel_gid)
+    verify_attestation(
+        paths,
+        uid=root_uid,
+        gid=wheel_gid,
+        acl_validator=acl_validator,
+        runner=runner,
+        probe_parent=probe_parent,
+        run_probe=False,
+    )
+    checkpoint("after_attestation_write")
+
+
+def filesystem_state_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in _all_paths(root):
+        details = path.lstat()
+        relative = path.relative_to(root).as_posix()
+        kind = "L" if path.is_symlink() else "D" if path.is_dir() else "F"
+        digest.update(
+            f"{kind}\0{relative}\0{details.st_uid}\0{details.st_gid}\0"
+            f"{stat.S_IMODE(details.st_mode):04o}\0".encode()
+        )
+        if path.is_symlink():
+            digest.update(os.readlink(path).encode())
+        elif path.is_file():
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_fixed_active(paths: RuntimePaths, *, runner: Runner = subprocess.run) -> None:
+    verifier = paths.runtime_root / "verify-hermes-email-agent.py"
+    result = runner(
+        [str(verifier)],
+        capture_output=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0 or result.stderr:
+        raise ValueError("activated fixed runtime verifier failed")
+
+
+def _cleanup_generation(path: Path) -> None:
+    if path.exists():
+        if path.is_symlink() or not path.is_dir():
+            raise ValueError(f"runtime transaction path is unsafe: {path}")
+        clear_disposable_flags(path)
+        shutil.rmtree(path)
 
 
 def install_runtime(
@@ -588,53 +900,110 @@ def install_runtime(
     acl_validator: AclValidator = reject_acls,
     provenance_checker: Callable[[], None] = verify_source_cli,
     probe_parent: Path = PROBE_PARENT,
+    asset_source: Optional[Path] = None,
+    checkpoint: Callable[[str], None] = lambda _step: None,
+    final_verifier: Optional[Callable[[RuntimePaths], None]] = None,
 ) -> None:
-    provenance_checker()
-    verify_lock(paths.source)
-    verify_uv(paths.uv, uid=root_uid, gid=wheel_gid, acl_validator=acl_validator, runner=runner)
-    paths.attestation.unlink(missing_ok=True)
-    for path in (paths.venv, paths.python_installs, paths.cache, paths.temporary):
-        _remove_tree(path)
-        path.mkdir(mode=0o700)
-        os.chown(path, build_uid, build_gid)
-        os.chmod(path, 0o700)
-    try:
-        result = runner(
-            uv_command(paths, build_user),
-            capture_output=True,
-            check=False,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
-            text=True,
-            timeout=1800,
-        )
-        if result.returncode != 0:
-            raise ValueError("frozen Hermes runtime installation failed")
-        provenance_checker()
-        verify_lock(paths.source)
-        for path in (paths.cache, paths.temporary):
-            _remove_tree(path)
-        for root in (paths.python_installs, paths.venv):
-            normalize_tree(root, uid=root_uid, gid=wheel_gid)
-            validate_tree(
-                root,
-                expected_uid=root_uid,
-                expected_gid=wheel_gid,
-                install_root=paths.install_root,
-                acl_validator=acl_validator,
-            )
-        probe_runtime(paths, runner=runner, probe_parent=probe_parent)
-        write_attestation(paths, expected_attestation(paths), uid=root_uid, gid=wheel_gid)
+    active = build_paths(paths.install_root, paths.uv)
+    if paths.runtime_root != active.runtime_root:
+        raise ValueError("runtime installer accepts only the fixed active runtime")
+    verifier = (
+        (lambda current: verify_fixed_active(current, runner=runner))
+        if final_verifier is None
+        else final_verifier
+    )
+    old_digest: Optional[str] = None
+    if active.runtime_root.exists():
         verify_attestation(
-            paths,
+            active,
             uid=root_uid,
             gid=wheel_gid,
             acl_validator=acl_validator,
             runner=runner,
             probe_parent=probe_parent,
         )
-    except Exception:
-        _remove_incomplete_runtime(paths)
-        raise
+        old_digest = filesystem_state_digest(active.runtime_root)
+    stage_root = Path(tempfile.mkdtemp(prefix=".runtime-stage.", dir=paths.install_root))
+    stage = build_paths(paths.install_root, paths.uv, stage_root)
+    backup = paths.install_root / (".runtime-backup." + secrets.token_hex(12))
+    failed = paths.install_root / (".runtime-failed." + secrets.token_hex(12))
+    backed_up = False
+    activated = False
+    try:
+        checkpoint("after_stage_creation")
+        build_generation(
+            stage,
+            asset_source=Path(__file__).parent if asset_source is None else asset_source,
+            root_uid=root_uid,
+            wheel_gid=wheel_gid,
+            build_user=build_user,
+            build_uid=build_uid,
+            build_gid=build_gid,
+            runner=runner,
+            acl_validator=acl_validator,
+            provenance_checker=provenance_checker,
+            probe_parent=probe_parent,
+            checkpoint=checkpoint,
+        )
+        checkpoint("after_staged_verification")
+        if active.runtime_root.exists():
+            os.replace(active.runtime_root, backup)
+            backed_up = True
+            checkpoint("after_backup_rename")
+        os.replace(stage.runtime_root, active.runtime_root)
+        activated = True
+        checkpoint("after_activation_rename")
+        verifier(active)
+        checkpoint("after_final_verifier")
+        probe_runtime(active, runner=runner, probe_parent=probe_parent)
+        verify_attestation(
+            active,
+            uid=root_uid,
+            gid=wheel_gid,
+            acl_validator=acl_validator,
+            runner=runner,
+            probe_parent=probe_parent,
+            run_probe=False,
+        )
+        checkpoint("after_final_entrypoint")
+        if backed_up:
+            checkpoint("backup_cleanup")
+            _cleanup_generation(backup)
+            backed_up = False
+    except Exception as original_error:
+        try:
+            if activated and active.runtime_root.exists():
+                os.replace(active.runtime_root, failed)
+                activated = False
+            if backed_up and backup.exists():
+                os.replace(backup, active.runtime_root)
+                backed_up = False
+            if old_digest is None:
+                if active.runtime_root.exists():
+                    raise RuntimeError("failed first install left an active runtime")
+            else:
+                if filesystem_state_digest(active.runtime_root) != old_digest:
+                    raise RuntimeError("runtime rollback did not preserve prior state")
+                verify_attestation(
+                    active,
+                    uid=root_uid,
+                    gid=wheel_gid,
+                    acl_validator=acl_validator,
+                    runner=runner,
+                    probe_parent=probe_parent,
+                )
+            _cleanup_generation(failed)
+            _cleanup_generation(stage.runtime_root)
+        except Exception as rollback_error:
+            raise RuntimeError(
+                "runtime generation failed and rollback was incomplete"
+            ) from rollback_error
+        raise original_error
+    finally:
+        if stage.runtime_root.exists():
+            _cleanup_generation(stage.runtime_root)
+    if backup.exists() or failed.exists() or stage.runtime_root.exists():
+        raise RuntimeError("runtime generation cleanup was incomplete")
 
 
 def main(arguments: Optional[Sequence[str]] = None) -> int:
@@ -661,7 +1030,6 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
         build_uid=builder.pw_uid,
         build_gid=builder.pw_gid,
     )
-    install_attestation_assets(Path(__file__).parent, UV.parent, uid=uid, gid=wheel)
     print(paths.attestation)
     return 0
 

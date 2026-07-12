@@ -4,6 +4,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -29,6 +31,35 @@ def _no_acl(_paths: Sequence[Path]) -> None:
     pass
 
 
+def _populate_generation(runtime: Any, paths: Any, label: str) -> None:
+    python_real = paths.python_installs / "cpython/bin/python3.11"
+    python_real.parent.mkdir(parents=True, exist_ok=True)
+    python_real.write_text("reviewed python " + label + "\n")
+    python_real.chmod(0o755)
+    bin_directory = paths.venv / "bin"
+    site = paths.venv / "lib/python3.11/site-packages"
+    bin_directory.mkdir(parents=True, exist_ok=True)
+    site.mkdir(parents=True, exist_ok=True)
+    python = bin_directory / "python"
+    if python.exists() or python.is_symlink():
+        python.unlink()
+    python.symlink_to(os.path.relpath(python_real, bin_directory))
+    hermes = bin_directory / "hermes"
+    active_python = paths.install_root / "runtime/venv/bin/python"
+    hermes.write_text(f"#!{active_python}\nprint('stub')\n")
+    hermes.chmod(0o755)
+    for name in ("hermes_cli", "run_agent", "model_tools", "toolsets"):
+        (site / (name + ".py")).write_text("# reviewed " + label + "\n")
+    paths.artifacts.mkdir(parents=True, exist_ok=True)
+    wheel = paths.artifacts / "hermes_agent-0.18.2-py3-none-any.whl"
+    wheel.write_bytes(("wheel " + label + "\n").encode())
+    direct = site / "hermes_agent-0.18.2.dist-info/direct_url.json"
+    direct.parent.mkdir()
+    direct.write_text(json.dumps(runtime.expected_direct_url(paths, active=True), sort_keys=True))
+    for name in runtime.ATTESTATION_ASSETS:
+        shutil.copyfile(ROOT / "deploy/macos" / name, paths.runtime_root / name)
+
+
 def _fixture(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Any, Any, Any, list[list[str]], int, int]:
@@ -41,48 +72,41 @@ def _fixture(
     (paths.source / runtime.PROVENANCE_FILE).write_text(
         json.dumps({"source_sha256": "reviewed-source"}) + "\n"
     )
-    python_real = paths.python_installs / "cpython/bin/python3.11"
-    python_real.parent.mkdir(parents=True)
-    python_real.write_text("reviewed python\n")
-    python_real.chmod(0o755)
-    bin_directory = paths.venv / "bin"
-    site = paths.venv / "lib/python3.11/site-packages"
-    bin_directory.mkdir(parents=True)
-    site.mkdir(parents=True)
-    (bin_directory / "python").symlink_to(python_real)
-    hermes = bin_directory / "hermes"
-    hermes.write_text(f"#!{bin_directory / 'python'}\nprint('stub')\n")
-    hermes.chmod(0o755)
-    origins: dict[str, str] = {}
-    for name in ("hermes_cli", "run_agent", "model_tools", "toolsets"):
-        path = site / (name + ".py")
-        path.write_text("# reviewed\n")
-        origins[name] = str(path)
+    _populate_generation(runtime, paths, "old")
     paths.uv.write_text("reviewed uv\n")
     paths.uv.chmod(0o755)
     monkeypatch.setattr(runtime, "UV_SHA256", hashlib.sha256(paths.uv.read_bytes()).hexdigest())
     uid, gid = os.getuid(), os.getgid()
     calls: list[list[str]] = []
-    evidence: dict[str, Any] = {
-        "direct_url": {"url": paths.source.resolve().as_uri(), "dir_info": {"editable": False}},
-        "origins": origins,
-        "tool_schemas": 0,
-        "version": runtime.VERSION,
-    }
+    overrides: dict[str, Any] = {}
 
     def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         calls.append(argv)
         if argv == [str(paths.uv), "--version"]:
             return subprocess.CompletedProcess(argv, 0, runtime.UV_VERSION + "\n", "")
-        if len(argv) > 1 and argv[0] == str(bin_directory / "python") and argv[1] == "-I":
+        if len(argv) > 1 and argv[1] == "-I":
+            code_index = argv.index("-c")
+            venv = Path(argv[code_index + 2])
+            site = venv / "lib/python3.11/site-packages"
+            evidence: dict[str, Any] = {
+                "direct_url": json.loads(argv[code_index + 4]),
+                "origins": {
+                    name: str(site / (name + ".py"))
+                    for name in ("hermes_cli", "run_agent", "model_tools", "toolsets")
+                },
+                "tool_schemas": 0,
+                "version": runtime.VERSION,
+            }
+            evidence.update(overrides)
             return subprocess.CompletedProcess(argv, 0, json.dumps(evidence) + "\n", "")
-        if argv == [str(hermes), "--version"]:
+        if argv[-1:] == ["--version"] and any(item.endswith("/bin/hermes") for item in argv):
             return subprocess.CompletedProcess(argv, 0, "Hermes Agent v0.18.2\n", "")
-        if argv[0] == str(hermes) and argv[-1] == "--help":
+        if argv[-1:] == ["--help"] and any(item.endswith("/bin/hermes") for item in argv):
             return subprocess.CompletedProcess(argv, 0, "usage --quiet --resume --query\n", "")
         raise AssertionError(argv)
 
-    runner.evidence = evidence  # type: ignore[attr-defined]
+    runner.evidence = overrides  # type: ignore[attr-defined]
+    runtime.normalize_tree(paths.runtime_root, uid=uid, gid=gid)
     attestation = runtime.expected_attestation(paths)
     runtime.write_attestation(paths, attestation, uid=uid, gid=gid)
     return runtime, paths, runner, calls, uid, gid
@@ -210,7 +234,11 @@ def test_runtime_probe_rejects_import_origin_outside_venv(
     runtime, paths, runner, _calls, _uid, _gid = _fixture(tmp_path, monkeypatch)
     outside = tmp_path / "outside.py"
     outside.write_text("tampered\n")
-    runner.evidence["origins"]["model_tools"] = str(outside)
+    site = paths.venv / "lib/python3.11/site-packages"
+    runner.evidence["origins"] = {
+        name: str(outside if name == "model_tools" else site / (name + ".py"))
+        for name in ("hermes_cli", "run_agent", "model_tools", "toolsets")
+    }
     with pytest.raises(ValueError, match="import origin"):
         runtime.probe_runtime(paths, runner=runner, probe_parent=tmp_path)
 
@@ -286,10 +314,11 @@ def test_uv_command_is_frozen_fixed_and_secret_free(
         "-i",
         "HOME=/var/empty",
     ]
-    assert command[-5:] == [
+    assert command[-6:] == [
         "--frozen",
         "--no-dev",
         "--no-editable",
+        "--no-install-project",
         "--python",
         "3.11",
     ]
@@ -300,84 +329,174 @@ def test_uv_command_is_frozen_fixed_and_secret_free(
     assert "composio" not in rendered
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "chflags") or not getattr(stat, "UF_IMMUTABLE", 0),
+    reason="BSD immutable flags require macOS",
+)
+def test_disposable_source_copy_clears_uchg_without_mutating_canonical(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    source = tmp_path / "source"
+    source.mkdir(mode=0o755)
+    reviewed = source / "reviewed.txt"
+    reviewed.write_text("reviewed canonical source\n")
+    reviewed.chmod(0o644)
+    flag = stat.UF_IMMUTABLE
+    original_flags = {path: path.lstat().st_flags for path in (source, reviewed)}
+    try:
+        os.chflags(reviewed, original_flags[reviewed] | flag, follow_symlinks=False)
+        os.chflags(source, original_flags[source] | flag, follow_symlinks=False)
+        before_digest = runtime.filesystem_state_digest(source)
+        before = {
+            path: (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.lstat().st_mode),
+                path.lstat().st_uid,
+                path.lstat().st_gid,
+                path.lstat().st_flags,
+            )
+            for path in (source, reviewed)
+        }
+
+        disposable = tmp_path / ".build-source"
+        shutil.copytree(source, disposable, symlinks=False)
+        copied = disposable / reviewed.name
+        assert disposable.lstat().st_flags & flag
+        assert copied.lstat().st_flags & flag
+
+        runtime.clear_disposable_flags(disposable)
+        runtime.normalize_tree(disposable, uid=os.getuid(), gid=os.getgid())
+        copied.write_text("build seam can mutate disposable source\n")
+        (disposable / "build-output").write_text("ok\n")
+
+        assert runtime.filesystem_state_digest(source) == before_digest
+        assert {
+            path: (
+                path.read_bytes() if path.is_file() else None,
+                stat.S_IMODE(path.lstat().st_mode),
+                path.lstat().st_uid,
+                path.lstat().st_gid,
+                path.lstat().st_flags,
+            )
+            for path in (source, reviewed)
+        } == before
+    finally:
+        os.chflags(source, original_flags[source], follow_symlinks=False)
+        os.chflags(reviewed, original_flags[reviewed], follow_symlinks=False)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "chflags") or not getattr(stat, "UF_IMMUTABLE", 0),
+    reason="BSD immutable flags require macOS",
+)
+def test_injected_failure_cleans_flagged_disposable_generation(tmp_path: Path) -> None:
+    runtime = _runtime()
+    paths = runtime.build_paths(tmp_path / "hermes-agent", tmp_path / "uv")
+    paths.source.mkdir(parents=True)
+    reviewed = paths.source / "uv.lock"
+    reviewed.write_text("reviewed immutable source\n")
+    paths.uv.write_text("reviewed uv\n")
+    paths.uv.chmod(0o755)
+    runtime.LOCK_SHA256 = hashlib.sha256(reviewed.read_bytes()).hexdigest()
+    runtime.UV_SHA256 = hashlib.sha256(paths.uv.read_bytes()).hexdigest()
+    uid, gid = os.getuid(), os.getgid()
+    flag = stat.UF_IMMUTABLE
+    original_flags = {path: path.lstat().st_flags for path in (paths.source, reviewed)}
+    observed_build_copy = False
+    try:
+        os.chflags(reviewed, original_flags[reviewed] | flag, follow_symlinks=False)
+        os.chflags(paths.source, original_flags[paths.source] | flag, follow_symlinks=False)
+        before_digest = runtime.filesystem_state_digest(paths.source)
+        before_mode = stat.S_IMODE(reviewed.lstat().st_mode)
+
+        def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            nonlocal observed_build_copy
+            if argv == [str(paths.uv), "--version"]:
+                return subprocess.CompletedProcess(argv, 0, runtime.UV_VERSION + "\n", "")
+            if "sync" in argv:
+                copied = Path(argv[argv.index("--directory") + 1])
+                copied_lock = copied / "uv.lock"
+                assert not copied.lstat().st_flags & flag
+                assert not copied_lock.lstat().st_flags & flag
+                copied_lock.write_text("build seam is writable\n")
+                observed_build_copy = True
+                os.chflags(
+                    copied_lock,
+                    copied_lock.lstat().st_flags | flag,
+                    follow_symlinks=False,
+                )
+                os.chflags(copied, copied.lstat().st_flags | flag, follow_symlinks=False)
+                return subprocess.CompletedProcess(argv, 1, "", "injected build failure")
+            raise AssertionError(argv)
+
+        with pytest.raises(ValueError, match="generation command failed"):
+            runtime.install_runtime(
+                paths,
+                root_uid=uid,
+                wheel_gid=gid,
+                build_user="_hermesmail",
+                build_uid=uid,
+                build_gid=gid,
+                runner=runner,
+                acl_validator=_no_acl,
+                provenance_checker=lambda: None,
+                probe_parent=tmp_path,
+            )
+        assert observed_build_copy
+        assert runtime.filesystem_state_digest(paths.source) == before_digest
+        assert stat.S_IMODE(reviewed.lstat().st_mode) == before_mode
+        assert reviewed.lstat().st_flags & flag
+        assert paths.source.lstat().st_flags & flag
+        assert not paths.runtime_root.exists()
+        assert not list(paths.install_root.glob(".runtime-*"))
+    finally:
+        os.chflags(paths.source, original_flags[paths.source], follow_symlinks=False)
+        os.chflags(reviewed, original_flags[reviewed], follow_symlinks=False)
+
+
 def test_runtime_installer_cli_rejects_arbitrary_root() -> None:
     with pytest.raises(SystemExit):
         _runtime().main(["--root", "/tmp/runtime"])
 
 
-def test_failed_runtime_install_removes_builder_owned_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _fake_generation_builder(runtime: Any, uid: int, gid: int) -> Any:
+    def build(stage: Any, **kwargs: Any) -> None:
+        checkpoint = kwargs["checkpoint"]
+        _populate_generation(runtime, stage, "new")
+        checkpoint("after_build")
+        for name in runtime.ATTESTATION_ASSETS:
+            checkpoint("after_asset:" + name)
+        runtime.normalize_tree(stage.runtime_root, uid=uid, gid=gid)
+        checkpoint("after_normalization")
+        checkpoint("after_probe")
+        runtime.write_attestation(stage, runtime.expected_attestation(stage), uid=uid, gid=gid)
+        checkpoint("after_attestation_write")
+
+    return build
+
+
+def _install_with_fake_generation(
+    runtime: Any,
+    paths: Any,
+    runner: Any,
+    uid: int,
+    gid: int,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    checkpoint: Any = lambda _step: None,
 ) -> None:
-    runtime, paths, valid_runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime, "build_generation", _fake_generation_builder(runtime, uid, gid))
 
-    def failing_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if argv == [str(paths.uv), "--version"]:
-            return cast(subprocess.CompletedProcess[str], valid_runner(argv, **kwargs))
-        if argv[:1] == ["/usr/bin/sudo"]:
-            return subprocess.CompletedProcess(argv, 1, "", "failed")
-        raise AssertionError(argv)
-
-    with pytest.raises(ValueError, match="frozen Hermes runtime installation"):
-        runtime.install_runtime(
-            paths,
-            root_uid=uid,
-            wheel_gid=gid,
-            build_user="_hermesmail",
-            build_uid=uid,
-            build_gid=gid,
-            runner=failing_runner,
+    def final_verifier(active: Any) -> None:
+        runtime.verify_attestation(
+            active,
+            uid=uid,
+            gid=gid,
             acl_validator=_no_acl,
-            provenance_checker=lambda: None,
-            probe_parent=tmp_path,
+            runner=runner,
+            probe_parent=paths.install_root,
         )
-    for path in (
-        paths.attestation,
-        paths.venv,
-        paths.python_installs,
-        paths.cache,
-        paths.temporary,
-    ):
-        assert not path.exists()
-
-
-def test_successful_install_uses_only_temporary_probe_homes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    runtime, paths, valid_runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
-    service_home = tmp_path / "service-home-must-not-exist"
-    probe_parent = tmp_path / "probe-homes"
-    probe_parent.mkdir(mode=0o700)
-    probe_homes: set[Path] = set()
-
-    def populate_runtime() -> None:
-        python_real = paths.python_installs / "cpython/bin/python3.11"
-        python_real.parent.mkdir(parents=True, exist_ok=True)
-        python_real.write_text("reviewed python\n")
-        python_real.chmod(0o755)
-        bin_directory = paths.venv / "bin"
-        site = paths.venv / "lib/python3.11/site-packages"
-        bin_directory.mkdir(parents=True, exist_ok=True)
-        site.mkdir(parents=True, exist_ok=True)
-        (bin_directory / "python").symlink_to(python_real)
-        hermes = bin_directory / "hermes"
-        hermes.write_text(f"#!{bin_directory / 'python'}\nprint('stub')\n")
-        hermes.chmod(0o755)
-        for name in ("hermes_cli", "run_agent", "model_tools", "toolsets"):
-            (site / (name + ".py")).write_text("# reviewed\n")
-
-    def install_runner(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if argv == [str(paths.uv), "--version"]:
-            return cast(subprocess.CompletedProcess[str], valid_runner(argv, **kwargs))
-        if argv[:1] == ["/usr/bin/sudo"]:
-            populate_runtime()
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        home = Path(kwargs["env"]["HOME"])
-        assert home.parent == probe_parent
-        assert home != service_home
-        assert home.stat().st_mode & 0o777 == 0o700
-        (home / "offline-state").write_text("temporary\n")
-        probe_homes.add(home)
-        return cast(subprocess.CompletedProcess[str], valid_runner(argv, **kwargs))
 
     runtime.install_runtime(
         paths,
@@ -386,12 +505,151 @@ def test_successful_install_uses_only_temporary_probe_homes(
         build_user="_hermesmail",
         build_uid=uid,
         build_gid=gid,
-        runner=install_runner,
+        runner=runner,
         acl_validator=_no_acl,
         provenance_checker=lambda: None,
-        probe_parent=probe_parent,
+        probe_parent=paths.install_root,
+        checkpoint=checkpoint,
+        final_verifier=final_verifier,
     )
-    assert probe_homes
-    assert list(probe_parent.iterdir()) == []
-    assert not service_home.exists()
-    assert paths.attestation.is_file()
+
+
+FAULT_STEPS = [
+    "after_stage_creation",
+    "after_build",
+    *(
+        "after_asset:" + name
+        for name in (
+            "fetch-hermes-email-agent.py",
+            "install-hermes-email-runtime.py",
+            "verify-hermes-email-agent.py",
+        )
+    ),
+    "after_normalization",
+    "after_probe",
+    "after_attestation_write",
+    "after_staged_verification",
+    "after_backup_rename",
+    "after_activation_rename",
+    "after_final_verifier",
+    "after_final_entrypoint",
+    "backup_cleanup",
+]
+
+
+@pytest.mark.parametrize("fault_step", FAULT_STEPS)
+def test_upgrade_faults_restore_byte_identical_executable_old_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_step: str
+) -> None:
+    runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    before = runtime.filesystem_state_digest(paths.runtime_root)
+
+    def fail(step: str) -> None:
+        if step == fault_step:
+            raise OSError("injected " + step)
+
+    with pytest.raises(OSError, match="injected"):
+        _install_with_fake_generation(
+            runtime, paths, runner, uid, gid, monkeypatch, checkpoint=fail
+        )
+    assert runtime.filesystem_state_digest(paths.runtime_root) == before
+    runtime.verify_attestation(
+        paths,
+        uid=uid,
+        gid=gid,
+        acl_validator=_no_acl,
+        runner=runner,
+        probe_parent=paths.install_root,
+    )
+    assert (
+        "reviewed old" in (paths.venv / "lib/python3.11/site-packages/model_tools.py").read_text()
+    )
+    assert not list(paths.install_root.glob(".runtime-*"))
+
+
+@pytest.mark.parametrize(
+    "fault_step",
+    ["after_build", "after_attestation_write", "after_activation_rename", "after_final_entrypoint"],
+)
+def test_failed_first_install_leaves_no_active_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_step: str
+) -> None:
+    runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    shutil.rmtree(paths.runtime_root)
+
+    def fail(step: str) -> None:
+        if step == fault_step:
+            raise OSError("injected first install")
+
+    with pytest.raises(OSError, match="injected first"):
+        _install_with_fake_generation(
+            runtime, paths, runner, uid, gid, monkeypatch, checkpoint=fail
+        )
+    assert not paths.runtime_root.exists()
+    assert not list(paths.install_root.glob(".runtime-*"))
+
+
+def test_successful_upgrade_activates_new_generation_without_debris(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    before = runtime.filesystem_state_digest(paths.runtime_root)
+    _install_with_fake_generation(runtime, paths, runner, uid, gid, monkeypatch)
+    assert runtime.filesystem_state_digest(paths.runtime_root) != before
+    assert (
+        "reviewed new" in (paths.venv / "lib/python3.11/site-packages/model_tools.py").read_text()
+    )
+    runtime.verify_attestation(
+        paths,
+        uid=uid,
+        gid=gid,
+        acl_validator=_no_acl,
+        runner=runner,
+        probe_parent=paths.install_root,
+    )
+    assert json.loads(paths.attestation.read_text()) == runtime.expected_attestation(paths)
+    first_inode = paths.runtime_root.stat().st_ino
+    _install_with_fake_generation(runtime, paths, runner, uid, gid, monkeypatch)
+    assert paths.runtime_root.stat().st_ino != first_inode
+    assert json.loads(paths.attestation.read_text()) == runtime.expected_attestation(paths)
+    assert not list(paths.runtime_root.rglob("*.pyc"))
+    assert not list(paths.runtime_root.rglob("__pycache__"))
+    assert not list(paths.install_root.glob(".runtime-*"))
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "chflags") or not getattr(stat, "UF_IMMUTABLE", 0),
+    reason="BSD immutable flags require macOS",
+)
+def test_flagged_backup_is_preserved_on_rollback_then_cleaned_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, paths, runner, _calls, uid, gid = _fixture(tmp_path, monkeypatch)
+    old_file = paths.venv / "lib/python3.11/site-packages/model_tools.py"
+    original_flags = old_file.lstat().st_flags
+    os.chflags(old_file, original_flags | stat.UF_IMMUTABLE, follow_symlinks=False)
+
+    def fail_after_activation(step: str) -> None:
+        if step == "after_activation_rename":
+            raise OSError("injected activation failure")
+
+    try:
+        with pytest.raises(OSError, match="injected activation failure"):
+            _install_with_fake_generation(
+                runtime,
+                paths,
+                runner,
+                uid,
+                gid,
+                monkeypatch,
+                checkpoint=fail_after_activation,
+            )
+        assert old_file.lstat().st_flags & stat.UF_IMMUTABLE
+
+        _install_with_fake_generation(runtime, paths, runner, uid, gid, monkeypatch)
+        assert "reviewed new" in old_file.read_text()
+        assert not old_file.lstat().st_flags & stat.UF_IMMUTABLE
+        assert not list(paths.install_root.glob(".runtime-*"))
+    finally:
+        if old_file.exists():
+            os.chflags(old_file, original_flags, follow_symlinks=False)

@@ -93,7 +93,7 @@ def test_wrapper_executes_only_fixed_cwd_argv_and_environment(
     monkeypatch.setattr(wrapper_os, "execve", fake_execve)
     assert wrapper.main(["--query", "fixed prompt"]) == 70
 
-    hermes = "/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/hermes"
+    hermes = "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes"
     assert calls["cwd"] == "/var/db/hermes-email-agent/workspace"
     assert calls["path"] == hermes
     assert calls["argv"] == [
