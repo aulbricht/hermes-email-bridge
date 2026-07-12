@@ -14,8 +14,6 @@
         <string>__ENV_FILE__</string>
         <key>HOME</key>
         <string>__HOME__</string>
-        <key>HERMES_HOME</key>
-        <string>__HERMES_HOME__</string>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
     </dict>

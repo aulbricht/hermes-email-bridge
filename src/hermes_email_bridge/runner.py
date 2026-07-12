@@ -62,9 +62,8 @@ Subject: {message.subject}
 class SubprocessHermesRunner(HermesRunner):
     """Run the configured Hermes CLI without invoking a shell."""
 
-    def __init__(self, command: str, profile: str = "default", timeout: float = 300) -> None:
+    def __init__(self, command: str, timeout: float = 300) -> None:
         self.command = command
-        self.profile = profile
         self.timeout = timeout
 
     def run(
@@ -78,25 +77,10 @@ class SubprocessHermesRunner(HermesRunner):
         if mapping:
             argv.extend(["--resume", mapping.hermes_session])
         argv.extend(["--query", format_hermes_prompt(message, mapping)])
-        env = os.environ.copy()
-        for secret_name in (
-            "EMAIL_BRIDGE_COMPOSIO_API_KEY",
-            "COMPOSIO_API_KEY",
-            "AGENTMAIL_API_KEY",
-            "AGENTMAIL_WEBHOOK_SECRET",
-        ):
-            env.pop(secret_name, None)
-        env.update(
-            {
-                "HERMES_PROFILE": self.profile,
-                "HERMES_EMAIL_PROVIDER": message.provider,
-                "HERMES_EMAIL_MESSAGE_ID": message.provider_message_id,
-                "HERMES_EMAIL_THREAD_ID": message.thread_id or "",
-                "HERMES_EMAIL_TOPIC": mapping.hermes_topic
-                if mapping and mapping.hermes_topic
-                else "",
-            }
-        )
+        env = {"PATH": os.environ.get("PATH", os.defpath)}
+        for locale_name in ("LANG", "LC_ALL", "LC_CTYPE"):
+            if value := os.environ.get(locale_name):
+                env[locale_name] = value
         try:
             completed = subprocess.run(
                 argv,

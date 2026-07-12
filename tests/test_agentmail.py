@@ -13,6 +13,7 @@ from hermes_email_bridge.providers.agentmail import (
     normalize_agentmail_message,
     normalize_agentmail_sent_message,
 )
+from hermes_email_bridge.store import MappingStore
 
 
 def test_normalizes_agentmail_message() -> None:
@@ -168,6 +169,47 @@ def test_direct_provider_polls_trusted_sent_recipient_metadata() -> None:
         "cc@example.test",
         "bcc@example.test",
     )
+
+
+def test_direct_reply_targets_only_authenticated_from_address() -> None:
+    class RecordingProvider(AgentMailProvider):
+        def __init__(self) -> None:
+            super().__init__(api_key="test", inbox_id="bridge@agentmail.test")
+            self.body: dict[str, Any] | None = None
+
+        def _request(
+            self,
+            method: str,
+            path: str,
+            *,
+            params: dict[str, Any] | None = None,
+            body: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            self.body = body
+            return {"message_id": "reply-1"}
+
+    message = normalize_agentmail_message(
+        {
+            "message_id": "inbound-1",
+            "from": "Allowed <person@example.test>",
+            "to": ["bridge@agentmail.test"],
+            "cc": ["attacker-cc@example.test"],
+            "bcc": ["attacker-bcc@example.test"],
+            "reply_to": ["attacker-reply@example.test"],
+            "timestamp": "2026-07-11T12:00:00Z",
+        },
+        sender_authentication=SenderAuthentication.AUTHENTICATED,
+    )
+    provider = RecordingProvider()
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("agentmail", message.from_email)
+        assert store.is_allowed("agentmail", message.from_email)
+        assert provider.reply(message, "safe reply") == "reply-1"
+    assert provider.body == {
+        "text": "safe reply",
+        "to": ["person@example.test"],
+        "reply_all": False,
+    }
 
 
 def test_unauthenticated_event_cannot_be_upgraded_by_api_received_label() -> None:

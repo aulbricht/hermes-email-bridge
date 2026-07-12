@@ -103,6 +103,11 @@ def test_threaded_reply_uses_only_fixed_relative_endpoint_and_body() -> None:
         subject="subject",
         text_body="body",
         received_at=datetime(2026, 7, 11, tzinfo=UTC),
+        raw_payload={
+            "reply_to": ["attacker-reply@example.test"],
+            "cc": ["attacker-cc@example.test"],
+            "bcc": ["attacker-bcc@example.test"],
+        },
         sender_authentication=SenderAuthentication.AUTHENTICATED,
     )
     assert provider.reply(inbound, "reply") == "reply-1"
@@ -111,7 +116,11 @@ def test_threaded_reply_uses_only_fixed_relative_endpoint_and_body() -> None:
     assert wrapped["endpoint"] == (
         "/v0/inboxes/bridge%40agentmail.test/messages/%3Cinbound%40example.test%3E/reply"
     )
-    assert wrapped["body"] == {"text": "reply"}
+    assert wrapped["body"] == {
+        "text": "reply",
+        "to": ["person@example.test"],
+        "reply_all": False,
+    }
 
 
 def test_composio_poll_get_reply_support_encoded_slash_message_id() -> None:

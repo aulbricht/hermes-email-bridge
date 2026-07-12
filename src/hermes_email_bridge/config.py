@@ -66,7 +66,6 @@ class Settings:
     poll_interval: float
     log_level: str
     hermes_command: str
-    hermes_profile: str
     hermes_timeout: float
     agentmail_api_key: str | None
     agentmail_inbox_id: str | None
@@ -138,7 +137,6 @@ class Settings:
             poll_interval=poll_interval,
             log_level=values.get("EMAIL_BRIDGE_LOG_LEVEL", "INFO").upper(),
             hermes_command=values.get("HERMES_COMMAND", "hermes chat --quiet --source tool"),
-            hermes_profile=values.get("HERMES_PROFILE", "default"),
             hermes_timeout=hermes_timeout,
             agentmail_api_key=values.get("AGENTMAIL_API_KEY"),
             agentmail_inbox_id=values.get("AGENTMAIL_INBOX_ID"),

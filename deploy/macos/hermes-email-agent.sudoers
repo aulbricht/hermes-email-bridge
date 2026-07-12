@@ -1,0 +1,2 @@
+Defaults:__BRIDGE_USER__ env_reset, secure_path=/usr/bin:/bin:/usr/sbin:/sbin
+__BRIDGE_USER__ ALL = (_hermesmail) NOPASSWD: /usr/local/libexec/hermes-email-agent

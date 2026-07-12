@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 import sys
 from dataclasses import replace
@@ -200,33 +201,46 @@ def test_subprocess_runner_uses_prompt_and_captures_session() -> None:
     assert result.session_id == "session-new"
 
 
-def test_subprocess_runner_removes_only_bridge_provider_secrets(
+def test_subprocess_runner_passes_only_minimal_execution_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    secret_names = (
+    forbidden_names = (
+        "EMAIL_BRIDGE_ENV_FILE",
         "EMAIL_BRIDGE_COMPOSIO_API_KEY",
         "COMPOSIO_API_KEY",
         "AGENTMAIL_API_KEY",
         "AGENTMAIL_WEBHOOK_SECRET",
+        "EMAIL_BRIDGE_DB_PATH",
+        "HERMES_HOME",
+        "HOME",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "PYTHONPATH",
+        "ARBITRARY_PARENT_SENTINEL",
     )
-    for index, name in enumerate(secret_names):
-        monkeypatch.setenv(name, f"distinctive-secret-{index}")
-    monkeypatch.setenv("HERMES_HOME", "/safe/hermes-home")
-    monkeypatch.setenv("UNRELATED_PROVIDER_KEY", "preserve-me")
+    for index, name in enumerate(forbidden_names):
+        monkeypatch.setenv(name, f"parent-only-{index}")
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
     script = (
         "import json, os; "
-        f"print(json.dumps({{name: os.getenv(name) for name in {secret_names!r}}} | "
-        "{'HERMES_HOME': os.getenv('HERMES_HOME'), "
-        "'HERMES_PROFILE': os.getenv('HERMES_PROFILE'), "
-        "'PATH_PRESENT': bool(os.getenv('PATH')), "
-        "'UNRELATED_PROVIDER_KEY': os.getenv('UNRELATED_PROVIDER_KEY')}))"
+        f"print(json.dumps({{name: os.getenv(name) for name in {forbidden_names!r}}} | "
+        "{'PATH': os.getenv('PATH'), 'LANG': os.getenv('LANG'), "
+        "'ENV_KEYS': sorted(os.environ)}))"
     )
     command = shlex.join([sys.executable, "-c", script])
-    result = SubprocessHermesRunner(command, profile="safe-profile").run(_message(), None)
+    result = SubprocessHermesRunner(command).run(_message(), None)
     child_env = json.loads(result.reply)
 
-    assert all(child_env[name] is None for name in secret_names)
-    assert child_env["HERMES_HOME"] == "/safe/hermes-home"
-    assert child_env["HERMES_PROFILE"] == "safe-profile"
-    assert child_env["PATH_PRESENT"] is True
-    assert child_env["UNRELATED_PROVIDER_KEY"] == "preserve-me"
+    assert all(child_env[name] is None for name in forbidden_names)
+    assert child_env["PATH"] == os.environ["PATH"]
+    assert child_env["LANG"] == "en_US.UTF-8"
+    # macOS may synthesize this Cocoa text-encoding variable after execve.
+    assert set(child_env["ENV_KEYS"]) <= {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "__CF_USER_TEXT_ENCODING",
+    }

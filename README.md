@@ -77,14 +77,15 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME` | `false` | Enable authenticated exact-participant subject fallback |
 | `EMAIL_BRIDGE_POLL_INTERVAL` | `30` | Continuous poll interval in seconds |
 | `EMAIL_BRIDGE_LOG_LEVEL` | `INFO` | Python log level |
-| `HERMES_COMMAND` | `hermes chat --quiet --source tool` | Shell-free Hermes command prefix |
-| `HERMES_PROFILE` | `default` | Profile metadata exported to Hermes |
+| `HERMES_COMMAND` | `hermes chat --quiet --source tool` | Shell-free command prefix; production must use the isolated sudo wrapper below |
 | `HERMES_TIMEOUT` | `300` | Invocation timeout in seconds |
 | `EMAIL_BRIDGE_WEBHOOK_HOST` | `127.0.0.1` | Webhook listen host |
 | `EMAIL_BRIDGE_WEBHOOK_PORT` | `8787` | Webhook listen port |
 | `EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE` | `8` | Accepted webhook events waiting for a worker |
 
-For a named Hermes profile, point `HERMES_COMMAND` at that profile's Hermes wrapper. The bridge appends `--resume SESSION` when mapped and always appends `--query PROMPT`; it never invokes a shell.
+The bridge appends `--resume SESSION` when mapped and always appends `--query PROMPT`; it
+never invokes a shell. The built-in command default is for local development only. A production
+email bridge must use the fixed isolated wrapper described below, not a same-user Hermes profile.
 
 ## Use
 
@@ -214,6 +215,10 @@ Every inbound path is an authorization decision: the provider must classify the 
 
 Every authorized match links the inbound and outbound message IDs to the mapping, improving subsequent reply matching. Provider thread IDs are unique per authenticated participant; conflicting attempts cannot overwrite an existing Hermes session.
 
+Threaded replies explicitly target only the normalized, authenticated, allowlisted `From`
+address and set `reply_all=false`. Untrusted `Reply-To`, Cc, and Bcc values can never select
+reply recipients.
+
 ## Trust boundary
 
 Email is untrusted user content. The bridge never reads commands, session IDs, routing values, or configuration from the body or subject. The body is passed to Hermes inside an explicit user-content boundary; only configured values, verified provider fields, and existing opaque mapping capabilities control the bridge.
@@ -223,6 +228,8 @@ Additional safeguards:
 - Webhook HMAC signature and five-minute timestamp verification
 - Configurable replies plus independent dry-run gate
 - No shell evaluation of `HERMES_COMMAND`
+- Minimal Hermes child environment: only `PATH` and present locale fields reach the command
+- Production Hermes runs as a separate non-staff account through a root-owned fixed wrapper
 - API keys and webhook secrets never logged
 - Processed message IDs plus in-process webhook coalescing prevent duplicate Hermes invocations
 - AgentMail bearer credentials are sent only to a validated HTTPS origin; redirects are rejected
@@ -258,15 +265,16 @@ configuration, and malformed-response failures stop rather than retry forever.
 
 ## macOS LaunchAgent
 
-Generic templates live in `deploy/macos`. Copy them into a neutral service installation;
-do not run the service from the repository or Hermes state directory.
+Generic templates live in `deploy/macos`. The bridge remains a user LaunchAgent, but
+email-driven Hermes runs as the separate hidden `_hermesmail` account. Do not run either
+component from the repository or from another Hermes user's state directory.
 
 1. Create separate workspace, configuration, state, and log directories with mode `0700`.
 2. Copy `run-email-bridge.sh` into the install directory and keep it executable.
 3. Put only required configuration in the environment file, set
    `EMAIL_BRIDGE_VENV` to the Python 3.11+ environment, then set the file to mode `0600`.
 4. Replace every `__PLACEHOLDER__` in the plist, including a unique label, absolute paths,
-   safe `HOME`, and `HERMES_HOME`. Keep the plist free of secrets.
+   and a neutral bridge `HOME`. Keep the plist free of secrets.
 5. Run `init-db --start-now`, add initial exact addresses with `allowlist add`, then load
    the plist as a user LaunchAgent.
 
@@ -279,9 +287,70 @@ Protect the database, SQLite sidecars, environment, workspace, and logs from oth
 A user LaunchAgent starts only after login; with FileVault enabled, it cannot run before
 the user unlocks and logs into the Mac after reboot.
 
-The bridge removes its Composio and AgentMail credentials from the Hermes child environment.
-Production Hermes must load its own Composio connection from its protected `HERMES_HOME`;
-do not make Hermes depend on inheriting the bridge's Proxy Execute key.
+### Isolated Hermes account and wrapper
+
+Before installation, list existing IDs with `dscl . -list /Users UniqueID` and
+`dscl . -list /Groups PrimaryGroupID`. Choose unused values for `__SERVICE_UID__` and
+`__SERVICE_GID__`, then rerun both checks immediately before creation. As root, create the
+hidden non-staff account and group:
+
+```bash
+dscl . -create /Groups/_hermesmail
+dscl . -create /Groups/_hermesmail PrimaryGroupID __SERVICE_GID__
+dscl . -create /Users/_hermesmail
+dscl . -create /Users/_hermesmail UniqueID __SERVICE_UID__
+dscl . -create /Users/_hermesmail PrimaryGroupID __SERVICE_GID__
+dscl . -create /Users/_hermesmail NFSHomeDirectory /var/db/hermes-email-agent
+dscl . -create /Users/_hermesmail UserShell /usr/bin/false
+dscl . -create /Users/_hermesmail IsHidden 1
+install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent
+install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent/workspace
+```
+
+Verify the wrapper interpreter first with `test -x /usr/bin/python3`. Install Hermes Agent
+**0.18.2** into the fixed, root-owned
+`/Library/Application Support/HermesEmailAgent/hermes-agent` tree and verify the pinned
+version before continuing. Its virtual-environment executable must be exactly
+`/Library/Application Support/HermesEmailAgent/hermes-agent/venv/bin/hermes`; code and
+environment files must not be writable by `_hermesmail`. Configure only the inference-only
+`openai-codex` authentication required for model `gpt-5.5` under
+`/var/db/hermes-email-agent`. Never copy or reuse another user's profile, auth files, home,
+Composio connection, hooks, plugins, rules, skills, or `HERMES_HOME`.
+
+Install and validate the enforcement assets as root:
+
+```bash
+install -o root -g wheel -m 0755 deploy/macos/hermes-email-agent-wrapper.py \
+  /usr/local/libexec/hermes-email-agent
+sed 's/__BRIDGE_USER__/YOUR_BRIDGE_ACCOUNT/g' deploy/macos/hermes-email-agent.sudoers \
+  > /tmp/hermes-email-agent.sudoers
+visudo -cf /tmp/hermes-email-agent.sudoers
+install -o root -g wheel -m 0440 /tmp/hermes-email-agent.sudoers \
+  /etc/sudoers.d/hermes-email-agent
+```
+
+The sudoers rule grants the bridge account only the exact root-owned wrapper as
+`_hermesmail`. The wrapper accepts only `--query TEXT` with one optional safe `--resume
+SESSION_ID`; it fixes the working directory, environment, executable, and Hermes arguments:
+safe mode, `no_mcp`, `openai-codex`, `gpt-5.5`, and one turn. It cannot select arbitrary
+providers, models, tools, toolsets, hooks, skills, flags, or commands. Configure the bridge:
+
+```bash
+HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'
+```
+
+Hermes 0.18.2 safe mode skips plugins, MCP configuration, hooks, rules, and skills, but
+built-in tool compatibility still depends on `--toolsets no_mcp`. Before every Hermes
+upgrade, keep the LaunchAgent unloaded and run the approved zero-schema probe through this
+wrapper. Do not restart unless the probe verifies that Hermes advertises exactly zero tool
+schemas and the wrapper still rejects unknown flags. Resume remains enabled because the
+bridge requires persisted conversation sessions.
+
+The bridge command receives only `PATH` and present locale fields; it receives no bridge
+environment-file path, AgentMail/Composio/bridge variables, proxy variables, `PYTHONPATH`,
+`HOME`, `HERMES_HOME`, or bridge metadata. The wrapper then replaces that environment with
+its fixed service-account environment. Same-user `0600` files alone are not an isolation
+boundary against an email-driven agent.
 
 ## Release notes
 
@@ -290,6 +359,7 @@ do not make Hermes depend on inheriting the bridge's Proxy Execute key.
 - Added Composio Proxy Execute transport for AgentMail without new runtime dependencies.
 - Added authenticated exact-address allowlisting and automatic trusted-sent enrollment.
 - Added no-history cursor seeding, transient polling backoff, and macOS LaunchAgent templates.
+- Restricted replies to authenticated `From` and added separate-account Hermes isolation assets.
 - Consolidated runtime version reporting on package metadata from `pyproject.toml`.
 
 ## AgentMail notes and current limits

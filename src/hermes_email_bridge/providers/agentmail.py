@@ -323,10 +323,11 @@ class AgentMailProvider(EmailProvider):
         )
 
     def reply(self, message: NormalizedEmail, text: str) -> str:
+        recipient = normalize_email_address(message.from_email)
         response = self._request(
             "POST",
             f"{self._inbox_path}/messages/{quote(message.provider_message_id, safe='')}/reply",
-            body={"text": text},
+            body={"text": text, "to": [recipient], "reply_all": False},
         )
         message_id = str(response.get("message_id") or "")
         if not message_id:

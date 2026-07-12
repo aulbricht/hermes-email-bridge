@@ -92,7 +92,6 @@ def _service(
         store=store,
         runner=SubprocessHermesRunner(
             settings.hermes_command,
-            settings.hermes_profile,
             settings.hermes_timeout,
         ),
         send_replies=settings.send_replies,
