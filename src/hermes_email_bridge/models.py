@@ -64,6 +64,16 @@ class NormalizedEmail:
 
 
 @dataclass(frozen=True, slots=True)
+class SentEmail:
+    """Trusted outbound message metadata used to authorize future senders."""
+
+    provider: str
+    provider_message_id: str
+    recipients: tuple[str, ...]
+    sent_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationMapping:
     """Persistent link between an email conversation and a Hermes route."""
 
@@ -91,6 +101,22 @@ class MappingResolution:
 class PollResult:
     messages: tuple[NormalizedEmail, ...]
     cursor: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SentPollResult:
+    messages: tuple[SentEmail, ...]
+    cursor: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AllowlistEntry:
+    provider: str
+    address: str
+    source: str
+    source_message_id: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

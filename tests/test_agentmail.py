@@ -11,6 +11,7 @@ from hermes_email_bridge.providers.agentmail import (
     AgentMailError,
     AgentMailProvider,
     normalize_agentmail_message,
+    normalize_agentmail_sent_message,
 )
 
 
@@ -62,6 +63,24 @@ def test_raw_authentication_results_header_is_never_trusted() -> None:
     assert message.sender_authentication is SenderAuthentication.UNKNOWN
 
 
+def test_normalizes_trusted_sent_recipients_across_to_cc_bcc() -> None:
+    message = normalize_agentmail_sent_message(
+        {
+            "message_id": "sent-1",
+            "to": ["To Person <to@example.test>"],
+            "cc": ["CC@example.test", "not-an-address"],
+            "bcc": "bcc@example.test",
+            "timestamp": "2026-07-11T12:00:00Z",
+        }
+    )
+    assert message.provider == "agentmail"
+    assert message.recipients == (
+        "to@example.test",
+        "cc@example.test",
+        "bcc@example.test",
+    )
+
+
 class StubAgentMailProvider(AgentMailProvider):
     def __init__(self, detail_labels: list[str] | None = None) -> None:
         super().__init__(api_key="test", inbox_id="bridge@agentmail.to")
@@ -103,6 +122,42 @@ def test_poll_received_classification_is_authenticated() -> None:
 def test_api_unauthenticated_label_overrides_received_assumption() -> None:
     messages = StubAgentMailProvider(["unauthenticated"]).poll(None).messages
     assert messages[0].sender_authentication is SenderAuthentication.UNAUTHENTICATED
+
+
+class StubSentAgentMailProvider(AgentMailProvider):
+    def __init__(self) -> None:
+        super().__init__(api_key="test", inbox_id="bridge@agentmail.to")
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if path.endswith("/messages"):
+            assert params and params["labels"] == ["sent"]
+            return {"messages": [{"message_id": "sent-1", "labels": ["sent"]}]}
+        return {
+            "message_id": "sent-1",
+            "labels": ["sent"],
+            "from": "bridge@agentmail.to",
+            "to": ["to@example.test"],
+            "cc": ["cc@example.test"],
+            "bcc": ["bcc@example.test"],
+            "timestamp": "2026-07-11T12:00:00Z",
+        }
+
+
+def test_direct_provider_polls_trusted_sent_recipient_metadata() -> None:
+    result = StubSentAgentMailProvider().poll_sent(None)
+    assert result.cursor == "2026-07-11T12:00:00Z"
+    assert result.messages[0].recipients == (
+        "to@example.test",
+        "cc@example.test",
+        "bcc@example.test",
+    )
 
 
 def test_unauthenticated_event_cannot_be_upgraded_by_api_received_label() -> None:
@@ -207,6 +262,27 @@ def test_settings_reject_remote_http_and_defaults_raw_storage_off() -> None:
     settings = Settings.from_env({})
     assert settings.store_raw is False
     assert settings.allow_subject_resume is False
+
+
+def test_composio_settings_require_only_key_account_and_inbox() -> None:
+    settings = Settings.from_env(
+        {
+            "EMAIL_BRIDGE_PROVIDER": "composio-agentmail",
+            "COMPOSIO_API_KEY": "test-key",
+            "COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID": "ca_test",
+            "COMPOSIO_AGENT_MAIL_INBOX_ID": "bridge@example.test",
+        }
+    )
+    assert settings.require_composio_agentmail() == (
+        "test-key",
+        "ca_test",
+        "bridge@example.test",
+    )
+    assert settings.logical_provider() == "agentmail"
+    with pytest.raises(ConfigError, match="COMPOSIO_API_KEY"):
+        Settings.from_env(
+            {"EMAIL_BRIDGE_PROVIDER": "composio-agentmail"}
+        ).require_composio_agentmail()
 
 
 def test_agentmail_redirect_is_rejected_before_following() -> None:

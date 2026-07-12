@@ -4,16 +4,17 @@
 
 AgentMail is the first adapter, not a core dependency. The bridge contract is intentionally small enough for future IMAP, Gmail API, Postmark, SendGrid, or SES adapters.
 
-> Status: alpha. Start with replies disabled and dry-run enabled.
+> Version: **0.3.0 (alpha)**. Start with replies disabled and dry-run enabled.
 
 ## What works
 
-- AgentMail polling, message inspection, threaded replies, and verified webhooks
+- Direct or Composio-backed AgentMail polling, message inspection, threaded replies, and verified webhooks
 - Provider-neutral typed message and attachment models
 - Authorization-aware SQLite mappings bound to a provider-authenticated participant
 - Hermes session creation and resume through its non-interactive CLI
 - JSON structured logs with secret-field redaction
 - Persistent poll cursor, processed-message idempotency, and optional raw payload storage
+- Exact sender allowlisting with automatic enrollment from trusted outbound mail
 - No runtime Python dependencies
 
 ## Install
@@ -59,7 +60,7 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `EMAIL_BRIDGE_PROVIDER` | `agentmail` | Active provider adapter |
+| `EMAIL_BRIDGE_PROVIDER` | `agentmail` | `agentmail` or `composio-agentmail` |
 | `AGENTMAIL_API_KEY` | required | AgentMail bearer API key |
 | `AGENTMAIL_INBOX_ID` | required | Inbox address or ID |
 | `AGENTMAIL_WEBHOOK_SECRET` | required by `serve` | Svix signing secret (`whsec_…`) |
@@ -68,6 +69,9 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_DRY_RUN` | `true` | Skip provider send even when replies are enabled |
 | `AGENTMAIL_BASE_URL` | `https://api.agentmail.to/v0` | HTTPS AgentMail API base URL |
 | `AGENTMAIL_ALLOW_INSECURE_LOCAL_HTTP` | `false` | Permit HTTP only to `localhost` or a loopback IP for local tests |
+| `COMPOSIO_API_KEY` | required for Composio | Project key scoped to Proxy Execute |
+| `COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID` | required for Composio | Active AgentMail connected account |
+| `COMPOSIO_AGENT_MAIL_INBOX_ID` | required for Composio | AgentMail inbox address or ID |
 | `EMAIL_BRIDGE_STORE_RAW` | `false` | Persist raw provider payloads for debugging |
 | `EMAIL_BRIDGE_RAW_RETENTION_DAYS` | `30` | Logical retention limit for opted-in raw payloads |
 | `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME` | `false` | Enable authenticated exact-participant subject fallback |
@@ -84,11 +88,27 @@ For a named Hermes profile, point `HERMES_COMMAND` at that profile's Hermes wrap
 
 ## Use
 
-Initialize the mapping database:
+Initialize the mapping database. For a fresh production deployment, seed both
+poll cursors to the current UTC time so existing received and sent mail is not imported:
 
 ```bash
 hermes-email-bridge init-db
+hermes-email-bridge init-db --start-now
 ```
+
+The bridge denies every sender until an exact address is authorized. Wildcards and
+domain entries are not accepted:
+
+```bash
+hermes-email-bridge allowlist add person@example.com
+hermes-email-bridge allowlist list
+hermes-email-bridge allowlist remove person@example.com
+```
+
+Each poll cycle reads trusted `sent` messages before `received` messages. Valid To,
+Cc, and Bcc recipients on new messages sent from the configured inbox are added to
+the allowlist automatically. Removing an address remains effective across cursor
+overlap and restarts; only a later, newly observed outbound message can authorize it again.
 
 Poll once, or continuously:
 
@@ -130,7 +150,8 @@ curl http://127.0.0.1:8787/healthz
 
 Expose `/webhooks` through HTTPS and register it for AgentMail's `message.received` event. `serve` refuses to start without `AGENTMAIL_WEBHOOK_SECRET` and verifies the exact raw body using AgentMail's Svix headers before parsing it. Verified events enter a bounded queue and one worker processes them serially so messages cannot race to create or resume the same Hermes session; saturation returns HTTP 503 so the provider can retry. See AgentMail's [webhook setup](https://docs.agentmail.to/webhooks-overview) and [verification](https://docs.agentmail.to/webhook-verification) guides.
 
-To enable actual replies, change both safety gates deliberately:
+To enable actual replies, change both safety gates deliberately. Authentication and
+allowlist checks still apply before Hermes invocation, mapping changes, or replies:
 
 ```bash
 export EMAIL_BRIDGE_SEND_REPLIES=true
@@ -171,7 +192,7 @@ The marker is a random opaque capability that only selects an existing database 
 flowchart LR
     A["AgentMail poll or signed webhook"] --> B["AgentMail adapter"]
     B --> C["NormalizedEmail"]
-    C --> D{"Authenticated exact participant?"}
+    C --> D{"Authenticated and allowlisted exact sender?"}
     D -->|"denied"| J["Record denial; no Hermes or mapping mutation"]
     D -->|"authorized / new"| E["SQLite resolver and Hermes runner"]
     E --> F{"Reply gates"}
@@ -189,7 +210,7 @@ Resolution order is:
 3. Provider thread ID
 4. Exact normalized subject and participant, only when `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME=true`
 
-Every resume path is an authorization decision: the provider must classify the sender as authenticated and the normalized sender address must exactly match the mapping's non-null participant. AgentMail authentication comes only from its signed event type or API `received`/`unauthenticated` classification. Raw `Authentication-Results` headers are untrusted and ignored. Failed, missing, or unknown authentication never invokes Hermes, sends a reply, or changes a mapping.
+Every inbound path is an authorization decision: the provider must classify the sender as authenticated, the exact normalized sender must be allowlisted, and a resumed mapping must match its non-null participant. AgentMail authentication comes only from its signed event type or API `received`/`unauthenticated` classification. Raw `Authentication-Results` headers are untrusted and ignored. Failed, missing, unknown, or unallowlisted senders never invoke Hermes, send a reply, or change a mapping.
 
 Every authorized match links the inbound and outbound message IDs to the mapping, improving subsequent reply matching. Provider thread IDs are unique per authenticated participant; conflicting attempts cannot overwrite an existing Hermes session.
 
@@ -205,6 +226,7 @@ Additional safeguards:
 - API keys and webhook secrets never logged
 - Processed message IDs plus in-process webhook coalescing prevent duplicate Hermes invocations
 - AgentMail bearer credentials are sent only to a validated HTTPS origin; redirects are rejected
+- Composio requests use one fixed HTTPS origin and fixed AgentMail `/v0` paths; upstream bodies and headers are never logged
 - Raw payloads default off and, when enabled, are stored only in SQLite and logically purged after the configured retention period
 
 Raw emails can contain sensitive data. Leave `EMAIL_BRIDGE_STORE_RAW=false` unless debugging requires them. The bridge creates a new state directory with mode `0700` and a new database with mode `0600` on POSIX systems, but existing directories, database copies, SQLite sidecars, and backups remain the operator's responsibility. Logical purge sets expired payloads to `NULL`; use your normal SQLite maintenance if physical page reclamation is required.
@@ -220,6 +242,48 @@ uv run python -m build
 ```
 
 Tests cover authentication and spoofing rejection, every mapping path, schema migration, marker rotation and expiry, raw retention, URL and redirect rejection, bounded webhook processing, normalization, dry-run behavior, the subprocess runner, and Svix verification.
+
+## Composio transport
+
+Set `EMAIL_BRIDGE_PROVIDER=composio-agentmail` to keep the AgentMail credential in
+Composio. The adapter calls only Composio's fixed v3.1 Proxy Execute endpoint and
+allows only the AgentMail message-list, message-get, and threaded-reply paths. It has
+no SDK dependency and does not require a Composio user ID or auth-config ID.
+
+Create a dedicated Composio project API key with only the **Proxy Execute** permission.
+Do not reuse Jarvis's broad automation key. The connected account and inbox must already
+exist and be active. Polling defaults to 30 seconds; transient network, HTTP 429, and 5xx
+failures use capped exponential backoff and safe `Retry-After` values. Authentication,
+configuration, and malformed-response failures stop rather than retry forever.
+
+## macOS LaunchAgent
+
+Generic templates live in `deploy/macos`. Copy them into a neutral service installation;
+do not run the service from the repository or Hermes state directory.
+
+1. Create separate workspace, configuration, state, and log directories with mode `0700`.
+2. Copy `run-email-bridge.sh` into the install directory and keep it executable.
+3. Put only required configuration in the environment file, set
+   `EMAIL_BRIDGE_VENV` to the Python 3.11+ environment, then set the file to mode `0600`.
+4. Replace every `__PLACEHOLDER__` in the plist, including a unique label, absolute paths,
+   safe `HOME`, and `HERMES_HOME`. Keep the plist free of secrets.
+5. Run `init-db --start-now`, add initial exact addresses with `allowlist add`, then load
+   the plist as a user LaunchAgent.
+
+The template uses umask `077`, a neutral working directory, stderr-only logging,
+`RunAtLoad`, restart only after unsuccessful exit, and a 30-second launchd throttle.
+Protect the database, SQLite sidecars, environment, workspace, and logs from other users.
+A user LaunchAgent starts only after login; with FileVault enabled, it cannot run before
+the user unlocks and logs into the Mac after reboot.
+
+## Release notes
+
+### 0.3.0
+
+- Added Composio Proxy Execute transport for AgentMail without new runtime dependencies.
+- Added authenticated exact-address allowlisting and automatic trusted-sent enrollment.
+- Added no-history cursor seeding, transient polling backoff, and macOS LaunchAgent templates.
+- Consolidated runtime version reporting on package metadata from `pyproject.toml`.
 
 ## AgentMail notes and current limits
 

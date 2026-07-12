@@ -5,7 +5,15 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from ..models import NormalizedEmail, PollResult
+from ..models import NormalizedEmail, PollResult, SentPollResult
+
+
+class RetryableProviderError(RuntimeError):
+    """A transient provider failure that continuous polling may retry."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class EmailProvider(ABC):
@@ -20,6 +28,10 @@ class EmailProvider(ABC):
     @abstractmethod
     def poll(self, cursor: str | None) -> PollResult:
         """Return inbound messages after a provider-specific cursor."""
+
+    @abstractmethod
+    def poll_sent(self, cursor: str | None) -> SentPollResult:
+        """Return trusted outbound metadata after a separate provider cursor."""
 
     @abstractmethod
     def get(self, message_id: str) -> NormalizedEmail:

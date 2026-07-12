@@ -6,7 +6,7 @@ import argparse
 import json
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 
 from . import __version__
@@ -14,7 +14,8 @@ from .config import ConfigError, Settings
 from .log import configure_logging
 from .models import ConversationMapping
 from .providers.agentmail import AgentMailProvider
-from .providers.base import EmailProvider
+from .providers.base import EmailProvider, RetryableProviderError
+from .providers.composio_agentmail import ComposioAgentMailProvider
 from .runner import SubprocessHermesRunner
 from .service import BridgeService
 from .store import MappingStore
@@ -46,18 +47,39 @@ def _parser() -> argparse.ArgumentParser:
     rotate.add_argument("--ttl-days", type=int, default=90)
     purge = commands.add_parser("purge-raw", help="Purge retained raw email payloads")
     purge.add_argument("--older-than-days", type=int)
-    commands.add_parser("init-db", help="Initialize the SQLite mapping store")
+    init_db = commands.add_parser("init-db", help="Initialize the SQLite mapping store")
+    init_db.add_argument(
+        "--start-now",
+        action="store_true",
+        help="Seed missing inbound and sent cursors without importing history",
+    )
+    allowlist = commands.add_parser("allowlist", help="Manage exact sender authorization")
+    allowlist_commands = allowlist.add_subparsers(dest="allowlist_command", required=True)
+    allowlist_commands.add_parser("list", help="List authorized sender addresses")
+    allowlist_add = allowlist_commands.add_parser("add", help="Authorize one exact address")
+    allowlist_add.add_argument("address")
+    allowlist_remove = allowlist_commands.add_parser("remove", help="Remove one exact address")
+    allowlist_remove.add_argument("address")
     return parser
 
 
 def _provider(settings: Settings) -> EmailProvider:
-    api_key, inbox_id = settings.require_agentmail()
-    return AgentMailProvider(
-        api_key=api_key,
-        inbox_id=inbox_id,
-        base_url=settings.agentmail_base_url,
-        allow_insecure_local_http=settings.agentmail_allow_insecure_local_http,
-    )
+    if settings.provider == "agentmail":
+        api_key, inbox_id = settings.require_agentmail()
+        return AgentMailProvider(
+            api_key=api_key,
+            inbox_id=inbox_id,
+            base_url=settings.agentmail_base_url,
+            allow_insecure_local_http=settings.agentmail_allow_insecure_local_http,
+        )
+    if settings.provider == "composio-agentmail":
+        api_key, connected_account_id, inbox_id = settings.require_composio_agentmail()
+        return ComposioAgentMailProvider(
+            api_key=api_key,
+            connected_account_id=connected_account_id,
+            inbox_id=inbox_id,
+        )
+    raise ConfigError(f"unsupported provider: {settings.provider}")
 
 
 def _service(
@@ -89,6 +111,37 @@ def _masked_mapping(mapping: ConversationMapping) -> dict[str, object]:
     return value
 
 
+def _run_poll_loop(
+    service: BridgeService,
+    *,
+    continuous: bool,
+    interval: float,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    failures = 0
+    while True:
+        try:
+            summary = service.poll_once()
+        except RetryableProviderError as exc:
+            if not continuous:
+                raise
+            failures += 1
+            delay = min(300.0, interval * (2 ** min(failures - 1, 8)))
+            if exc.retry_after is not None:
+                delay = max(delay, exc.retry_after)
+            logger.warning(
+                "provider retry scheduled",
+                extra={"event": "provider_retry", "delay": delay},
+            )
+            sleep(delay)
+            continue
+        failures = 0
+        print(json.dumps(asdict(summary)))
+        if not continuous:
+            return 1 if summary.failed else 0
+        sleep(interval)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -96,7 +149,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         configure_logging(settings.log_level)
         with MappingStore(settings.db_path) as store:
             if args.command == "init-db":
-                print(settings.db_path)
+                seeded = (
+                    store.seed_poll_cursors(settings.logical_provider()) if args.start_now else ()
+                )
+                print(json.dumps({"db_path": str(settings.db_path), "seeded": seeded}))
+                return 0
+            if args.command == "allowlist":
+                provider_name = settings.logical_provider()
+                if args.allowlist_command == "add":
+                    entry = store.add_allowed_address(provider_name, args.address)
+                    print(json.dumps(asdict(entry), default=str))
+                    return 0
+                if args.allowlist_command == "remove":
+                    print(
+                        json.dumps(
+                            {"removed": store.remove_allowed_address(provider_name, args.address)}
+                        )
+                    )
+                    return 0
+                print(
+                    json.dumps(
+                        [asdict(entry) for entry in store.list_allowed_addresses(provider_name)],
+                        default=str,
+                    )
+                )
                 return 0
             if args.command == "mappings":
                 if args.mappings_command == "rotate":
@@ -156,12 +232,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             interval = settings.poll_interval if args.interval is None else args.interval
             if interval <= 0:
                 raise ConfigError("poll interval must be positive")
-            while True:
-                summary = service.poll_once()
-                print(json.dumps(asdict(summary)))
-                if not args.continuous:
-                    return 1 if summary.failed else 0
-                time.sleep(interval)
+            return _run_poll_loop(
+                service,
+                continuous=args.continuous,
+                interval=interval,
+            )
     except KeyboardInterrupt:
         logger.info("bridge stopped", extra={"event": "bridge_stopped"})
         return 130

@@ -9,6 +9,7 @@ from hermes_email_bridge.models import (
     NormalizedEmail,
     ResolutionStatus,
     SenderAuthentication,
+    SentEmail,
 )
 from hermes_email_bridge.store import MappingStore
 
@@ -227,7 +228,7 @@ def test_v0_database_migrates_without_data_loss(tmp_path: Path) -> None:
             store.resolve(_message(thread_id="legacy-thread")).status is ResolutionStatus.AUTHORIZED
         )
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
 
 
 def test_rejects_newer_database_version(tmp_path: Path) -> None:
@@ -265,3 +266,76 @@ def test_ongoing_raw_retention_preserves_processed_record_and_secure_new_file(
     if os.name == "posix":
         assert path.stat().st_mode & 0o777 == 0o600
         assert path.parent.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "not-an-address",
+        "@example.test",
+        "person@",
+        "*@example.test",
+        "example.test",
+        "Person <person@example.test>",
+        "person@example.test\nBcc: attacker@example.test",
+    ],
+)
+def test_allowlist_rejects_non_exact_or_unsafe_addresses(address: str) -> None:
+    with MappingStore(":memory:") as store, pytest.raises(ValueError, match="exact"):
+        store.add_allowed_address("agentmail", address)
+
+
+def test_allowlist_is_exact_provider_scoped_and_manually_manageable() -> None:
+    with MappingStore(":memory:") as store:
+        added = store.add_allowed_address("agentmail", "Person@Example.Test")
+        assert added.address == "person@example.test"
+        assert added.source == "manual"
+        assert store.is_allowed("agentmail", "PERSON@example.test")
+        assert not store.is_allowed("fake", "person@example.test")
+        assert [entry.address for entry in store.list_allowed_addresses("agentmail")] == [
+            "person@example.test"
+        ]
+        assert store.remove_allowed_address("agentmail", "person@example.test")
+        assert not store.remove_allowed_address("agentmail", "person@example.test")
+        assert not store.is_allowed("agentmail", "person@example.test")
+
+
+def test_sent_enrollment_is_idempotent_and_removal_requires_a_new_message() -> None:
+    first = SentEmail(
+        provider="agentmail",
+        provider_message_id="sent-1",
+        recipients=("to@example.test", "cc@example.test", "bcc@example.test"),
+        sent_at=datetime(2026, 7, 11, 12, tzinfo=UTC),
+    )
+    second = SentEmail(
+        provider="agentmail",
+        provider_message_id="sent-2",
+        recipients=("to@example.test",),
+        sent_at=datetime(2026, 7, 11, 13, tzinfo=UTC),
+    )
+    with MappingStore(":memory:") as store:
+        assert store.enroll_sent_message(first) == 3
+        assert store.enroll_sent_message(first) == 0
+        assert store.remove_allowed_address("agentmail", "to@example.test")
+        assert store.enroll_sent_message(first) == 0
+        assert not store.is_allowed("agentmail", "to@example.test")
+        assert store.enroll_sent_message(second) == 1
+        assert store.is_allowed("agentmail", "to@example.test")
+        entry = next(
+            item
+            for item in store.list_allowed_addresses("agentmail")
+            if item.address == "to@example.test"
+        )
+        assert entry.source_message_id == "sent-2"
+
+
+def test_start_now_atomically_seeds_missing_cursors_without_overwrite() -> None:
+    start = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
+    with MappingStore(":memory:") as store:
+        store.set_cursor("agentmail", "2026-07-10T00:00:00Z")
+        assert store.seed_poll_cursors("agentmail", now=start) == ("agentmail:sent",)
+        assert store.get_cursor("agentmail") == "2026-07-10T00:00:00Z"
+        assert store.get_poll_start("agentmail") is None
+        assert store.get_cursor("agentmail:sent") == "2026-07-11T12:00:00Z"
+        assert store.get_poll_start("agentmail:sent") == start
+        assert store.seed_poll_cursors("agentmail", now=start + timedelta(days=1)) == ()

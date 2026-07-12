@@ -7,21 +7,23 @@ import os
 import secrets
 import sqlite3
 import threading
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .mapping import extract_bridge_marker, normalize_subject
+from .mapping import extract_bridge_marker, normalize_email_address, normalize_subject
 from .models import (
+    AllowlistEntry,
     ConversationMapping,
     MappingResolution,
     NormalizedEmail,
     ResolutionStatus,
     SenderAuthentication,
+    SentEmail,
     utc_now,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _LEGACY_SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS mappings (
@@ -143,6 +145,37 @@ class MappingStore:
                     CREATE UNIQUE INDEX IF NOT EXISTS mappings_provider_thread_participant
                     ON mappings(provider, provider_thread_id, participant_email)
                     WHERE provider_thread_id IS NOT NULL AND participant_email IS NOT NULL
+                    """
+                )
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS email_allowlist (
+                        provider TEXT NOT NULL,
+                        address TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        source_message_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (provider, address)
+                    )
+                    """
+                )
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS observed_sent_messages (
+                        provider TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        PRIMARY KEY (provider, message_id)
+                    )
+                    """
+                )
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS poll_starts (
+                        cursor_key TEXT PRIMARY KEY,
+                        started_at TEXT NOT NULL
+                    )
                     """
                 )
                 self._connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
@@ -374,6 +407,141 @@ class MappingStore:
             ).fetchall()
             return [self._row_to_mapping(row) for row in rows]
 
+    def add_allowed_address(
+        self,
+        provider: str,
+        address: str,
+        *,
+        source: str = "manual",
+        source_message_id: str | None = None,
+    ) -> AllowlistEntry:
+        normalized = normalize_email_address(address)
+        now = utc_now().isoformat()
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO email_allowlist(
+                    provider, address, source, source_message_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, address) DO UPDATE SET
+                    source = excluded.source,
+                    source_message_id = excluded.source_message_id,
+                    updated_at = excluded.updated_at
+                """,
+                (provider, normalized, source, source_message_id, now, now),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM email_allowlist WHERE provider = ? AND address = ?",
+                (provider, normalized),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("allowlist insert failed")
+            return self._row_to_allowlist(row)
+
+    def remove_allowed_address(self, provider: str, address: str) -> bool:
+        normalized = normalize_email_address(address)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "DELETE FROM email_allowlist WHERE provider = ? AND address = ?",
+                (provider, normalized),
+            )
+            return cursor.rowcount == 1
+
+    def is_allowed(self, provider: str, address: str) -> bool:
+        try:
+            normalized = normalize_email_address(address)
+        except ValueError:
+            return False
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT 1 FROM email_allowlist WHERE provider = ? AND address = ?",
+                (provider, normalized),
+            ).fetchone()
+            return row is not None
+
+    def list_allowed_addresses(self, provider: str) -> list[AllowlistEntry]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM email_allowlist WHERE provider = ? ORDER BY address",
+                (provider,),
+            ).fetchall()
+            return [self._row_to_allowlist(row) for row in rows]
+
+    def enroll_sent_message(self, message: SentEmail) -> int:
+        """Authorize recipients once per trusted outbound message."""
+
+        now = utc_now().isoformat()
+        with self._lock, self._connection:
+            inserted = self._connection.execute(
+                """
+                INSERT INTO observed_sent_messages(provider, message_id, observed_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(provider, message_id) DO NOTHING
+                """,
+                (message.provider, message.provider_message_id, now),
+            )
+            if inserted.rowcount != 1:
+                return 0
+            count = 0
+            for address in message.recipients:
+                try:
+                    normalized = normalize_email_address(address)
+                except ValueError:
+                    continue
+                self._connection.execute(
+                    """
+                    INSERT INTO email_allowlist(
+                        provider, address, source, source_message_id, created_at, updated_at
+                    ) VALUES (?, ?, 'sent', ?, ?, ?)
+                    ON CONFLICT(provider, address) DO UPDATE SET
+                        source = 'sent',
+                        source_message_id = excluded.source_message_id,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        message.provider,
+                        normalized,
+                        message.provider_message_id,
+                        now,
+                        now,
+                    ),
+                )
+                count += 1
+            return count
+
+    def seed_poll_cursors(self, provider: str, *, now: datetime | None = None) -> tuple[str, ...]:
+        """Atomically seed missing inbound/sent cursors and their no-history floors."""
+
+        timestamp = (now or utc_now()).astimezone(UTC).isoformat().replace("+00:00", "Z")
+        seeded: list[str] = []
+        with self._lock, self._connection:
+            for cursor_key in (provider, f"{provider}:sent"):
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO cursors(provider, cursor, updated_at) VALUES (?, ?, ?)
+                    ON CONFLICT(provider) DO NOTHING
+                    """,
+                    (cursor_key, timestamp, timestamp),
+                )
+                if cursor.rowcount == 1:
+                    self._connection.execute(
+                        "INSERT INTO poll_starts(cursor_key, started_at) VALUES (?, ?)",
+                        (cursor_key, timestamp),
+                    )
+                    seeded.append(cursor_key)
+        return tuple(seeded)
+
+    def get_poll_start(self, cursor_key: str) -> datetime | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT started_at FROM poll_starts WHERE cursor_key = ?", (cursor_key,)
+            ).fetchone()
+            return (
+                datetime.fromisoformat(str(row["started_at"]).replace("Z", "+00:00"))
+                if row
+                else None
+            )
+
     def get_cursor(self, provider: str) -> str | None:
         with self._lock:
             row = self._connection.execute(
@@ -473,6 +641,17 @@ class MappingStore:
             bridge_marker_expires_at=_optional_datetime(values.get("bridge_marker_expires_at")),
             created_at=datetime.fromisoformat(str(values["created_at"])),
             updated_at=datetime.fromisoformat(str(values["updated_at"])),
+        )
+
+    @staticmethod
+    def _row_to_allowlist(row: sqlite3.Row) -> AllowlistEntry:
+        return AllowlistEntry(
+            provider=str(row["provider"]),
+            address=str(row["address"]),
+            source=str(row["source"]),
+            source_message_id=_optional_string(row["source_message_id"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
 
 

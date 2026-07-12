@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from .models import NormalizedEmail, PollSummary, ResolutionStatus
+from .models import NormalizedEmail, PollSummary, ResolutionStatus, SenderAuthentication
 from .providers.base import EmailProvider
 from .runner import HermesRunner
 from .store import MappingStore
@@ -36,18 +36,46 @@ class BridgeService:
         self.store.purge_raw(raw_retention_days)
 
     def handle(self, message: NormalizedEmail) -> str:
+        if self.store.is_processed(message.provider, message.provider_message_id):
+            logger.info(
+                "message skipped",
+                extra={
+                    "event": "message_skipped",
+                    "reason": "already_processed",
+                    "provider": message.provider,
+                },
+            )
+            return "skipped"
+
+        denial_reason = None
+        if message.sender_authentication is not SenderAuthentication.AUTHENTICATED:
+            denial_reason = "sender_authentication"
+        elif not self.store.is_allowed(message.provider, message.from_email):
+            denial_reason = "sender_allowlist"
+        if denial_reason:
+            logger.warning(
+                "message denied",
+                extra={
+                    "event": "message_denied",
+                    "reason": denial_reason,
+                    "sender_authentication": message.sender_authentication,
+                    "provider": message.provider,
+                },
+            )
+            self.store.mark_processed(
+                message,
+                "authorization_denied",
+                store_raw=False,
+                raw_retention_days=self.raw_retention_days,
+            )
+            return "skipped"
+
         context: dict[str, object] = {
             "provider": message.provider,
             "provider_message_id": message.provider_message_id,
             "thread_id": message.thread_id,
         }
         logger.info("message received", extra={"event": "message_received", **context})
-        if self.store.is_processed(message.provider, message.provider_message_id):
-            logger.info(
-                "message skipped",
-                extra={"event": "message_skipped", "reason": "already_processed", **context},
-            )
-            return "skipped"
 
         logger.info(
             "message parsed",
@@ -154,20 +182,33 @@ class BridgeService:
         )
 
     def poll_once(self) -> PollSummary:
+        sent_cursor_key = f"{self.provider.name}:sent"
+        sent_result = self.provider.poll_sent(self.store.get_cursor(sent_cursor_key))
+        sent_floor = self.store.get_poll_start(sent_cursor_key)
+        for sent_message in sent_result.messages:
+            if sent_floor is None or sent_message.sent_at > sent_floor:
+                self.store.enroll_sent_message(sent_message)
+        if sent_result.cursor:
+            self.store.set_cursor(sent_cursor_key, sent_result.cursor)
+
         cursor = self.store.get_cursor(self.provider.name)
         result = self.provider.poll(cursor)
+        inbound_floor = self.store.get_poll_start(self.provider.name)
         processed = skipped = failed = 0
-        for message in result.messages:
+        for inbound_message in result.messages:
+            if inbound_floor is not None and inbound_message.received_at <= inbound_floor:
+                skipped += 1
+                continue
             try:
-                outcome = self.handle(message)
+                outcome = self.handle(inbound_message)
             except Exception:
                 failed += 1
                 logger.exception(
                     "message processing failed",
                     extra={
                         "event": "message_error",
-                        "provider": message.provider,
-                        "provider_message_id": message.provider_message_id,
+                        "provider": inbound_message.provider,
+                        "provider_message_id": inbound_message.provider_message_id,
                     },
                 )
             else:

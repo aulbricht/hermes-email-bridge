@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LAUNCHD_LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__INSTALL_DIR__/run-email-bridge.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>EMAIL_BRIDGE_ENV_FILE</key>
+        <string>__ENV_FILE__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>HERMES_HOME</key>
+        <string>__HERMES_HOME__</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>__WORKSPACE__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/bridge.stderr.log</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

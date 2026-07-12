@@ -5,15 +5,20 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
-from ..models import NormalizedEmail, PollResult
+from ..models import NormalizedEmail, PollResult, SentEmail, SentPollResult
 from .base import EmailProvider
 
 
 class FakeProvider(EmailProvider):
     name = "fake"
 
-    def __init__(self, messages: Iterable[NormalizedEmail] = ()) -> None:
+    def __init__(
+        self,
+        messages: Iterable[NormalizedEmail] = (),
+        sent_messages: Iterable[SentEmail] = (),
+    ) -> None:
         self.messages = {message.provider_message_id: message for message in messages}
+        self.sent_messages = tuple(sent_messages)
         self.replies: list[tuple[str, str]] = []
 
     def poll(self, cursor: str | None) -> PollResult:
@@ -23,6 +28,10 @@ class FakeProvider(EmailProvider):
 
     def get(self, message_id: str) -> NormalizedEmail:
         return self.messages[message_id]
+
+    def poll_sent(self, cursor: str | None) -> SentPollResult:
+        next_cursor = self.sent_messages[-1].sent_at.isoformat() if self.sent_messages else cursor
+        return SentPollResult(self.sent_messages, next_cursor)
 
     def reply(self, message: NormalizedEmail, text: str) -> str:
         self.replies.append((message.provider_message_id, text))

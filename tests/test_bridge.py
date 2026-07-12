@@ -1,13 +1,14 @@
 import shlex
 import sys
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from hermes_email_bridge.models import (
     ConversationMapping,
     HermesResult,
     NormalizedEmail,
     SenderAuthentication,
+    SentEmail,
 )
 from hermes_email_bridge.providers.fake import FakeProvider
 from hermes_email_bridge.runner import HermesRunner, SubprocessHermesRunner
@@ -47,6 +48,7 @@ def test_dry_run_never_sends_reply() -> None:
     message = _message()
     provider = FakeProvider([message])
     with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", "person@example.com")
         service = BridgeService(
             provider=provider,
             store=store,
@@ -71,6 +73,7 @@ def test_unauthenticated_message_never_invokes_hermes_or_changes_mapping() -> No
     provider = FakeProvider([message])
     runner = StubRunner()
     with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", "person@example.com")
         original = store.add_mapping(
             provider="fake",
             hermes_session="existing-session",
@@ -83,6 +86,95 @@ def test_unauthenticated_message_never_invokes_hermes_or_changes_mapping() -> No
         assert runner.calls == 0
         assert provider.replies == []
         assert store.list_mappings() == [original]
+
+
+def test_authenticated_unallowlisted_message_never_invokes_maps_or_replies() -> None:
+    message = _message()
+    provider = FakeProvider([message])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+            store_raw=True,
+        )
+        assert service.handle(message) == "skipped"
+        assert runner.calls == 0
+        assert store.list_mappings() == []
+        assert provider.replies == []
+        raw = store._connection.execute(
+            "SELECT raw_payload FROM processed_messages WHERE message_id = 'message-1'"
+        ).fetchone()
+        assert raw is not None and raw[0] is None
+
+
+def test_allowlisted_but_unauthenticated_message_still_fails_closed() -> None:
+    message = replace(_message(), sender_authentication=SenderAuthentication.UNAUTHENTICATED)
+    provider = FakeProvider([message])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+        )
+        assert service.handle(message) == "skipped"
+        assert runner.calls == 0
+        assert provider.replies == []
+
+
+def test_trusted_sent_enrollment_precedes_inbound_and_replies_exactly_once() -> None:
+    message = _message()
+    sent = SentEmail(
+        provider="fake",
+        provider_message_id="sent-1",
+        recipients=(message.from_email,),
+        sent_at=message.received_at - timedelta(minutes=1),
+    )
+    provider = FakeProvider([message], [sent])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+        )
+        summary = service.poll_once()
+        assert summary.processed == 1
+        assert runner.calls == 1
+        assert provider.replies == [("message-1", "Hermes reply")]
+        assert store.is_allowed("fake", message.from_email)
+        assert service.poll_once().skipped == 1
+        assert runner.calls == 1
+        assert len(provider.replies) == 1
+
+
+def test_start_now_ignores_historical_sent_and_inbound_messages() -> None:
+    start = datetime(2026, 7, 9, 1, tzinfo=UTC)
+    inbound = _message()
+    sent = SentEmail(
+        provider="fake",
+        provider_message_id="sent-before-start",
+        recipients=(inbound.from_email,),
+        sent_at=inbound.received_at,
+    )
+    provider = FakeProvider([inbound], [sent])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        store.seed_poll_cursors("fake", now=start)
+        service = BridgeService(provider=provider, store=store, runner=runner)
+        summary = service.poll_once()
+        assert summary.skipped == 1
+        assert runner.calls == 0
+        assert not store.is_allowed("fake", inbound.from_email)
 
 
 def test_fake_provider_contract() -> None:

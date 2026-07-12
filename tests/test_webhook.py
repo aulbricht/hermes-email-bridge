@@ -104,6 +104,7 @@ def test_webhook_dispatcher_bounds_queue_and_concurrency() -> None:
     provider = FakeProvider(messages)
     runner = BlockingRunner()
     with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", "person@example.com")
         service = BridgeService(provider=provider, store=store, runner=runner)
         dispatcher = WebhookDispatcher(service, provider, queue_size=1)
         try:
@@ -126,6 +127,7 @@ def test_same_thread_messages_are_serialized_without_loss() -> None:
     provider = FakeProvider(messages)
     runner = BlockingRunner()
     with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", "person@example.com")
         service = BridgeService(provider=provider, store=store, runner=runner)
         dispatcher = WebhookDispatcher(service, provider, queue_size=1)
         try:
@@ -148,6 +150,7 @@ def test_webhook_dispatcher_coalesces_in_flight_duplicate() -> None:
     provider = FakeProvider([message])
     runner = BlockingRunner()
     with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", "person@example.com")
         service = BridgeService(provider=provider, store=store, runner=runner)
         dispatcher = WebhookDispatcher(service, provider, queue_size=1)
         try:
@@ -181,6 +184,7 @@ def test_saturated_webhook_server_returns_503(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(webhook_module, "ThreadingHTTPServer", ThreeRequestServer)
 
     with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", "person@example.com")
         service = BridgeService(provider=provider, store=store, runner=runner)
 
         def run_server() -> None:

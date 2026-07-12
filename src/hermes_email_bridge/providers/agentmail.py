@@ -13,8 +13,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .. import __version__
 from ..config import validate_agentmail_base_url
-from ..models import Attachment, NormalizedEmail, PollResult, SenderAuthentication
+from ..mapping import normalize_email_address
+from ..models import (
+    Attachment,
+    NormalizedEmail,
+    PollResult,
+    SenderAuthentication,
+    SentEmail,
+    SentPollResult,
+)
 from .base import EmailProvider
 
 
@@ -85,6 +94,32 @@ def normalize_agentmail_message(
         attachments=attachments,
         raw_payload=dict(payload),
         sender_authentication=sender_authentication,
+    )
+
+
+def normalize_agentmail_sent_message(payload: dict[str, Any]) -> SentEmail:
+    """Convert a trusted AgentMail sent-message payload to enrollment metadata."""
+
+    message_id = str(payload.get("message_id") or "")
+    if not message_id:
+        raise AgentMailError("AgentMail payload is missing message_id")
+    recipients: list[str] = []
+    for field in ("to", "cc", "bcc"):
+        raw_values = payload.get(field) or []
+        values = raw_values if isinstance(raw_values, list) else [raw_values]
+        for raw_value in values:
+            _name, address = parseaddr(str(raw_value))
+            try:
+                normalized = normalize_email_address(address or str(raw_value))
+            except ValueError:
+                continue
+            if normalized not in recipients:
+                recipients.append(normalized)
+    return SentEmail(
+        provider="agentmail",
+        provider_message_id=message_id,
+        recipients=tuple(recipients),
+        sent_at=_parse_datetime(payload.get("timestamp") or payload.get("created_at")),
     )
 
 
@@ -167,7 +202,7 @@ class AgentMailProvider(EmailProvider):
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "hermes-email-bridge/0.2.0",
+                "User-Agent": f"hermes-email-bridge/{__version__}",
             },
         )
         try:
@@ -184,9 +219,35 @@ class AgentMailProvider(EmailProvider):
         return decoded
 
     def poll(self, cursor: str | None) -> PollResult:
+        messages, next_cursor = self._poll_messages(cursor, label="received")
+        return PollResult(tuple(messages), next_cursor)
+
+    def poll_sent(self, cursor: str | None) -> SentPollResult:
+        payloads, next_cursor = self._poll_payloads(cursor, label="sent")
+        messages = tuple(normalize_agentmail_sent_message(payload) for payload in payloads)
+        return SentPollResult(messages, next_cursor)
+
+    def _poll_messages(
+        self, cursor: str | None, *, label: str
+    ) -> tuple[list[NormalizedEmail], str | None]:
+        payloads, next_cursor = self._poll_payloads(cursor, label=label)
+        messages = [
+            normalize_agentmail_message(
+                payload,
+                sender_authentication=_classified_authentication(
+                    payload, SenderAuthentication.AUTHENTICATED
+                ),
+            )
+            for payload in payloads
+        ]
+        return messages, next_cursor
+
+    def _poll_payloads(
+        self, cursor: str | None, *, label: str
+    ) -> tuple[list[dict[str, Any]], str | None]:
         params: dict[str, Any] = {
             "ascending": "true",
-            "labels": ["received"],
+            "labels": [label],
             "limit": 100,
         }
         if cursor:
@@ -194,7 +255,7 @@ class AgentMailProvider(EmailProvider):
             after = _parse_datetime(cursor) - timedelta(seconds=1)
             params["after"] = after.isoformat().replace("+00:00", "Z")
 
-        messages: list[NormalizedEmail] = []
+        messages: list[dict[str, Any]] = []
         seen: set[str] = set()
         latest = _parse_datetime(cursor) if cursor else None
         while True:
@@ -209,23 +270,36 @@ class AgentMailProvider(EmailProvider):
                 labels = _labels(summary)
                 if not message_id or message_id in seen:
                     continue
-                if "received" not in labels or "unauthenticated" in labels:
+                if label not in labels:
                     continue
                 seen.add(message_id)
-                message = self._get(
-                    message_id,
-                    assumed_authentication=SenderAuthentication.AUTHENTICATED,
+                payload = self._request(
+                    "GET",
+                    f"{self._inbox_path}/messages/{quote(message_id, safe='')}",
                 )
-                messages.append(message)
-                if latest is None or message.received_at > latest:
-                    latest = message.received_at
+                detail_labels = _labels(payload)
+                if (
+                    detail_labels
+                    and label not in detail_labels
+                    and not (label == "received" and "unauthenticated" in detail_labels)
+                ):
+                    continue
+                if label == "received" and "unauthenticated" in labels:
+                    payload = dict(payload)
+                    payload["labels"] = list(detail_labels | {"unauthenticated"})
+                message_time = _parse_datetime(
+                    payload.get("timestamp") or payload.get("created_at")
+                )
+                messages.append(payload)
+                if latest is None or message_time > latest:
+                    latest = message_time
             page_token = response.get("next_page_token")
             if not page_token:
                 break
             params["page_token"] = str(page_token)
 
         next_cursor = latest.isoformat().replace("+00:00", "Z") if latest else cursor
-        return PollResult(tuple(messages), next_cursor)
+        return messages, next_cursor
 
     def get(self, message_id: str) -> NormalizedEmail:
         return self._get(message_id)
