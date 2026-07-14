@@ -373,6 +373,64 @@ dsmemberutil checkmembership -U _hermesbuild -G staff | grep -q 'not a member'
 sudo -n -u _hermesbuild /usr/bin/test ! -r /var/db/hermes-email-agent
 ```
 
+### v0.3 to v0.4 fail-closed migration
+
+The v0.4 runtime installer intentionally accepts only an absent runtime or an already attested
+v0.4 runtime. It does not recognize or execute a v0.3 tree. A v0.3 installation therefore needs
+this one-time fail-closed handoff. The order is security-sensitive: keep the LaunchAgent unloaded
+and stop every manual poller before starting. Do **not** install the v0.4 wrapper or boundary below
+before quarantining v0.3; that wrapper points at an adapter the legacy runtime does not contain.
+Never run or restore the old email path after beginning this sequence. Follow this numbered
+procedure only for an existing v0.3 runtime; a fresh v0.4 install skips directly to the wrapper
+installation below.
+
+1. Unload the LaunchAgent and stop any manually started `poll --continuous` process. Confirm that
+   no bridge or email-triggered Hermes process remains. Keep the service unloaded through every
+   remaining step.
+2. From the reviewed v0.4 checkout, run the fixed, no-argument migration helper directly. It uses
+   macOS system Python 3.9, validates only fixed root-owned parent/runtime metadata and ACL state,
+   and atomically renames `runtime` to a unique `.runtime-v0.3-quarantine.<24-hex>` sibling. It
+   never imports, executes, traverses, deletes, or automatically restores legacy Hermes files:
+
+   ```bash
+   sudo /usr/bin/python3 deploy/macos/quarantine-hermes-email-runtime-v0_3.py
+   ```
+
+   Save its canonical JSON output for the change record. After success there is deliberately no
+   active `runtime`, so every bridge invocation fails closed. The helper refuses alternate paths,
+   arguments, nonroot use, unsafe ownership/modes/ACLs/symlinks, collisions, and any existing
+   `.runtime-*` transaction or quarantine sibling.
+3. Install the new root wrapper, boundary helper, and sudoers policy with
+   `install-hermes-email-agent.py` as documented below.
+4. Prepare the pinned source and `uv`, run `install-hermes-email-runtime.py --check`, then run the
+   fresh v0.4 runtime installer, all as documented below. With no active runtime this is its
+   supported first-install path; it must not use or replace the quarantined v0.3 tree.
+5. Run the fixed offline `verify-hermes-email-agent.py` command below.
+6. From this reviewed checkout, run these three macOS gates as root with an absolute Python 3.11+
+   environment containing the development dependencies:
+
+   ```bash
+   sudo -H /ABSOLUTE/PYTHON-3.11 -m pytest -q \
+     tests/test_isolation.py::test_distinct_bridge_uid_cannot_read_sudoers_but_exact_helper_succeeds_and_tamper_fails
+   sudo -H /ABSOLUTE/PYTHON-3.11 -m pytest -q \
+     tests/test_isolation.py::test_inference_uid_cannot_read_bridge_env_database_sidecars_or_credentials
+   sudo -H /ABSOLUTE/PYTHON-3.11 -m pytest -q \
+     tests/test_runtime_attestation.py::test_distinct_uid_builder_traverses_non_listable_stage_only_into_private_child
+   ```
+
+7. Run the fixed verifier's `--live` new-session and resumed-session canary below from the bridge
+   account. Load the LaunchAgent only after the offline verifier, all three root account gates, and
+   both live protocol records succeed exactly.
+
+If any step fails, keep the service unloaded and the v0.3 tree quarantined. Correct the v0.4
+installation and retry v0.4; never restart v0.3. There is intentionally no rollback or cleanup
+helper. Retain the quarantine by default. If retention policy eventually requires removal, use a
+separately approved manual root change only after the exact fixed v0.4 active verifier succeeds
+again: compare the candidate with the exact path saved from the migration JSON, require the fixed
+`.runtime-v0.3-quarantine.` prefix followed by exactly 24 lowercase hexadecimal characters,
+confirm there are no unexpected `.runtime-*` siblings, and remove only that reviewed path. Do not
+use a wildcard, search result, or automatic recursive cleanup.
+
 Verify the wrapper interpreter first with `test -x /usr/bin/python3`. Install Hermes Agent
 **0.18.2** into the fixed, root-owned
 `/Library/Application Support/HermesEmailAgent/hermes-agent` tree and verify the pinned
@@ -584,6 +642,9 @@ root-owned wrapper is not sufficient and must not be used for live email executi
   added recurring macOS account, runtime, and adapter attestation.
 - Added incident replay, malformed-output, resumed-session rotation, secret-canary isolation,
   redacted-log, and exact delivered-body regression tests.
+- Added the explicit v0.3-to-v0.4 fail-closed migration: the stopped legacy runtime is atomically
+  quarantined without execution, never restored automatically, and retained while a fresh v0.4
+  runtime passes offline verification, three root account gates, and live new/resume canaries.
 
 ### 0.3.0
 

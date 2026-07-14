@@ -40,6 +40,18 @@ Issues = "https://github.com/aulbricht/hermes-email-bridge/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_email_bridge"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "/.env.example",
+  "/.github",
+  "/LICENSE",
+  "/README.md",
+  "/deploy",
+  "/src",
+  "/tests",
+  "/uv.lock",
+]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]

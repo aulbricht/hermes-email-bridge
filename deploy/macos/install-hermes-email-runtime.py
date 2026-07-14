@@ -54,6 +54,7 @@ PROVENANCE_FILE = ".hermes-email-agent-provenance.json"
 ATTESTATION_ASSETS = (
     "fetch-hermes-email-agent.py",
     "install-hermes-email-runtime.py",
+    "quarantine-hermes-email-runtime-v0_3.py",
     "verify-hermes-email-agent.py",
     "hermes-email-agent-wrapper.py",
     "hermes-email-agent-adapter.py",
