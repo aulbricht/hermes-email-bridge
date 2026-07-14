@@ -7,7 +7,7 @@ import logging
 from .mapping import normalize_email_address
 from .models import NormalizedEmail, PollSummary, ResolutionStatus, SenderAuthentication
 from .providers.base import EmailProvider
-from .runner import HermesRunner
+from .runner import HermesProtocolError, HermesRunner
 from .store import MappingStore
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,25 @@ class BridgeService:
             },
         )
 
-        result = self.runner.run(message, mapping)
+        try:
+            result = self.runner.run(message, mapping)
+        except HermesProtocolError as exc:
+            self.store.mark_processed(
+                message,
+                "hermes_protocol_error",
+                store_raw=False,
+                raw_retention_days=self.raw_retention_days,
+            )
+            logger.error(
+                "Hermes protocol rejected",
+                extra={
+                    "event": "hermes_protocol_error",
+                    "reason": exc.category,
+                    "byte_count": exc.byte_count,
+                    **context,
+                },
+            )
+            return "processed"
         logger.info(
             "Hermes invoked",
             extra={
@@ -128,9 +146,12 @@ class BridgeService:
             },
         )
 
+        if mapping and result.session_id != mapping.hermes_session:
+            mapping = self.store.update_mapping_session(mapping.id, result.session_id)
+
         if mapping:
             self.store.add_message_link(message.provider, message.provider_message_id, mapping.id)
-        elif result.session_id:
+        else:
             mapping = self.store.add_mapping(
                 provider=message.provider,
                 hermes_session=result.session_id,

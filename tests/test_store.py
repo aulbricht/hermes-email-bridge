@@ -162,6 +162,16 @@ def test_thread_conflict_never_overwrites_session(tmp_path: Path) -> None:
         assert other.id != original.id
 
 
+def test_mapping_session_rotation_is_atomic(tmp_path: Path) -> None:
+    with MappingStore(tmp_path / "bridge.db") as store:
+        original = store.add_mapping(provider="agentmail", hermes_session="session-parent")
+
+        rotated = store.update_mapping_session(original.id, "session-child")
+
+        assert rotated.hermes_session == "session-child"
+        assert store.list_mappings()[0].hermes_session == "session-child"
+
+
 def test_marker_rotation_and_expiry(tmp_path: Path) -> None:
     path = tmp_path / "bridge.db"
     with MappingStore(path) as store:

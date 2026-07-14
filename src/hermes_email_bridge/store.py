@@ -283,6 +283,24 @@ class MappingStore:
         with self._lock, self._connection:
             self._link_message(provider, message_id, mapping_id)
 
+    def update_mapping_session(
+        self, mapping_id: int, hermes_session: str
+    ) -> ConversationMapping:
+        """Atomically record a Hermes continuation-session rotation."""
+
+        if not hermes_session.strip():
+            raise ValueError("hermes_session cannot be empty")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE mappings SET hermes_session = ?, updated_at = ? WHERE id = ?
+                """,
+                (hermes_session, utc_now().isoformat(), mapping_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(mapping_id)
+            return self._get_mapping(mapping_id)
+
     def _link_message(self, provider: str, message_id: str, mapping_id: int) -> None:
         self._connection.execute(
             """

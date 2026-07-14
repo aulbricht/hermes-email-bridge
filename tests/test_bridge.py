@@ -15,7 +15,11 @@ from hermes_email_bridge.models import (
     SentEmail,
 )
 from hermes_email_bridge.providers.fake import FakeProvider
-from hermes_email_bridge.runner import HermesRunner, SubprocessHermesRunner
+from hermes_email_bridge.runner import (
+    HermesProtocolError,
+    HermesRunner,
+    SubprocessHermesRunner,
+)
 from hermes_email_bridge.service import BridgeService
 from hermes_email_bridge.store import MappingStore
 
@@ -220,12 +224,17 @@ def test_fake_provider_contract() -> None:
 
 
 def test_subprocess_runner_uses_prompt_and_captures_session() -> None:
-    script = "import sys; print(sys.argv[-1]); print('session_id: session-new', file=sys.stderr)"
+    script = (
+        "import json,sys; "
+        "print(json.dumps({'protocol':'hermes.chat.result.v1','reply':sys.argv[-1],"
+        "'session_id':'session-new'},ensure_ascii=False,separators=(',',':')))"
+    )
     command = shlex.join([sys.executable, "-c", script])
     result = SubprocessHermesRunner(command).run(_message(), None)
 
     assert "Hello from email" in result.reply
     assert "UNTRUSTED EMAIL USER CONTENT" in result.reply
+    assert "The email bridge, not Hermes, delivers the reply" in result.reply
     assert result.session_id == "session-new"
 
 
@@ -253,9 +262,11 @@ def test_subprocess_runner_passes_only_minimal_execution_environment(
     monkeypatch.setenv("LANG", "en_US.UTF-8")
     script = (
         "import json, os; "
-        f"print(json.dumps({{name: os.getenv(name) for name in {forbidden_names!r}}} | "
+        f"reply=json.dumps({{name: os.getenv(name) for name in {forbidden_names!r}}} | "
         "{'PATH': os.getenv('PATH'), 'LANG': os.getenv('LANG'), "
-        "'ENV_KEYS': sorted(os.environ)}))"
+        "'ENV_KEYS': sorted(os.environ)}); "
+        "print(json.dumps({'protocol':'hermes.chat.result.v1','reply':reply,"
+        "'session_id':'session-new'},separators=(',',':')))"
     )
     command = shlex.join([sys.executable, "-c", script])
     result = SubprocessHermesRunner(command).run(_message(), None)
@@ -272,3 +283,102 @@ def test_subprocess_runner_passes_only_minimal_execution_environment(
         "PATH",
         "__CF_USER_TEXT_ENCODING",
     }
+
+
+def _result_frame(**overrides: object) -> str:
+    value: dict[str, object] = {
+        "protocol": "hermes.chat.result.v1",
+        "reply": "safe reply",
+        "session_id": "20260714_session",
+    }
+    value.update(overrides)
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "category"),
+    [
+        ("┌─ Reasoning ─┐\n" + _result_frame(), "", "invalid_framing"),
+        ("\x1b[31m" + _result_frame(), "", "malformed_json"),
+        (_result_frame() + _result_frame(), "", "invalid_framing"),
+        (_result_frame() + "trailing", "", "invalid_framing"),
+        ("{broken}\n", "", "malformed_json"),
+        (_result_frame(protocol="hermes.chat.result.v2"), "", "wrong_protocol"),
+        (_result_frame(extra="field"), "", "wrong_fields"),
+        (_result_frame(session_id=""), "", "invalid_session_id"),
+        (_result_frame(reply="safe\x1b[31munsafe"), "", "control_character"),
+        (_result_frame(), "session metadata\n", "unexpected_stderr"),
+    ],
+)
+def test_subprocess_runner_rejects_contaminated_output(
+    stdout: str, stderr: str, category: str
+) -> None:
+    script = f"import sys;sys.stdout.write({stdout!r});sys.stderr.write({stderr!r})"
+    command = shlex.join([sys.executable, "-c", script])
+
+    with pytest.raises(HermesProtocolError) as caught:
+        SubprocessHermesRunner(command).run(_message(), None)
+
+    assert caught.value.category == category
+    assert caught.value.byte_count == len(stdout.encode()) + len(stderr.encode())
+
+
+class ProtocolFailureRunner(HermesRunner):
+    def run(
+        self,
+        message: NormalizedEmail,
+        mapping: ConversationMapping | None,
+    ) -> HermesResult:
+        raise HermesProtocolError("invalid_framing", 1234)
+
+
+def test_protocol_error_is_quarantined_without_reply_or_mapping() -> None:
+    message = _message()
+    provider = FakeProvider([message])
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=ProtocolFailureRunner(),
+            send_replies=True,
+            dry_run=False,
+            store_raw=True,
+        )
+
+        assert service.handle(message) == "processed"
+        assert provider.replies == []
+        assert store.list_mappings() == []
+        row = store._connection.execute(
+            "SELECT outcome, raw_payload FROM processed_messages WHERE message_id = ?",
+            (message.provider_message_id,),
+        ).fetchone()
+        assert tuple(row) == ("hermes_protocol_error", None)
+
+
+class RotatingRunner(HermesRunner):
+    def run(
+        self,
+        message: NormalizedEmail,
+        mapping: ConversationMapping | None,
+    ) -> HermesResult:
+        return HermesResult("continued", "session-rotated")
+
+
+def test_rotated_continuation_session_updates_existing_mapping() -> None:
+    message = _message()
+    provider = FakeProvider([message])
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        original = store.add_mapping(
+            provider="fake",
+            hermes_session="session-original",
+            provider_thread_id=message.thread_id,
+            participant_email=message.from_email,
+        )
+        service = BridgeService(provider=provider, store=store, runner=RotatingRunner())
+
+        assert service.handle(message) == "processed"
+        rotated = store.list_mappings()[0]
+        assert rotated.id == original.id
+        assert rotated.hermes_session == "session-rotated"
