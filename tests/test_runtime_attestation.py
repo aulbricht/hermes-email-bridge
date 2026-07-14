@@ -71,7 +71,7 @@ def _populate_generation(runtime: Any, paths: Any, label: str) -> None:
     active_python = paths.install_root / "runtime/venv/bin/python"
     hermes.write_text(f"#!{active_python}\nprint('stub')\n")
     hermes.chmod(0o755)
-    for name in ("hermes_cli", "run_agent", "model_tools", "toolsets"):
+    for name in ("cli", "hermes_cli", "run_agent", "model_tools", "toolsets"):
         (site / (name + ".py")).write_text("# reviewed " + label + "\n")
     paths.artifacts.mkdir(parents=True, exist_ok=True)
     wheel = paths.artifacts / "hermes_agent-0.18.2-py3-none-any.whl"
@@ -80,7 +80,9 @@ def _populate_generation(runtime: Any, paths: Any, label: str) -> None:
     direct.parent.mkdir()
     direct.write_text(json.dumps(runtime.expected_direct_url(paths, active=True), sort_keys=True))
     for name in runtime.ATTESTATION_ASSETS:
-        shutil.copyfile(ROOT / "deploy/macos" / name, paths.runtime_root / name)
+        destination = paths.runtime_root / name
+        shutil.copyfile(ROOT / "deploy/macos" / name, destination)
+        destination.chmod(0o755 if name.endswith(".py") else 0o644)
 
 
 def _fixture(
@@ -116,8 +118,9 @@ def _fixture(
                 "direct_url": json.loads(argv[code_index + 4]),
                 "origins": {
                     name: str(site / (name + ".py"))
-                    for name in ("hermes_cli", "run_agent", "model_tools", "toolsets")
+                    for name in ("cli", "hermes_cli", "run_agent", "model_tools", "toolsets")
                 },
+                "adapter_protocol": "hermes-email-bridge/1",
                 "tool_schemas": 0,
                 "version": runtime.VERSION,
             }
@@ -145,11 +148,7 @@ def test_attestation_verifies_actual_import_and_entrypoint_seams(
     )
     assert evidence["tool_schemas"] == 0
     assert any(call[:2] == [str(paths.venv / "bin/hermes"), "--version"] for call in calls)
-    parser_calls = [call for call in calls if call[-1:] == ["--help"]]
-    assert len(parser_calls) == 2
-    assert "--resume" not in parser_calls[0]
-    resume_index = parser_calls[1].index("--resume")
-    assert parser_calls[1][resume_index : resume_index + 2] == ["--resume", "probe_session"]
+    assert evidence["adapter_protocol"] == "hermes-email-bridge/1"
 
 
 def test_attestation_binds_build_identity_constraints_backend_and_boundary_hashes(
@@ -168,6 +167,8 @@ def test_attestation_binds_build_identity_constraints_backend_and_boundary_hashe
     assert attestation["build_require_hashes"] is True
     assert attestation["dependency_sync_no_build"] is True
     assert attestation["wrapper_sha256"] == runtime.WRAPPER_SHA256
+    assert attestation["adapter_sha256"] == runtime.ADAPTER_SHA256
+    assert attestation["adapter_protocol"] == "hermes-email-bridge/1"
     assert attestation["boundary_helper_sha256"] == runtime.BOUNDARY_HELPER_SHA256
     assert attestation["sudoers_template_sha256"] == runtime.SUDOERS_TEMPLATE_SHA256
     assert len(attestation["wheel_sha256"]) == 64
@@ -282,7 +283,7 @@ def test_runtime_probe_rejects_import_origin_outside_venv(
     site = paths.venv / "lib/python3.11/site-packages"
     runner.evidence["origins"] = {
         name: str(outside if name == "model_tools" else site / (name + ".py"))
-        for name in ("hermes_cli", "run_agent", "model_tools", "toolsets")
+        for name in ("cli", "hermes_cli", "run_agent", "model_tools", "toolsets")
     }
     with pytest.raises(ValueError, match="import origin"):
         runtime.probe_runtime(paths, runner=runner, probe_parent=tmp_path)
@@ -513,6 +514,32 @@ def test_build_account_requires_false_shell_empty_home_unique_group_and_no_suppl
         runtime.verify_build_account(builder, service, runner=hidden)
 
 
+def test_runtime_prerequisites_require_canonical_service_boundary_evidence() -> None:
+    runtime = _runtime()
+    evidence: dict[str, Any] = {
+        "accounts": {
+            "bridge_uid": 501,
+            "build_uid": 503,
+            "inference_uid": 502,
+            "inference_user": "_hermesmail",
+        },
+        "bridge_user": "bridge_user",
+        "sudoers_sha256": "a" * 64,
+        "wrapper_sha256": "b" * 64,
+    }
+
+    def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert argv == [str(runtime.BOUNDARY_HELPER)]
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n", ""
+        )
+
+    assert runtime.verify_service_boundary(runner=runner) == evidence
+    evidence["accounts"]["bridge_uid"] = 0
+    with pytest.raises(ValueError, match="invalid identities"):
+        runtime.verify_service_boundary(runner=runner)
+
+
 @pytest.mark.skipif(
     not hasattr(os, "chflags") or not getattr(stat, "UF_IMMUTABLE", 0),
     reason="BSD immutable flags require macOS",
@@ -709,8 +736,15 @@ def test_rebase_resolves_tmp_alias_and_final_active_verification_passes(
                     "direct_url": json.loads(argv[code_index + 4]),
                     "origins": {
                         name: str(site / (name + ".py"))
-                        for name in ("hermes_cli", "run_agent", "model_tools", "toolsets")
+                        for name in (
+                            "cli",
+                            "hermes_cli",
+                            "run_agent",
+                            "model_tools",
+                            "toolsets",
+                        )
                     },
+                    "adapter_protocol": "hermes-email-bridge/1",
                     "tool_schemas": 0,
                     "version": runtime.VERSION,
                 }
@@ -920,6 +954,7 @@ PRE_COMMIT_FAULT_STEPS = [
             "fetch-hermes-email-agent.py",
             "install-hermes-email-runtime.py",
             "verify-hermes-email-agent.py",
+            "hermes-email-agent-adapter.py",
         )
     ),
     "after_normalization",

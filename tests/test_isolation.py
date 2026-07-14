@@ -7,15 +7,26 @@ import json
 import os
 import pwd
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from hermes_email_bridge.models import NormalizedEmail, SenderAuthentication
+from hermes_email_bridge.providers.fake import FakeProvider
+from hermes_email_bridge.runner import SubprocessHermesRunner
+from hermes_email_bridge.service import BridgeService
+from hermes_email_bridge.store import MappingStore
+
 ROOT = Path(__file__).parents[1]
 WRAPPER_PATH = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
+ADAPTER_PATH = ROOT / "deploy/macos/hermes-email-agent-adapter.py"
 PROBE_PATH = ROOT / "deploy/macos/verify-hermes-email-agent.py"
 BOUNDARY_HELPER_PATH = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
 RUNTIME_PATH = ROOT / "deploy/macos/install-hermes-email-runtime.py"
@@ -56,6 +67,15 @@ def _load_boundary_helper() -> Any:
     return module
 
 
+def _synthetic_account_evidence(_bridge_user: str) -> dict[str, object]:
+    return {
+        "bridge_uid": 501,
+        "build_uid": 503,
+        "inference_uid": 502,
+        "inference_user": "_hermesmail",
+    }
+
+
 def test_wrapper_accepts_only_runner_argument_shapes() -> None:
     wrapper = _load_wrapper()
     build = wrapper.build_invocation
@@ -77,6 +97,13 @@ def test_wrapper_accepts_only_runner_argument_shapes() -> None:
         "20260711_120000_ab12-CD34",
         "--query",
         "follow-up",
+    )
+    assert argv[:4] == (
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/python",
+        "-I",
+        "-B",
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/"
+        "hermes-email-agent-adapter.py",
     )
 
 
@@ -119,24 +146,15 @@ def test_wrapper_executes_only_fixed_cwd_argv_and_environment(
     monkeypatch.setattr(wrapper_os, "execve", fake_execve)
     assert wrapper.main(["--query", "fixed prompt"]) == 70
 
-    hermes = "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes"
+    python = "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/python"
     assert calls["cwd"] == "/var/db/hermes-email-agent/workspace"
-    assert calls["path"] == hermes
+    assert calls["path"] == python
     assert calls["argv"] == [
-        hermes,
-        "chat",
-        "--quiet",
-        "--source",
-        "tool",
-        "--safe-mode",
-        "--toolsets",
-        "context_engine",
-        "--provider",
-        "openai-codex",
-        "--model",
-        "gpt-5.5",
-        "--max-turns",
-        "1",
+        python,
+        "-I",
+        "-B",
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/"
+        "hermes-email-agent-adapter.py",
         "--query",
         "fixed prompt",
     ]
@@ -157,74 +175,201 @@ def test_wrapper_executable_rejects_unknown_shape_without_echoing_input() -> Non
     assert secret_argument not in result.stderr
 
 
-def test_wrapper_contract_new_and_resume_have_zero_schemas_and_clean_streams(
+def test_programmatic_adapter_suppresses_all_process_output_and_emits_only_protocol(
     tmp_path: Path,
 ) -> None:
-    wrapper = _load_wrapper()
-    stub = tmp_path / "pinned-hermes-stub.py"
-    stub.write_text(
-        """import sys
-
-PINNED_COMMIT = "4281151ae859241351ba14d8c7682dc67ff4c126"
-TOOL_DEFINITIONS = {"context_engine": []}
-def get_tool_definitions(toolset, *, quiet_mode):
-    assert quiet_mode is True
-    return TOOL_DEFINITIONS[toolset]
-expected = [
-    "chat", "--quiet", "--source", "tool", "--safe-mode",
-    "--toolsets", "context_engine", "--provider", "openai-codex",
-    "--model", "gpt-5.5", "--max-turns", "1",
-]
-arguments = sys.argv[1:]
-assert arguments[:len(expected)] == expected
-tail = arguments[len(expected):]
-if tail[:1] == ["--resume"]:
-    session = tail[1]
-    tail = tail[2:]
-else:
-    session = "new-session"
-assert tail[0] == "--query" and len(tail) == 2
-assert get_tool_definitions("context_engine", quiet_mode=True) == []
-print("answer only")
-print(f"session_id: {session}", file=sys.stderr)
+    fake = tmp_path / "cli.py"
+    fake.write_text(
+        """import os, sys
+from pathlib import Path
+print("IMPORT TRANSCRIPT")
+os.write(2, b"IMPORT STDERR\\n")
+class Agent:
+    def __init__(self, session):
+        self.session_id = session
+        self.model = "gpt-5.5"
+        self.provider = "openai-codex"
+    def run_conversation(self, **kwargs):
+        incident = Path(os.environ["INCIDENT_FIXTURE"]).read_text().replace("\u241b", "\x1b")
+        os.write(1, incident.encode())
+        os.write(2, b"TIMEOUT AND SECRET-CANARY\\n")
+        result = {"final_response":"Short intended reply.","session_id":self.session_id,
+                  "completed":True,"failed":False,"partial":False,"interrupted":False,
+                  "turn_exit_reason":"text_response(finish_reason=stop)",
+                  "response_transformed":False,"response_previewed":False,
+                  "model":self.model,"provider":self.provider}
+        mode = os.environ.get("FAKE_RESULT_MODE")
+        if mode in {"failed", "partial", "interrupted"}: result[mode] = True
+        if mode == "incomplete": result["completed"] = False
+        if mode == "cleanup": result["cleanup_errors"] = ["SECRET-CANARY"]
+        if mode == "wrong-session": result["session_id"] = "different_session"
+        if mode == "agent-session": self.session_id = "different_session"
+        if mode in {"partial_stream_recovery", "fallback_prior_turn_content"}:
+            result["turn_exit_reason"] = mode
+        if mode == "missing-exit": result.pop("turn_exit_reason")
+        if mode == "unknown-exit": result["turn_exit_reason"] = "unknown"
+        if mode == "length-exit":
+            result["turn_exit_reason"] = "text_response(finish_reason=length)"
+        if mode == "content-filter-exit":
+            result["turn_exit_reason"] = "text_response(finish_reason=content_filter)"
+        if mode == "budget-exit": result["turn_exit_reason"] = "budget_exhausted"
+        if mode == "timeout-exit": result["turn_exit_reason"] = "max_iterations_reached(1/1)"
+        if mode == "transformed": result["response_transformed"] = True
+        if mode == "previewed": result["response_previewed"] = True
+        if mode == "pending-steer": result["pending_steer"] = "benign-looking follow-up"
+        if mode == "result-model": result["model"] = "different-model"
+        if mode == "agent-model": self.model = "different-model"
+        if mode == "result-provider": result["provider"] = "different-provider"
+        if mode == "agent-provider": self.provider = "different-provider"
+        return result
+class HermesCLI:
+    def __init__(self, **kwargs):
+        assert kwargs == {"model":"gpt-5.5","toolsets":["context_engine"],
+                          "provider":"openai-codex","max_turns":1,
+                          "resume":kwargs.get("resume"),"ignore_rules":True}
+        self.session_id = kwargs.get("resume") or "fresh_session"
+        self.agent = Agent(self.session_id)
+        self.conversation_history = []
+    def _claim_active_session(self, surface, stderr=False):
+        print("CLAIM")
+        return surface == "cli" and stderr is True
+    def _ensure_runtime_credentials(self): return True
+    def _resolve_turn_agent_config(self, query):
+        return {"model":"gpt-5.5","runtime":{},"request_overrides":None}
+    def _init_agent(self, **kwargs): return True
+def _finalize_single_query(cli):
+    print("FINALIZE")
+    os.write(2, b"CLEANUP STDERR\\n")
+    if os.environ.get("FAKE_RESULT_MODE") == "finalize": raise RuntimeError("SECRET-CANARY")
 """
     )
+    bootstrap = (
+        "import importlib.metadata,runpy,sys;"
+        "importlib.metadata.version=lambda name:'0.18.2';"
+        f"sys.path.insert(0,{str(tmp_path)!r});"
+        f"m=runpy.run_path({str(ADAPTER_PATH)!r});"
+        "raise SystemExit(m['main'](sys.argv[1:]))"
+    )
 
-    def run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
-        _cwd, fixed_argv, env = wrapper.build_invocation(arguments)
-        assert fixed_argv[fixed_argv.index("--toolsets") + 1] == "context_engine"
-        assert not {"none", "no_mcp", "", "default"} & set(fixed_argv)
+    def run(arguments: list[str], mode: str | None = None) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        environment["INCIDENT_FIXTURE"] = str(
+            ROOT / "tests/fixtures/incident_terminal_transcript.txt"
+        )
+        if mode is not None:
+            environment["FAKE_RESULT_MODE"] = mode
         return subprocess.run(
-            [sys.executable, str(stub), *fixed_argv[1:]],
+            [sys.executable, "-c", bootstrap, *arguments],
             capture_output=True,
             check=False,
-            env=env,
+            env=environment,
             text=True,
         )
 
     fresh = run(["--query", "new email"])
-    assert fresh.returncode == 0
-    assert fresh.stdout == "answer only\n"
-    assert fresh.stderr == "session_id: new-session\n"
-    assert "warning" not in (fresh.stdout + fresh.stderr).lower()
+    assert fresh.returncode == 0 and fresh.stderr == ""
+    assert json.loads(fresh.stdout) == {
+        "protocol": "hermes-email-bridge/1",
+        "reply": "Short intended reply.",
+        "session_id": "fresh_session",
+    }
+    assert fresh.stdout == (
+        '{"protocol":"hermes-email-bridge/1","reply":"Short intended reply.",'
+        '"session_id":"fresh_session"}\n'
+    )
 
     resumed = run(["--resume", "session_123", "--query", "reply email"])
-    assert resumed.returncode == 0
-    assert resumed.stdout == "answer only\n"
-    assert resumed.stderr == "session_id: session_123\n"
-    assert "warning" not in (resumed.stdout + resumed.stderr).lower()
+    assert resumed.returncode == 0 and resumed.stderr == ""
+    assert json.loads(resumed.stdout)["session_id"] == "session_123"
+
+    for mode in (
+        "failed",
+        "partial",
+        "interrupted",
+        "incomplete",
+        "cleanup",
+        "wrong-session",
+        "agent-session",
+        "finalize",
+        "partial_stream_recovery",
+        "fallback_prior_turn_content",
+        "missing-exit",
+        "unknown-exit",
+        "length-exit",
+        "content-filter-exit",
+        "budget-exit",
+        "timeout-exit",
+        "transformed",
+        "previewed",
+        "pending-steer",
+        "result-model",
+        "agent-model",
+        "result-provider",
+        "agent-provider",
+    ):
+        rejected = run(["--query", "new email"], mode)
+        assert rejected.returncode == 1
+        assert rejected.stdout == rejected.stderr == ""
+
+    incident_fixture = str(ROOT / "tests/fixtures/incident_terminal_transcript.txt")
+    e2e_bootstrap = (
+        "import importlib.metadata,os,runpy,sys;"
+        "importlib.metadata.version=lambda name:'0.18.2';"
+        f"os.environ['INCIDENT_FIXTURE']={incident_fixture!r};"
+        "os.environ['FAKE_RESULT_MODE']='partial_stream_recovery';"
+        f"sys.path.insert(0,{str(tmp_path)!r});"
+        f"m=runpy.run_path({str(ADAPTER_PATH)!r});"
+        "raise SystemExit(m['main'](sys.argv[1:]))"
+    )
+    command = shlex.join([sys.executable, "-c", e2e_bootstrap])
+    message = NormalizedEmail(
+        provider="fake",
+        provider_message_id="provenance-failure",
+        from_email="sender@example.invalid",
+        to_email="bridge@example.invalid",
+        subject="Provenance failure",
+        text_body="Do not deliver fallback content",
+        received_at=datetime.now(UTC),
+        sender_authentication=SenderAuthentication.AUTHENTICATED,
+    )
+    provider = FakeProvider([message])
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=SubprocessHermesRunner(command),
+            send_replies=True,
+            dry_run=False,
+        )
+        assert service.handle(message) == "processed"
+        assert provider.replies == []
+        assert store.list_mappings() == []
 
 
 def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
     probe = _load_probe()
     probe.verify_wrapper_shapes(WRAPPER_PATH)
+    probe.verify_adapter_shape(ADAPTER_PATH)
     results = iter(
         (
             subprocess.CompletedProcess(
-                [], 0, stdout="EMAIL_BRIDGE_PROBE_OK\n", stderr="session_id: live_session\n"
+                [],
+                0,
+                stdout=(
+                    '{"protocol":"hermes-email-bridge/1","reply":"EMAIL_BRIDGE_PROBE_OK",'
+                    '"session_id":"live_session"}\n'
+                ),
+                stderr="",
             ),
             subprocess.CompletedProcess(
-                [], 0, stdout="EMAIL_BRIDGE_RESUME_OK\n", stderr="session_id: live_session\n"
+                [],
+                0,
+                stdout=(
+                    '{"protocol":"hermes-email-bridge/1","reply":"EMAIL_BRIDGE_RESUME_OK",'
+                    '"session_id":"rotated_session"}\n'
+                ),
+                stderr="",
             ),
         )
     )
@@ -249,6 +394,8 @@ def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path, Path,
     boundary.mkdir(mode=0o755)
     candidate_wrapper = candidates / "hermes-email-agent-wrapper.py"
     candidate_wrapper.write_bytes(WRAPPER_PATH.read_bytes())
+    candidate_adapter = candidates / "hermes-email-agent-adapter.py"
+    candidate_adapter.write_bytes(ADAPTER_PATH.read_bytes())
     candidate_template = candidates / "hermes-email-agent.sudoers"
     candidate_template.write_bytes((ROOT / "deploy/macos/hermes-email-agent.sudoers").read_bytes())
     candidate_helper = candidates / "hermes-email-boundary-verify.py"
@@ -278,6 +425,7 @@ def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path, Path,
         if policy != rendered:
             return subprocess.CompletedProcess(argv, 1, "", "boundary failure")
         evidence = {
+            "accounts": _synthetic_account_evidence(configured_user),
             "bridge_user": configured_user,
             "sudoers_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
             "wrapper_sha256": runtime.WRAPPER_SHA256,
@@ -302,10 +450,35 @@ def test_runtime_verifier_requires_exact_attested_wrapper_and_sudoers_bytes(
         helper=helper,
         candidate_directory=candidates,
         runner=runner,
+        account_validator=_synthetic_account_evidence,
     )
     assert evidence["bridge_user"] == pwd.getpwuid(uid).pw_name
     assert len(evidence["wrapper_sha256"]) == 64
     assert len(evidence["sudoers_sha256"]) == 64
+
+
+def test_runtime_verifier_rejects_mismatched_account_evidence(tmp_path: Path) -> None:
+    probe, runtime, candidates, wrapper, helper, _sudoers, runner = _boundary_fixture(tmp_path)
+
+    def tampered(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        result = runner(argv, **kwargs)
+        evidence = json.loads(result.stdout)
+        evidence["accounts"]["inference_uid"] = 999
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n", ""
+        )
+
+    with pytest.raises(ValueError, match="does not match"):
+        probe.verify_fixed_boundary(
+            runtime,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            wrapper=wrapper,
+            helper=helper,
+            candidate_directory=candidates,
+            runner=tampered,
+            account_validator=_synthetic_account_evidence,
+        )
 
 
 @pytest.mark.parametrize(
@@ -314,6 +487,7 @@ def test_runtime_verifier_requires_exact_attested_wrapper_and_sudoers_bytes(
         ("wrapper-byte", "wrapper bytes"),
         ("broader-policy", "privileged boundary attestation failed"),
         ("stale-wrapper", "wrapper bytes"),
+        ("adapter-byte", "adapter candidate"),
         ("helper-byte", "helper bytes"),
         ("wrong-user", "startup verifier user"),
     ],
@@ -334,7 +508,10 @@ def test_runtime_verifier_rejects_tampered_boundary_bytes(
         )
         sudoers.chmod(0o440)
     elif mutation == "stale-wrapper":
-        wrapper.write_text(wrapper.read_text().replace('"gpt-5.5"', '"gpt-5.4"'))
+        wrapper.write_text(wrapper.read_text().replace('"-I"', '"-E"'))
+    elif mutation == "adapter-byte":
+        adapter = candidates / "hermes-email-agent-adapter.py"
+        adapter.write_bytes(adapter.read_bytes() + b"\n")
     elif mutation == "helper-byte":
         helper.write_bytes(helper.read_bytes() + b"\n")
     else:
@@ -354,7 +531,106 @@ def test_runtime_verifier_rejects_tampered_boundary_bytes(
             helper=helper,
             candidate_directory=candidates,
             runner=runner,
+            account_validator=_synthetic_account_evidence,
         )
+
+
+def _mac_account_inputs(helper: Any, failure: str | None = None) -> dict[str, Any]:
+    def user(name: str, uid: int, gid: int, home: str, shell: str) -> pwd.struct_passwd:
+        return pwd.struct_passwd((name, "*", uid, gid, "", home, shell))
+
+    bridge = user("bridge_user", 501, 601, "/Users/bridge_user", "/bin/zsh")
+    inference = user("_hermesmail", 502, 602, "/var/db/hermes-email-agent", "/usr/bin/false")
+    builder = user("_hermesbuild", 503, 603, "/var/empty", "/usr/bin/false")
+    if failure == "same_uid":
+        inference = user(
+            "_hermesmail", bridge.pw_uid, 602, "/var/db/hermes-email-agent", "/usr/bin/false"
+        )
+    elif failure == "wrong_home":
+        inference = user("_hermesmail", 502, 602, "/tmp", "/usr/bin/false")
+    elif failure == "wrong_shell":
+        inference = user("_hermesmail", 502, 602, "/var/db/hermes-email-agent", "/bin/zsh")
+    elif failure == "wrong_group":
+        inference = user("_hermesmail", 502, 604, "/var/db/hermes-email-agent", "/usr/bin/false")
+    elif failure == "admin":
+        inference = user("_hermesmail", 502, 80, "/var/db/hermes-email-agent", "/usr/bin/false")
+    elif failure == "staff":
+        inference = user("_hermesmail", 502, 20, "/var/db/hermes-email-agent", "/usr/bin/false")
+    accounts = {
+        "bridge_user": bridge,
+        "_hermesmail": inference,
+        "_hermesbuild": builder,
+    }
+    group_items = [
+        helper.grp.struct_group(("admin", "*", 80, [])),
+        helper.grp.struct_group(("staff", "*", 20, [])),
+        helper.grp.struct_group(("bridge_user", "*", 601, [])),
+        helper.grp.struct_group(("_hermesmail", "*", inference.pw_gid, [])),
+        helper.grp.struct_group(("_hermesbuild", "*", 603, [])),
+    ]
+    if failure == "supplementary":
+        group_items.append(helper.grp.struct_group(("extra", "*", 700, ["_hermesmail"])))
+    elif failure == "shared_group_member":
+        group_items[3] = helper.grp.struct_group(("_hermesmail", "*", 602, ["other_user"]))
+    by_name = {group.gr_name: group for group in group_items}
+    by_gid = {group.gr_gid: group for group in group_items}
+    if failure == "wrong_group":
+        by_gid[inference.pw_gid] = helper.grp.struct_group(("other", "*", 604, []))
+
+    def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "/usr/bin/dscl":
+            output = "IsHidden: 0\n" if failure == "not_hidden" else "IsHidden: 1\n"
+        else:
+            group_name = argv[-1]
+            member = failure == group_name
+            output = (
+                "user is a member of the group\n"
+                if member
+                else "user is not a member of the group\n"
+            )
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    return {
+        "user_lookup": accounts.__getitem__,
+        "users": lambda: list(accounts.values()),
+        "group_lookup": by_name.__getitem__,
+        "gid_lookup": by_gid.__getitem__,
+        "groups": lambda: group_items,
+        "runner": runner,
+    }
+
+
+def test_macos_account_invariants_accept_only_valid_dedicated_identities() -> None:
+    helper = _load_boundary_helper()
+    evidence = helper.validate_accounts("bridge_user", **_mac_account_inputs(helper))
+    assert evidence == _synthetic_account_evidence("bridge_user")
+    for reserved in ("root", "_hermesmail", "_hermesbuild"):
+        with pytest.raises(ValueError, match="name"):
+            helper.validate_accounts(reserved, **_mac_account_inputs(helper))
+    missing = _mac_account_inputs(helper)
+    missing["user_lookup"] = {}.__getitem__
+    with pytest.raises(ValueError, match="missing"):
+        helper.validate_accounts("bridge_user", **missing)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "same_uid",
+        "wrong_home",
+        "wrong_shell",
+        "wrong_group",
+        "admin",
+        "staff",
+        "supplementary",
+        "shared_group_member",
+        "not_hidden",
+    ],
+)
+def test_macos_account_invariants_fail_closed(failure: str) -> None:
+    helper = _load_boundary_helper()
+    with pytest.raises(ValueError):
+        helper.validate_accounts("bridge_user", **_mac_account_inputs(helper, failure))
 
 
 def test_privileged_helper_rejects_args_and_broadened_policy(
@@ -370,6 +646,7 @@ def test_privileged_helper_rejects_args_and_broadened_policy(
         "_read_fixed",
         lambda path, _mode: WRAPPER_PATH.read_bytes() if path == helper.WRAPPER else policy,
     )
+    monkeypatch.setattr(helper, "validate_accounts", _synthetic_account_evidence)
     assert helper.verify()["bridge_user"] == "bridge_user"
     with pytest.raises(ValueError, match="no arguments"):
         helper.main(["--alternate-path"])
@@ -452,6 +729,67 @@ def test_distinct_bridge_uid_cannot_read_sudoers_but_exact_helper_succeeds_and_t
             candidate_directory=probe.INSTALL_ROOT / "runtime",
             enforce_invoker=False,
         )
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or os.geteuid() != 0,
+    reason="requires root and the installed dedicated macOS accounts",
+)
+def test_inference_uid_cannot_read_bridge_env_database_sidecars_or_credentials() -> None:
+    probe = _load_probe()
+    if not probe.BOUNDARY_HELPER.is_file():
+        pytest.skip("fixed production boundary is not installed")
+    direct = subprocess.run(
+        [str(probe.BOUNDARY_HELPER)], capture_output=True, check=False, text=True
+    )
+    assert direct.returncode == 0 and direct.stderr == ""
+    bridge_user = json.loads(direct.stdout)["bridge_user"]
+    accounts = {name: pwd.getpwnam(name) for name in (bridge_user, "_hermesmail", "_hermesbuild")}
+    root = Path(tempfile.mkdtemp(prefix="hermes-email-secret-canary.", dir="/private/tmp"))
+    root.chmod(0o755)
+    try:
+        bridge = root / "bridge-private"
+        inference = root / "inference-private"
+        bridge.mkdir(mode=0o700)
+        inference.mkdir(mode=0o700)
+        os.chown(bridge, accounts[bridge_user].pw_uid, accounts[bridge_user].pw_gid)
+        os.chown(inference, accounts["_hermesmail"].pw_uid, accounts["_hermesmail"].pw_gid)
+        bridge_files = [
+            bridge / "service.env",
+            bridge / "bridge.db",
+            bridge / "bridge.db-wal",
+            bridge / "bridge.db-shm",
+            bridge / "provider.credentials",
+        ]
+        inference_file = inference / "oauth.credentials"
+        for path in bridge_files:
+            path.write_text("SECRET-CANARY-BRIDGE\n")
+            os.chown(path, accounts[bridge_user].pw_uid, accounts[bridge_user].pw_gid)
+            path.chmod(0o600)
+        inference_file.write_text("SECRET-CANARY-INFERENCE\n")
+        os.chown(
+            inference_file,
+            accounts["_hermesmail"].pw_uid,
+            accounts["_hermesmail"].pw_gid,
+        )
+        inference_file.chmod(0o600)
+
+        def read_as(user: str, path: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["/usr/bin/sudo", "-n", "-u", user, "/bin/cat", str(path)],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+        assert all(read_as(bridge_user, path).returncode == 0 for path in bridge_files)
+        assert read_as("_hermesmail", inference_file).returncode == 0
+        assert all(read_as("_hermesmail", path).returncode != 0 for path in bridge_files)
+        assert read_as(bridge_user, inference_file).returncode != 0
+        assert all(read_as("_hermesbuild", path).returncode != 0 for path in bridge_files)
+        assert read_as("_hermesbuild", inference_file).returncode != 0
+    finally:
+        shutil.rmtree(root)
 
 
 @pytest.mark.parametrize(

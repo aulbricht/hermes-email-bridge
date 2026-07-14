@@ -7,7 +7,7 @@ import logging
 from .mapping import normalize_email_address
 from .models import NormalizedEmail, PollSummary, ResolutionStatus, SenderAuthentication
 from .providers.base import EmailProvider
-from .runner import HermesRunner
+from .runner import HermesProtocolError, HermesRunner
 from .store import MappingStore
 
 logger = logging.getLogger(__name__)
@@ -118,7 +118,23 @@ class BridgeService:
             },
         )
 
-        result = self.runner.run(message, mapping)
+        try:
+            result = self.runner.run(message, mapping)
+        except HermesProtocolError as exc:
+            self.store.mark_processed(
+                message,
+                "hermes_protocol_error",
+                store_raw=False,
+                raw_retention_days=self.raw_retention_days,
+            )
+            logger.warning(
+                "Hermes protocol rejected",
+                extra={
+                    "event": "hermes_protocol_error",
+                    "reason": exc.code,
+                },
+            )
+            return "processed"
         logger.info(
             "Hermes invoked",
             extra={
@@ -129,8 +145,13 @@ class BridgeService:
         )
 
         if mapping:
+            mapping = self.store.update_mapping_session(
+                mapping.id,
+                expected_session=mapping.hermes_session,
+                new_session=result.session_id,
+            )
             self.store.add_message_link(message.provider, message.provider_message_id, mapping.id)
-        elif result.session_id:
+        else:
             mapping = self.store.add_mapping(
                 provider=message.provider,
                 hermes_session=result.session_id,
@@ -147,8 +168,7 @@ class BridgeService:
             outcome = "reply_dry_run"
             self._log_reply_skipped("dry_run", context)
         elif (
-            self.reply_domains
-            and self._email_domain(message.from_email) not in self.reply_domains
+            self.reply_domains and self._email_domain(message.from_email) not in self.reply_domains
         ):
             outcome = "reply_domain_denied"
             self._log_reply_skipped("sender_domain", context)

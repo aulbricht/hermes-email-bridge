@@ -4,14 +4,14 @@
 
 AgentMail is the first adapter, not a core dependency. The bridge contract is intentionally small enough for future IMAP, Gmail API, Postmark, SendGrid, or SES adapters.
 
-> Version: **0.3.0 (alpha)**. Start with replies disabled and dry-run enabled.
+> Version: **0.4.0 (alpha)**. Start with replies disabled and dry-run enabled.
 
 ## What works
 
 - Direct or Composio-backed AgentMail polling, message inspection, threaded replies, and verified webhooks
 - Provider-neutral typed message and attachment models
 - Authorization-aware SQLite mappings bound to a provider-authenticated participant
-- Hermes session creation and resume through its non-interactive CLI
+- Hermes session creation and resume through a version-pinned programmatic adapter
 - JSON structured logs with secret-field redaction
 - Persistent poll cursor, processed-message idempotency, and optional raw payload storage
 - Exact sender allowlisting with automatic enrollment from trusted outbound mail
@@ -78,15 +78,51 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME` | `false` | Enable authenticated exact-participant subject fallback |
 | `EMAIL_BRIDGE_POLL_INTERVAL` | `30` | Continuous poll interval in seconds |
 | `EMAIL_BRIDGE_LOG_LEVEL` | `INFO` | Python log level |
-| `HERMES_COMMAND` | `hermes chat --quiet --source tool` | Shell-free command prefix; production must use the isolated sudo wrapper below |
+| `HERMES_COMMAND` | exact isolated sudo wrapper | Every email-triggered invocation requires the fixed command below |
 | `HERMES_TIMEOUT` | `300` | Invocation timeout in seconds |
 | `EMAIL_BRIDGE_WEBHOOK_HOST` | `127.0.0.1` | Webhook listen host |
 | `EMAIL_BRIDGE_WEBHOOK_PORT` | `8787` | Webhook listen port |
 | `EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE` | `8` | Accepted webhook events waiting for a worker |
 
 The bridge appends `--resume SESSION` when mapped and always appends `--query PROMPT`; it
-never invokes a shell. The built-in command default is for local development only. A production
-email bridge must use the fixed isolated wrapper described below, not a same-user Hermes profile.
+never invokes a shell. The isolated wrapper is the default and only accepted runtime command.
+Startup rejects direct or same-account Hermes commands in every mode, including dry-run and
+replies-disabled operation, because those modes still invoke Hermes on email content.
+
+### Critical output-isolation boundary and 0.4 migration
+
+Version 0.4.0 replaces Hermes terminal stdout as an email transport. Earlier releases could
+mistake reasoning panels, tool previews, timeouts, terminal UI, duplicated passages, or trusted
+bridge metadata for the reply body. Because the email-driven process could also share access
+with bridge secrets on an unsafe deployment, contaminated stdout was a potential secret-
+exfiltration path.
+
+The only accepted subprocess output is one canonical UTF-8 JSON line using protocol
+`hermes-email-bridge/1`, with keys exactly `protocol`, `reply`, and `session_id`. The bridge
+requires a nonempty reply, a validated session ID, empty stderr, a zero exit status, canonical
+serialization, and no extra bytes, BOM, ANSI/control characters, terminal borders, or bridge
+trust-boundary markers. Output is captured with a hard bound. Any mismatch is recorded once as
+`hermes_protocol_error`; no email or mapping/link mutation occurs, and logs contain only a fixed
+reason code—not child stdout, stderr, reply text, lengths, snippets, or hashes.
+
+This is an intentional fail-closed migration. An existing `HERMES_COMMAND` that invokes
+`hermes chat --quiet` directly will no longer start the bridge in any mode. Install and attest the 0.4 adapter,
+root-owned wrapper, and dedicated `_hermesmail` account first, then use exactly:
+
+```bash
+HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'
+```
+
+The adapter redirects operating-system file descriptors 1 and 2 to `/dev/null` before importing
+Hermes and calls the pinned Hermes 0.18.2 `HermesCLI`/`AIAgent` result API. It accepts only the
+exact normal `text_response(finish_reason=stop)` provenance with completed, untransformed,
+unpreviewed output; pinned result and agent model/provider/session values; no pending steer; and
+no failed, partial, interrupted, or cleanup state. It finalizes the session, then emits only the
+canonical record through a saved non-inheritable descriptor. This preserves new and resumed
+sessions, including a validated session ID rotated by Hermes compression. The email instructions
+tell Hermes to return only the user-visible body, never discuss or perform delivery, and use
+tools only when the request genuinely requires them; the fixed `context_engine` toolset resolves
+to exactly zero tool schemas.
 
 ## Use
 
@@ -168,7 +204,10 @@ AgentMail's reply endpoint preserves the original email thread, including `In-Re
 
 ## Seed a mapping
 
-Inbound mail with no existing mapping starts a new Hermes session. The runner captures the `session_id:` emitted by Hermes and persists the new thread mapping automatically.
+Inbound mail with no existing mapping starts a new Hermes session. The runner accepts the
+validated `session_id` field from the canonical `hermes-email-bridge/1` JSON record and persists
+the new thread mapping automatically. Legacy `session_id:` terminal markers are incompatible
+with 0.4 and fail closed without sending an email.
 
 For a message originally sent elsewhere, seed its outbound message ID before replies arrive:
 
@@ -235,6 +274,8 @@ Additional safeguards:
 - No shell evaluation of `HERMES_COMMAND`
 - Minimal Hermes child environment: only `PATH` and present locale fields reach the command
 - Production Hermes runs as a separate non-staff account through a root-owned fixed wrapper
+- Canonical versioned JSON reply protocol; terminal output and stderr fail closed without delivery
+- Protocol failures are logged by reason code only; contaminated child bytes are never logged
 - API keys and webhook secrets never logged
 - Processed message IDs plus in-process webhook coalescing prevent duplicate Hermes invocations
 - AgentMail bearer credentials are sent only to a validated HTTPS origin; redirects are rejected
@@ -312,6 +353,9 @@ dscl . -create /Users/_hermesmail PrimaryGroupID __SERVICE_GID__
 dscl . -create /Users/_hermesmail NFSHomeDirectory /var/db/hermes-email-agent
 dscl . -create /Users/_hermesmail UserShell /usr/bin/false
 dscl . -create /Users/_hermesmail IsHidden 1
+! dscl . -read /Groups/_hermesmail GroupMembership
+dsmemberutil checkmembership -U _hermesmail -G admin | grep -q 'not a member'
+dsmemberutil checkmembership -U _hermesmail -G staff | grep -q 'not a member'
 install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent
 install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent/workspace
 dscl . -create /Groups/_hermesbuild
@@ -328,6 +372,64 @@ dsmemberutil checkmembership -U _hermesbuild -G admin | grep -q 'not a member'
 dsmemberutil checkmembership -U _hermesbuild -G staff | grep -q 'not a member'
 sudo -n -u _hermesbuild /usr/bin/test ! -r /var/db/hermes-email-agent
 ```
+
+### v0.3 to v0.4 fail-closed migration
+
+The v0.4 runtime installer intentionally accepts only an absent runtime or an already attested
+v0.4 runtime. It does not recognize or execute a v0.3 tree. A v0.3 installation therefore needs
+this one-time fail-closed handoff. The order is security-sensitive: keep the LaunchAgent unloaded
+and stop every manual poller before starting. Do **not** install the v0.4 wrapper or boundary below
+before quarantining v0.3; that wrapper points at an adapter the legacy runtime does not contain.
+Never run or restore the old email path after beginning this sequence. Follow this numbered
+procedure only for an existing v0.3 runtime; a fresh v0.4 install skips directly to the wrapper
+installation below.
+
+1. Unload the LaunchAgent and stop any manually started `poll --continuous` process. Confirm that
+   no bridge or email-triggered Hermes process remains. Keep the service unloaded through every
+   remaining step.
+2. From the reviewed v0.4 checkout, run the fixed, no-argument migration helper directly. It uses
+   macOS system Python 3.9, validates only fixed root-owned parent/runtime metadata and ACL state,
+   and atomically renames `runtime` to a unique `.runtime-v0.3-quarantine.<24-hex>` sibling. It
+   never imports, executes, traverses, deletes, or automatically restores legacy Hermes files:
+
+   ```bash
+   sudo /usr/bin/python3 deploy/macos/quarantine-hermes-email-runtime-v0_3.py
+   ```
+
+   Save its canonical JSON output for the change record. After success there is deliberately no
+   active `runtime`, so every bridge invocation fails closed. The helper refuses alternate paths,
+   arguments, nonroot use, unsafe ownership/modes/ACLs/symlinks, collisions, and any existing
+   `.runtime-*` transaction or quarantine sibling.
+3. Install the new root wrapper, boundary helper, and sudoers policy with
+   `install-hermes-email-agent.py` as documented below.
+4. Prepare the pinned source and `uv`, run `install-hermes-email-runtime.py --check`, then run the
+   fresh v0.4 runtime installer, all as documented below. With no active runtime this is its
+   supported first-install path; it must not use or replace the quarantined v0.3 tree.
+5. Run the fixed offline `verify-hermes-email-agent.py` command below.
+6. From this reviewed checkout, run these three macOS gates as root with an absolute Python 3.11+
+   environment containing the development dependencies:
+
+   ```bash
+   sudo -H /ABSOLUTE/PYTHON-3.11 -m pytest -q \
+     tests/test_isolation.py::test_distinct_bridge_uid_cannot_read_sudoers_but_exact_helper_succeeds_and_tamper_fails
+   sudo -H /ABSOLUTE/PYTHON-3.11 -m pytest -q \
+     tests/test_isolation.py::test_inference_uid_cannot_read_bridge_env_database_sidecars_or_credentials
+   sudo -H /ABSOLUTE/PYTHON-3.11 -m pytest -q \
+     tests/test_runtime_attestation.py::test_distinct_uid_builder_traverses_non_listable_stage_only_into_private_child
+   ```
+
+7. Run the fixed verifier's `--live` new-session and resumed-session canary below from the bridge
+   account. Load the LaunchAgent only after the offline verifier, all three root account gates, and
+   both live protocol records succeed exactly.
+
+If any step fails, keep the service unloaded and the v0.3 tree quarantined. Correct the v0.4
+installation and retry v0.4; never restart v0.3. There is intentionally no rollback or cleanup
+helper. Retain the quarantine by default. If retention policy eventually requires removal, use a
+separately approved manual root change only after the exact fixed v0.4 active verifier succeeds
+again: compare the candidate with the exact path saved from the migration JSON, require the fixed
+`.runtime-v0.3-quarantine.` prefix followed by exactly 24 lowercase hexadecimal characters,
+confirm there are no unexpected `.runtime-*` siblings, and remove only that reviewed path. Do not
+use a wildcard, search result, or automatic recursive cleanup.
 
 Verify the wrapper interpreter first with `test -x /usr/bin/python3`. Install Hermes Agent
 **0.18.2** into the fixed, root-owned
@@ -371,10 +473,16 @@ explicit empty argument list. The helper itself rejects all arguments and reads 
 wrapper and `0440` policy, returning canonical identity and hash evidence. The unprivileged
 LaunchAgent never reads sudoers directly; it exact-byte checks the readable attested helper and
 accepts only the fixed helper command and exact evidence for its own configured bridge identity.
+Installation rejects root, `_hermesmail`, `_hermesbuild`, missing accounts, UID 0, and any UID
+collision. Every startup revalidates that the bridge identity is nonroot and distinct and that
+`_hermesmail` retains its exact hidden home, false shell, unique private primary group, no
+explicit members in that group, no supplementary groups, and no admin or staff membership. The runtime build/check calls the same
+root helper before touching the frozen runtime.
 The wrapper accepts only `--query TEXT` with one optional safe `--resume
-SESSION_ID`; it fixes the working directory, environment, executable, and Hermes arguments:
-safe mode, `context_engine`, `openai-codex`, `gpt-5.5`, and one turn. It cannot select arbitrary
-providers, models, tools, toolsets, hooks, skills, flags, or commands. Configure the bridge:
+SESSION_ID`; it fixes the working directory and minimal environment, then executes the attested
+adapter with the frozen venv Python using `-I -B`. The adapter pins safe mode, ignored user
+configuration/rules, `context_engine`, `openai-codex`, `gpt-5.5`, and one turn. It cannot select
+arbitrary providers, models, tools, toolsets, hooks, skills, flags, or commands. Configure the bridge:
 
 ```bash
 HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'
@@ -484,10 +592,10 @@ before the environment file is sourced:
 '/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/verify-hermes-email-agent.py'
 ```
 
-The verifier checks the exact root helper/wrapper boundary and privileged sudoers hash evidence,
+The verifier checks the exact root helper/wrapper boundary, adapter, and privileged sudoers hash evidence,
 the actual fixed Python, `hermes` console script, non-editable distribution, import origins,
-lock/version, exactly zero tool schemas for `context_engine`, and offline
-new/resume parser shapes. Every offline install and startup probe creates its own invoking-user-owned
+lock/version, the pinned `HermesCLI`/`AIAgent` import seam, protocol version, exactly zero tool
+schemas for `context_engine`, and offline adapter new/resume argument shapes. Every offline install and startup probe creates its own invoking-user-owned
 mode `0700` temporary `HOME`/`HERMES_HOME` outside `/var/db/hermes-email-agent` and removes it on
 success or failure. Offline verification never reads or changes the real service home.
 It does not claim that a model answered. Before loading the LaunchAgent, separately run the live
@@ -499,8 +607,8 @@ canary from the bridge account:
 ```
 
 Do not load or restart unless attestation succeeds and the live canary returns the exact new and
-resumed answers with only `session_id:` metadata on stderr and no warning. Resume remains enabled
-because the bridge requires persisted sessions.
+resumed answers as canonical protocol records with empty stderr. Resume remains enabled because
+the bridge requires persisted sessions.
 
 The bridge command receives only `PATH` and present locale fields; it receives no bridge
 environment-file path, AgentMail/Composio/bridge variables, proxy variables, `PYTHONPATH`,
@@ -508,7 +616,35 @@ environment-file path, AgentMail/Composio/bridge variables, proxy variables, `PY
 its fixed service-account environment. Same-user `0600` files alone are not an isolation
 boundary against an email-driven agent.
 
+## Linux deployment status
+
+Version 0.4.0 supports live email-triggered Hermes execution only through the fully attested
+macOS boundary above. Linux and same-user deployments are intentionally unsupported and fail
+closed; this repository does not ship Linux systemd, sudoers, wrapper, or verifier assets.
+The provider-neutral bridge code remains portable, but that does not provide a safe inference
+execution boundary.
+
+Linux support requires an equivalent complete implementation and review: recursive trusted-path
+ownership, modes, ACL and symlink checks; a pinned runtime digest and distribution/import-origin
+provenance; the exact private Hermes API seam; zero tool schemas; distinct private identities and
+state; and recurring startup plus live protocol verification. A manually copied adapter or
+root-owned wrapper is not sufficient and must not be used for live email execution.
+
 ## Release notes
+
+### 0.4.0
+
+- Replaced unstructured Hermes terminal stdout with strict canonical
+  `hermes-email-bridge/1` JSON and bounded capture.
+- Added a pinned programmatic Hermes adapter that suppresses all process/UI output and fails
+  closed on incomplete or contaminated turns.
+- Made every email-triggered invocation require the exact dedicated-account sudo wrapper and
+  added recurring macOS account, runtime, and adapter attestation.
+- Added incident replay, malformed-output, resumed-session rotation, secret-canary isolation,
+  redacted-log, and exact delivered-body regression tests.
+- Added the explicit v0.3-to-v0.4 fail-closed migration: the stopped legacy runtime is atomically
+  quarantined without execution, never restored automatically, and retained while a fresh v0.4
+  runtime passes offline verification, three root account gates, and live new/resume canaries.
 
 ### 0.3.0
 

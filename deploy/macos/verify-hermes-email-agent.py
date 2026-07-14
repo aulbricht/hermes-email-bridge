@@ -24,7 +24,7 @@ WRAPPER = Path("/usr/local/libexec/hermes-email-agent")
 BOUNDARY_HELPER = Path("/usr/local/libexec/hermes-email-boundary-verify")
 SUDOERS = Path("/private/etc/sudoers.d/hermes-email-agent")
 RUNTIME_INSTALLER = Path(__file__).with_name("install-hermes-email-runtime.py")
-_SESSION = re.compile(r"(?m)^session_id:\s*([A-Za-z0-9][A-Za-z0-9_-]{0,127})\s*$")
+_SESSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _BRIDGE_USER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
 _PLACEHOLDER = "__BRIDGE_USER__"
 
@@ -48,12 +48,31 @@ def verify_wrapper_shapes(wrapper: Path) -> None:
         raise ValueError("installed wrapper does not expose build_invocation")
     _cwd, fresh, _env = build(["--query", "probe"])
     _cwd, resumed, _env = build(["--resume", "probe_session", "--query", "probe"])
-    for argv in (fresh, resumed):
-        index = argv.index("--toolsets")
-        if argv[index + 1] != "context_engine":
-            raise ValueError("wrapper does not pin context_engine")
+    expected = (
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/python",
+        "-I",
+        "-B",
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/"
+        "hermes-email-agent-adapter.py",
+    )
+    if fresh[:4] != expected or resumed[:4] != expected:
+        raise ValueError("wrapper does not pin the programmatic adapter")
     if "--resume" in fresh or resumed[-4:-2] != ("--resume", "probe_session"):
         raise ValueError("wrapper new/resume argument contract is invalid")
+
+
+def verify_adapter_shape(adapter: Path) -> None:
+    namespace = runpy.run_path(str(adapter))
+    if (
+        namespace.get("PROTOCOL") != "hermes-email-bridge/1"
+        or namespace.get("HERMES_VERSION") != "0.18.2"
+        or namespace.get("MODEL") != "gpt-5.5"
+        or namespace.get("PROVIDER") != "openai-codex"
+        or namespace.get("TOOLSETS") != ["context_engine"]
+        or namespace.get("MAX_TURNS") != 1
+        or namespace.get("NORMAL_TURN_EXIT_REASON") != "text_response(finish_reason=stop)"
+    ):
+        raise ValueError("adapter does not pin the reviewed programmatic contract")
 
 
 def _sha256(content: bytes) -> str:
@@ -70,16 +89,21 @@ def verify_fixed_boundary(
     candidate_directory: Optional[Path] = None,
     enforce_invoker: bool = True,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    account_validator: Optional[Callable[[str], dict[str, object]]] = None,
 ) -> dict[str, str]:
     candidates = Path(__file__).parent if candidate_directory is None else candidate_directory
     candidate_wrapper = candidates / "hermes-email-agent-wrapper.py"
+    candidate_adapter = candidates / "hermes-email-agent-adapter.py"
     candidate_sudoers = candidates / "hermes-email-agent.sudoers"
     candidate_helper = candidates / "hermes-email-boundary-verify.py"
     candidate_wrapper_content = candidate_wrapper.read_bytes()
+    candidate_adapter_content = candidate_adapter.read_bytes()
     candidate_sudoers_content = candidate_sudoers.read_bytes()
     candidate_helper_content = candidate_helper.read_bytes()
     if _sha256(candidate_wrapper_content) != runtime.WRAPPER_SHA256:
         raise ValueError("attested wrapper candidate does not match the reviewed hash")
+    if _sha256(candidate_adapter_content) != runtime.ADAPTER_SHA256:
+        raise ValueError("attested adapter candidate does not match the reviewed hash")
     if _sha256(candidate_sudoers_content) != runtime.SUDOERS_TEMPLATE_SHA256:
         raise ValueError("attested sudoers candidate does not match the reviewed hash")
     if _sha256(candidate_helper_content) != runtime.BOUNDARY_HELPER_SHA256:
@@ -118,6 +142,7 @@ def verify_fixed_boundary(
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("privileged boundary attestation is malformed") from exc
     if not isinstance(evidence, dict) or set(evidence) != {
+        "accounts",
         "bridge_user",
         "sudoers_sha256",
         "wrapper_sha256",
@@ -128,7 +153,16 @@ def verify_fixed_boundary(
         raise ValueError("privileged boundary bridge user is malformed")
     if template.count(_PLACEHOLDER) != 3:
         raise ValueError("attested sudoers template is malformed")
+    if account_validator is None:
+        helper_namespace = runpy.run_path(str(candidate_helper))
+        validator = helper_namespace.get("validate_accounts")
+        if not callable(validator):
+            raise ValueError("attested boundary helper lacks account validation")
+        account_evidence = validator(bridge_user)
+    else:
+        account_evidence = account_validator(bridge_user)
     expected = {
+        "accounts": account_evidence,
         "bridge_user": bridge_user,
         "sudoers_sha256": _sha256(template.replace(_PLACEHOLDER, bridge_user).encode()),
         "wrapper_sha256": runtime.WRAPPER_SHA256,
@@ -141,7 +175,9 @@ def verify_fixed_boundary(
     if enforce_invoker and os.geteuid() != 0 and pwd.getpwuid(os.getuid()).pw_name != bridge_user:
         raise ValueError("startup verifier user does not match the sudoers bridge user")
     verify_wrapper_shapes(wrapper)
+    verify_adapter_shape(candidate_adapter)
     return {
+        "adapter_sha256": runtime.ADAPTER_SHA256,
         "bridge_user": bridge_user,
         "sudoers_sha256": expected["sudoers_sha256"],
         "wrapper_sha256": expected["wrapper_sha256"],
@@ -163,29 +199,53 @@ def _live_call(
     )
 
 
+def _parse_protocol(result: subprocess.CompletedProcess[str]) -> dict[str, str]:
+    if result.returncode != 0 or result.stderr:
+        raise ValueError("Hermes live protocol failed")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Hermes live protocol is malformed") from exc
+    if not isinstance(payload, dict) or set(payload) != {"protocol", "reply", "session_id"}:
+        raise ValueError("Hermes live protocol has an invalid shape")
+    reply = payload.get("reply")
+    session_id = payload.get("session_id")
+    if (
+        payload.get("protocol") != "hermes-email-bridge/1"
+        or not isinstance(reply, str)
+        or not reply.strip()
+        or not isinstance(session_id, str)
+        or _SESSION.fullmatch(session_id) is None
+    ):
+        raise ValueError("Hermes live protocol fields are invalid")
+    canonical = (
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")) + "\n"
+    )
+    if result.stdout != canonical:
+        raise ValueError("Hermes live protocol is not canonical")
+    return {"reply": reply, "session_id": session_id}
+
+
 def verify_live(
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> None:
     fresh = _live_call(["--query", "Reply with exactly: EMAIL_BRIDGE_PROBE_OK"], runner=runner)
-    if fresh.returncode != 0 or fresh.stdout.strip() != "EMAIL_BRIDGE_PROBE_OK":
+    fresh_payload = _parse_protocol(fresh)
+    if fresh_payload["reply"] != "EMAIL_BRIDGE_PROBE_OK":
         raise ValueError("Hermes live new-session probe failed")
-    match = _SESSION.fullmatch(fresh.stderr.strip())
-    if match is None or "warning" in fresh.stderr.lower():
-        raise ValueError("Hermes live probe did not emit a session ID")
     resumed = _live_call(
-        ["--resume", match.group(1), "--query", "Reply with exactly: EMAIL_BRIDGE_RESUME_OK"],
+        [
+            "--resume",
+            fresh_payload["session_id"],
+            "--query",
+            "Reply with exactly: EMAIL_BRIDGE_RESUME_OK",
+        ],
         runner=runner,
     )
-    if resumed.returncode != 0 or resumed.stdout.strip() != "EMAIL_BRIDGE_RESUME_OK":
+    resumed_payload = _parse_protocol(resumed)
+    if resumed_payload["reply"] != "EMAIL_BRIDGE_RESUME_OK":
         raise ValueError("Hermes live resumed-session probe failed")
-    resumed_match = _SESSION.fullmatch(resumed.stderr.strip())
-    if (
-        resumed_match is None
-        or resumed_match.group(1) != match.group(1)
-        or "warning" in resumed.stderr.lower()
-    ):
-        raise ValueError("Hermes live resume did not preserve the session ID")
 
 
 def main(arguments: Optional[Sequence[str]] = None) -> int:

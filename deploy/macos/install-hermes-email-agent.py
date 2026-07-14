@@ -20,6 +20,7 @@ from typing import Optional
 
 _BRIDGE_USER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
 _PLACEHOLDER = "__BRIDGE_USER__"
+_RESERVED_USERS = {"root", "_hermesmail", "_hermesbuild"}
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,30 @@ def build_plan(root: Path = Path("/"), assets: Optional[Path] = None) -> Install
 def validate_bridge_user(value: str) -> str:
     if _BRIDGE_USER.fullmatch(value) is None:
         raise ValueError("bridge user must be a narrow local account name")
+    return value
+
+
+def validate_bridge_account(
+    value: str,
+    *,
+    user_lookup: Optional[Callable[[str], pwd.struct_passwd]] = None,
+) -> str:
+    """Require an existing, nonroot bridge identity distinct from service accounts."""
+
+    validate_bridge_user(value)
+    if value in _RESERVED_USERS:
+        raise ValueError("bridge user cannot be root or a reserved service account")
+    get_user = pwd.getpwnam if user_lookup is None else user_lookup
+    try:
+        bridge = get_user(value)
+        inference = get_user("_hermesmail")
+        builder = get_user("_hermesbuild")
+    except KeyError as exc:
+        raise ValueError("bridge, inference, and build accounts must already exist") from exc
+    if bridge.pw_name != value or bridge.pw_uid == 0:
+        raise ValueError("bridge account must be an existing nonroot identity")
+    if len({0, bridge.pw_uid, inference.pw_uid, builder.pw_uid}) != 4:
+        raise ValueError("bridge, inference, and build account UIDs must be distinct")
     return value
 
 
@@ -209,7 +234,7 @@ def install(
     sudoers_validator: Callable[[Path], None] = run_visudo,
     replacer: Callable[[Path, Path], None] = os.replace,
 ) -> tuple[str, ...]:
-    bridge_user = validate_bridge_user(bridge_user)
+    bridge_user = validate_bridge_account(bridge_user)
     wrapper_content = _read_source(plan.wrapper_source)
     helper_content = _read_source(plan.helper_source)
     try:

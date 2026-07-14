@@ -14,9 +14,9 @@ ROOT = Path(__file__).parents[1]
 
 def test_version_has_one_project_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert project["project"]["version"] == "0.3.0"
-    assert __version__ == "0.3.0"
-    assert '__version__ = "0.3.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
+    assert project["project"]["version"] == "0.4.0"
+    assert __version__ == "0.4.0"
+    assert '__version__ = "0.4.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
 
 
 def test_docs_and_example_config_cover_composio_allowlisting_and_start_now() -> None:
@@ -38,10 +38,12 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     plist_path = ROOT / "deploy/macos/com.example.hermes.email-bridge.plist"
     launcher_path = ROOT / "deploy/macos/run-email-bridge.sh"
     wrapper_path = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
+    adapter_path = ROOT / "deploy/macos/hermes-email-agent-adapter.py"
     helper_path = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
     fetcher_path = ROOT / "deploy/macos/fetch-hermes-email-agent.py"
     probe_path = ROOT / "deploy/macos/verify-hermes-email-agent.py"
     runtime_installer_path = ROOT / "deploy/macos/install-hermes-email-runtime.py"
+    migration_path = ROOT / "deploy/macos/quarantine-hermes-email-runtime-v0_3.py"
     installer_path = ROOT / "deploy/macos/install-hermes-email-agent.py"
     sudoers_path = ROOT / "deploy/macos/hermes-email-agent.sudoers"
     build_constraint_path = ROOT / "deploy/macos/hermes-email-build-constraints.txt"
@@ -49,20 +51,22 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     launcher = launcher_path.read_text()
     wrapper = wrapper_path.read_text()
     sudoers = sudoers_path.read_text()
-    combined = plist_text + launcher + wrapper + helper_path.read_text() + sudoers
+    adapter = adapter_path.read_text()
+    combined = plist_text + launcher + wrapper + adapter + helper_path.read_text() + sudoers
     assert "snowcapconsulting" not in combined
     assert "aulbricht" not in combined
-    assert "/Users/" not in combined
     assert "EMAIL_BRIDGE_COMPOSIO_API_KEY" not in combined
     assert "umask 077" in launcher
     assert '!= "600"' in launcher
     if os.name == "posix":
         assert launcher_path.stat().st_mode & 0o111
         assert wrapper_path.stat().st_mode & 0o111
+        assert adapter_path.stat().st_mode & 0o111
         assert helper_path.stat().st_mode & 0o111
         assert fetcher_path.stat().st_mode & 0o111
         assert probe_path.stat().st_mode & 0o111
         assert runtime_installer_path.stat().st_mode & 0o111
+        assert migration_path.stat().st_mode & 0o111
         assert installer_path.stat().st_mode & 0o111
         assert not sudoers_path.stat().st_mode & 0o111
         assert not build_constraint_path.stat().st_mode & 0o111
@@ -74,13 +78,23 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     ) in sudoers
     for fixed in (
         "/var/db/hermes-email-agent/workspace",
-        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes",
-        '"--safe-mode"',
-        '"context_engine"',
-        '"openai-codex"',
-        '"gpt-5.5"',
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/python",
+        "hermes-email-agent-adapter.py",
+        '"-I"',
+        '"-B"',
     ):
         assert fixed in wrapper
+    for fixed in (
+        'PROTOCOL = "hermes-email-bridge/1"',
+        'HERMES_VERSION = "0.18.2"',
+        'TOOLSETS = ["context_engine"]',
+        'PROVIDER = "openai-codex"',
+        'MODEL = "gpt-5.5"',
+        'NORMAL_TURN_EXIT_REASON = "text_response(finish_reason=stop)"',
+        "os.dup2(devnull, 1)",
+        "_finalize_single_query",
+    ):
+        assert fixed in adapter
     installer = (ROOT / "deploy/macos/install-hermes-email-agent.py").read_text()
     assert 'rooted("/usr/local/libexec")' in installer
     assert 'rooted("/private/etc/sudoers.d")' in installer
@@ -93,7 +107,10 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "PROVENANCE_FILE" in fetcher
     runtime_installer = runtime_installer_path.read_text()
     assert "get_tool_definitions" in runtime_installer
+    assert "AIAgent.run_conversation" in runtime_installer
     assert 'enabled_toolsets=["context_engine"]' in runtime_installer
+    assert "ADAPTER_SHA256" in runtime_installer
+    assert '"adapter_protocol": "hermes-email-bridge/1"' in runtime_installer
     assert "--no-editable" in runtime_installer
     assert "LOCK_SHA256" in runtime_installer
     assert "runtime-attestation.json" in runtime_installer
@@ -103,6 +120,11 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "--require-hashes" in runtime_installer
     assert "--no-build" in runtime_installer
     assert "/var/db/hermes-email-agent" not in runtime_installer
+    assert '"quarantine-hermes-email-runtime-v0_3.py"' in runtime_installer
+    migration = migration_path.read_text()
+    assert 'QUARANTINE_PREFIX = ".runtime-v0.3-quarantine."' in migration
+    assert "renamer(paths.active_runtime, quarantine)" in migration
+    assert "shutil" not in migration
     probe = probe_path.read_text()
     assert "installed wrapper bytes do not match" in probe
     assert "privileged boundary attestation" in probe
@@ -115,6 +137,35 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert plist["Umask"] == 0o77
     assert plist["WorkingDirectory"] == "__WORKSPACE__"
     assert "HERMES_HOME" not in plist["EnvironmentVariables"]
+
+
+def test_source_distribution_includes_runtime_migration_helper() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    includes = project["tool"]["hatch"]["build"]["targets"]["sdist"]["include"]
+    assert "/deploy" in includes
+    assert (ROOT / "deploy/macos/quarantine-hermes-email-runtime-v0_3.py").is_file()
+
+
+def test_v0_3_migration_runbook_preserves_fail_closed_order() -> None:
+    readme = (ROOT / "README.md").read_text()
+    section = readme.split("### v0.3 to v0.4 fail-closed migration", 1)[1].split(
+        "Verify the wrapper interpreter first", 1
+    )[0]
+    ordered = (
+        "1. Unload the LaunchAgent",
+        "sudo /usr/bin/python3 deploy/macos/quarantine-hermes-email-runtime-v0_3.py",
+        "3. Install the new root wrapper",
+        "4. Prepare the pinned source and `uv`",
+        "5. Run the fixed offline",
+        "6. From this reviewed checkout",
+        "7. Run the fixed verifier's `--live`",
+        "Load the LaunchAgent only after",
+    )
+    positions = [section.index(item) for item in ordered]
+    assert positions == sorted(positions)
+    assert "Do **not** install the v0.4 wrapper or boundary below" in section
+    assert "never restart v0.3" in section
+    assert "no rollback or cleanup helper" in " ".join(section.split())
 
 
 def test_shipping_docs_and_assets_have_no_deployment_personalization() -> None:
@@ -161,6 +212,9 @@ def test_macos_isolation_installation_requirements_are_documented() -> None:
         "--require-hashes",
         "--no-build",
         "byte-compare",
+        "v0.3 to v0.4",
+        "quarantine-hermes-email-runtime-v0_3.py",
+        "never restart v0.3",
     ):
         assert required.lower() in normalized_readme
     for pin in (

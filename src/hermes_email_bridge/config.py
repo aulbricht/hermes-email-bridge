@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 from .mapping import normalize_email_address
 
+ISOLATED_HERMES_COMMAND = "/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent"
+
 
 class ConfigError(ValueError):
     """Raised when bridge configuration is missing or invalid."""
@@ -134,17 +136,22 @@ class Settings:
             values.get("AGENTMAIL_BASE_URL", "https://api.agentmail.to/v0"),
             allow_local_http=allow_local_http,
         )
+        send_replies = _bool(
+            values.get("EMAIL_BRIDGE_SEND_REPLIES", "false"),
+            "EMAIL_BRIDGE_SEND_REPLIES",
+        )
+        dry_run = _bool(
+            values.get("EMAIL_BRIDGE_DRY_RUN", "true"),
+            "EMAIL_BRIDGE_DRY_RUN",
+        )
+        hermes_command = values.get("HERMES_COMMAND", ISOLATED_HERMES_COMMAND)
+        if hermes_command != ISOLATED_HERMES_COMMAND:
+            raise ConfigError("email-triggered Hermes requires the exact isolated protocol wrapper")
         return cls(
             provider=provider,
             db_path=db_path,
-            send_replies=_bool(
-                values.get("EMAIL_BRIDGE_SEND_REPLIES", "false"),
-                "EMAIL_BRIDGE_SEND_REPLIES",
-            ),
-            dry_run=_bool(
-                values.get("EMAIL_BRIDGE_DRY_RUN", "true"),
-                "EMAIL_BRIDGE_DRY_RUN",
-            ),
+            send_replies=send_replies,
+            dry_run=dry_run,
             reply_domains=_domains(
                 values.get("EMAIL_BRIDGE_REPLY_DOMAINS", ""),
                 "EMAIL_BRIDGE_REPLY_DOMAINS",
@@ -160,7 +167,7 @@ class Settings:
             ),
             poll_interval=poll_interval,
             log_level=values.get("EMAIL_BRIDGE_LOG_LEVEL", "INFO").upper(),
-            hermes_command=values.get("HERMES_COMMAND", "hermes chat --quiet --source tool"),
+            hermes_command=hermes_command,
             hermes_timeout=hermes_timeout,
             agentmail_api_key=values.get("AGENTMAIL_API_KEY"),
             agentmail_inbox_id=values.get("AGENTMAIL_INBOX_ID"),

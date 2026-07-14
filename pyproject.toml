@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-email-bridge"
-version = "0.3.0"
+version = "0.4.0"
 description = "Provider-neutral inbound email bridge for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -39,6 +39,18 @@ Issues = "https://github.com/aulbricht/hermes-email-bridge/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hermes_email_bridge"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/.env.example",
+  "/.github",
+  "/LICENSE",
+  "/README.md",
+  "/deploy",
+  "/src",
+  "/tests",
+  "/uv.lock",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"

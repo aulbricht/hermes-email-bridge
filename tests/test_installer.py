@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pwd
 import stat
 import subprocess
 import sys
@@ -25,6 +26,7 @@ def _installer() -> Any:
 
 def _fixture(tmp_path: Path) -> tuple[Any, Any, int, int]:
     installer = _installer()
+    installer.validate_bridge_account = lambda value: installer.validate_bridge_user(value)
     assets = tmp_path / "assets"
     assets.mkdir()
     (assets / "hermes-email-agent-wrapper.py").write_text("#!/usr/bin/python3\n")
@@ -125,6 +127,35 @@ def test_installer_dry_plan_does_not_create_missing_directory(tmp_path: Path) ->
 def test_installer_rejects_unsafe_bridge_user(name: str) -> None:
     with pytest.raises(ValueError, match="narrow"):
         _installer().validate_bridge_user(name)
+
+
+def test_installer_requires_existing_distinct_nonroot_bridge_identity() -> None:
+    installer = _installer()
+
+    def account(name: str, uid: int) -> pwd.struct_passwd:
+        return pwd.struct_passwd((name, "*", uid, uid + 100, "", "/var/empty", "/usr/bin/false"))
+
+    valid = {
+        "bridge_user": account("bridge_user", 501),
+        "_hermesmail": account("_hermesmail", 502),
+        "_hermesbuild": account("_hermesbuild", 503),
+    }
+    assert installer.validate_bridge_account("bridge_user", user_lookup=valid.__getitem__) == (
+        "bridge_user"
+    )
+    for reserved in ("root", "_hermesmail", "_hermesbuild"):
+        with pytest.raises(ValueError, match="reserved"):
+            installer.validate_bridge_account(reserved, user_lookup=valid.__getitem__)
+    with pytest.raises(ValueError, match="already exist"):
+        installer.validate_bridge_account("missing", user_lookup=valid.__getitem__)
+    for invalid_bridge in (
+        account("bridge_user", 0),
+        account("bridge_user", valid["_hermesmail"].pw_uid),
+        account("bridge_user", valid["_hermesbuild"].pw_uid),
+    ):
+        accounts = {**valid, "bridge_user": invalid_bridge}
+        with pytest.raises(ValueError, match=r"nonroot|distinct"):
+            installer.validate_bridge_account("bridge_user", user_lookup=accounts.__getitem__)
 
 
 def test_installer_requires_exact_placeholder_count() -> None:
@@ -444,7 +475,7 @@ def test_final_path_validation_failure_restores_existing_files(tmp_path: Path) -
     or Path("/usr/local/libexec").exists(),
     reason="requires the pre-install macOS system-Python state",
 )
-def test_macos_system_python_dry_run_plans_missing_libexec() -> None:
+def test_macos_system_python_dry_run_rejects_missing_accounts() -> None:
     result = subprocess.run(
         [
             "/usr/bin/python3",
@@ -458,7 +489,5 @@ def test_macos_system_python_dry_run_plans_missing_libexec() -> None:
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
         text=True,
     )
-    assert result.returncode == 0, result.stderr
-    assert result.stderr == ""
-    assert "create /usr/local/libexec root:wheel 0755" in result.stdout
-    assert "install /usr/local/libexec/hermes-email-agent root:wheel 0755" in result.stdout
+    assert result.returncode == 1
+    assert "accounts must already exist" in result.stderr

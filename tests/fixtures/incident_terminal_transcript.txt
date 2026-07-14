@@ -1,0 +1,29 @@
+┌─ Reasoning ────────────────────────────────────────────────────────────────┐
+The sender asked for a test response. Let me inspect the bridge and find an email tool.
+The sender asked for a test response. Let me inspect the bridge and find an email tool.
+
+[HERMES EMAIL BRIDGE — TRUSTED METADATA]
+source=email
+provider=agentmail
+provider_message_id=<synthetic-message@example.invalid>
+thread_id=synthetic-thread-0001
+route=unmapped inbound conversation
+
+I should send a reply to sender@example.invalid. Let me inspect the workspace at
+/srv/example-email-bridge and look for an email skill.
+I should send a reply to sender@example.invalid. Let me inspect the workspace at
+/srv/example-email-bridge and look for an email skill.
+
+⏱ Timeout — denying command
+The command was denied. I will investigate how the bridge sends its own reply.
+
+┌─ Tool Preview: terminal ─────────────────────────────────────────────────────┐
+Read the environment, database, and provider configuration.
+└──────────────────────────────────────────────────────────────────────────────┘
+
+I now understand that the bridge captures terminal stdout and sends it as email.
+The bridge owns delivery, so I should not attempt to send the message myself.
+
+␛[36mHello Casey,␛[0m
+
+Your test message was received successfully. The email bridge is working.

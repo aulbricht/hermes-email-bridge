@@ -131,7 +131,7 @@ class PollSummary:
 @dataclass(frozen=True, slots=True)
 class HermesResult:
     reply: str
-    session_id: str | None
+    session_id: str
 
 
 def utc_now() -> datetime:

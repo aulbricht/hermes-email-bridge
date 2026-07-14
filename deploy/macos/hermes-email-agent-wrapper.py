@@ -8,26 +8,15 @@ import re
 import sys
 from collections.abc import Sequence
 
-HERMES = "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes"
+PYTHON = "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/python"
+ADAPTER = (
+    "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/"
+    "hermes-email-agent-adapter.py"
+)
 STATE_DIR = "/var/db/hermes-email-agent"
 WORKSPACE = "/var/db/hermes-email-agent/workspace"
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
-_BASE_ARGV = (
-    HERMES,
-    "chat",
-    "--quiet",
-    "--source",
-    "tool",
-    "--safe-mode",
-    "--toolsets",
-    "context_engine",
-    "--provider",
-    "openai-codex",
-    "--model",
-    "gpt-5.5",
-    "--max-turns",
-    "1",
-)
+_BASE_ARGV = (PYTHON, "-I", "-B", ADAPTER)
 _ENV = {
     "HOME": STATE_DIR,
     "HERMES_HOME": STATE_DIR,
@@ -63,7 +52,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         print(f"hermes-email-agent: {exc}", file=sys.stderr)
         return 64
     os.chdir(cwd)
-    os.execve(HERMES, list(argv), env)
+    os.execve(PYTHON, list(argv), env)
     return 70  # pragma: no cover - execve replaces the process
 
 
