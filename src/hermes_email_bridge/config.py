@@ -9,6 +9,8 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .mapping import normalize_email_address
+
 
 class ConfigError(ValueError):
     """Raised when bridge configuration is missing or invalid."""
@@ -21,6 +23,23 @@ def _bool(value: str, name: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ConfigError(f"{name} must be true or false")
+
+
+def _domains(value: str, name: str) -> frozenset[str]:
+    if not value.strip():
+        return frozenset()
+    items = value.split(",")
+    if any(not item.strip() for item in items):
+        raise ConfigError(f"{name} must be comma-separated email domains")
+    try:
+        return frozenset(
+            normalize_email_address(f"bridge@{item.strip().lower().removeprefix('@')}").rsplit(
+                "@", 1
+            )[1]
+            for item in items
+        )
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be comma-separated email domains") from exc
 
 
 def validate_agentmail_base_url(value: str, *, allow_local_http: bool = False) -> str:
@@ -60,6 +79,7 @@ class Settings:
     db_path: Path
     send_replies: bool
     dry_run: bool
+    reply_domains: frozenset[str]
     store_raw: bool
     raw_retention_days: int
     allow_subject_resume: bool
@@ -124,6 +144,10 @@ class Settings:
             dry_run=_bool(
                 values.get("EMAIL_BRIDGE_DRY_RUN", "true"),
                 "EMAIL_BRIDGE_DRY_RUN",
+            ),
+            reply_domains=_domains(
+                values.get("EMAIL_BRIDGE_REPLY_DOMAINS", ""),
+                "EMAIL_BRIDGE_REPLY_DOMAINS",
             ),
             store_raw=_bool(
                 values.get("EMAIL_BRIDGE_STORE_RAW", "false"),

@@ -316,6 +316,15 @@ def test_settings_reject_remote_http_and_defaults_raw_storage_off() -> None:
     assert settings.allow_subject_resume is False
 
 
+def test_settings_normalize_and_validate_reply_domains() -> None:
+    settings = Settings.from_env(
+        {"EMAIL_BRIDGE_REPLY_DOMAINS": "@Example.COM,43560.com"}
+    )
+    assert settings.reply_domains == frozenset({"example.com", "43560.com"})
+    with pytest.raises(ConfigError, match="comma-separated email domains"):
+        Settings.from_env({"EMAIL_BRIDGE_REPLY_DOMAINS": "example.com,evil@example.com"})
+
+
 def test_composio_settings_require_only_key_account_and_inbox() -> None:
     settings = Settings.from_env(
         {

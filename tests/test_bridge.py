@@ -68,6 +68,34 @@ def test_dry_run_never_sends_reply() -> None:
         assert store.resolve(message).mapping is not None
 
 
+@pytest.mark.parametrize(
+    ("sender", "reply_expected"),
+    [
+        ("person@example.com", True),
+        ("person@sub.example.com", False),
+        ("person@evil-example.com", False),
+    ],
+)
+def test_reply_domain_gate_requires_an_exact_domain(sender: str, reply_expected: bool) -> None:
+    message = replace(_message(), from_email=sender)
+    provider = FakeProvider([message])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", sender)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+            reply_domains=frozenset({"example.com"}),
+        )
+
+        assert service.handle(message) == "processed"
+        assert runner.calls == 1
+        assert bool(provider.replies) is reply_expected
+
+
 def test_unauthenticated_message_never_invokes_hermes_or_changes_mapping() -> None:
     authenticated = _message()
     message = replace(
