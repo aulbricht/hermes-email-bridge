@@ -7,14 +7,22 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from hermes_email_bridge.models import NormalizedEmail, SenderAuthentication
+from hermes_email_bridge.providers.fake import FakeProvider
+from hermes_email_bridge.runner import SubprocessHermesRunner
+from hermes_email_bridge.service import BridgeService
+from hermes_email_bridge.store import MappingStore
 
 ROOT = Path(__file__).parents[1]
 WRAPPER_PATH = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
@@ -22,7 +30,6 @@ ADAPTER_PATH = ROOT / "deploy/macos/hermes-email-agent-adapter.py"
 PROBE_PATH = ROOT / "deploy/macos/verify-hermes-email-agent.py"
 BOUNDARY_HELPER_PATH = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
 RUNTIME_PATH = ROOT / "deploy/macos/install-hermes-email-runtime.py"
-LINUX_BOUNDARY_HELPER_PATH = ROOT / "deploy/linux/hermes-email-boundary-verify.py"
 
 
 def _load_wrapper() -> Any:
@@ -53,16 +60,6 @@ def _load_runtime() -> Any:
 def _load_boundary_helper() -> Any:
     spec = importlib.util.spec_from_file_location(
         "hermes_email_boundary_helper", BOUNDARY_HELPER_PATH
-    )
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_linux_boundary_helper() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "hermes_email_linux_boundary_helper", LINUX_BOUNDARY_HELPER_PATH
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -190,17 +187,40 @@ os.write(2, b"IMPORT STDERR\\n")
 class Agent:
     def __init__(self, session):
         self.session_id = session
+        self.model = "gpt-5.5"
+        self.provider = "openai-codex"
     def run_conversation(self, **kwargs):
         incident = Path(os.environ["INCIDENT_FIXTURE"]).read_text().replace("\u241b", "\x1b")
         os.write(1, incident.encode())
         os.write(2, b"TIMEOUT AND SECRET-CANARY\\n")
         result = {"final_response":"Short intended reply.","session_id":self.session_id,
-                  "completed":True,"failed":False,"partial":False,"interrupted":False}
+                  "completed":True,"failed":False,"partial":False,"interrupted":False,
+                  "turn_exit_reason":"text_response(finish_reason=stop)",
+                  "response_transformed":False,"response_previewed":False,
+                  "model":self.model,"provider":self.provider}
         mode = os.environ.get("FAKE_RESULT_MODE")
         if mode in {"failed", "partial", "interrupted"}: result[mode] = True
         if mode == "incomplete": result["completed"] = False
         if mode == "cleanup": result["cleanup_errors"] = ["SECRET-CANARY"]
         if mode == "wrong-session": result["session_id"] = "different_session"
+        if mode == "agent-session": self.session_id = "different_session"
+        if mode in {"partial_stream_recovery", "fallback_prior_turn_content"}:
+            result["turn_exit_reason"] = mode
+        if mode == "missing-exit": result.pop("turn_exit_reason")
+        if mode == "unknown-exit": result["turn_exit_reason"] = "unknown"
+        if mode == "length-exit":
+            result["turn_exit_reason"] = "text_response(finish_reason=length)"
+        if mode == "content-filter-exit":
+            result["turn_exit_reason"] = "text_response(finish_reason=content_filter)"
+        if mode == "budget-exit": result["turn_exit_reason"] = "budget_exhausted"
+        if mode == "timeout-exit": result["turn_exit_reason"] = "max_iterations_reached(1/1)"
+        if mode == "transformed": result["response_transformed"] = True
+        if mode == "previewed": result["response_previewed"] = True
+        if mode == "pending-steer": result["pending_steer"] = "benign-looking follow-up"
+        if mode == "result-model": result["model"] = "different-model"
+        if mode == "agent-model": self.model = "different-model"
+        if mode == "result-provider": result["provider"] = "different-provider"
+        if mode == "agent-provider": self.provider = "different-provider"
         return result
 class HermesCLI:
     def __init__(self, **kwargs):
@@ -269,11 +289,62 @@ def _finalize_single_query(cli):
         "incomplete",
         "cleanup",
         "wrong-session",
+        "agent-session",
         "finalize",
+        "partial_stream_recovery",
+        "fallback_prior_turn_content",
+        "missing-exit",
+        "unknown-exit",
+        "length-exit",
+        "content-filter-exit",
+        "budget-exit",
+        "timeout-exit",
+        "transformed",
+        "previewed",
+        "pending-steer",
+        "result-model",
+        "agent-model",
+        "result-provider",
+        "agent-provider",
     ):
         rejected = run(["--query", "new email"], mode)
         assert rejected.returncode == 1
         assert rejected.stdout == rejected.stderr == ""
+
+    incident_fixture = str(ROOT / "tests/fixtures/incident_terminal_transcript.txt")
+    e2e_bootstrap = (
+        "import importlib.metadata,os,runpy,sys;"
+        "importlib.metadata.version=lambda name:'0.18.2';"
+        f"os.environ['INCIDENT_FIXTURE']={incident_fixture!r};"
+        "os.environ['FAKE_RESULT_MODE']='partial_stream_recovery';"
+        f"sys.path.insert(0,{str(tmp_path)!r});"
+        f"m=runpy.run_path({str(ADAPTER_PATH)!r});"
+        "raise SystemExit(m['main'](sys.argv[1:]))"
+    )
+    command = shlex.join([sys.executable, "-c", e2e_bootstrap])
+    message = NormalizedEmail(
+        provider="fake",
+        provider_message_id="provenance-failure",
+        from_email="sender@example.invalid",
+        to_email="bridge@example.invalid",
+        subject="Provenance failure",
+        text_body="Do not deliver fallback content",
+        received_at=datetime.now(UTC),
+        sender_authentication=SenderAuthentication.AUTHENTICATED,
+    )
+    provider = FakeProvider([message])
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=SubprocessHermesRunner(command),
+            send_replies=True,
+            dry_run=False,
+        )
+        assert service.handle(message) == "processed"
+        assert provider.replies == []
+        assert store.list_mappings() == []
 
 
 def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
@@ -560,102 +631,6 @@ def test_macos_account_invariants_fail_closed(failure: str) -> None:
     helper = _load_boundary_helper()
     with pytest.raises(ValueError):
         helper.validate_accounts("bridge_user", **_mac_account_inputs(helper, failure))
-
-
-def _linux_account_inputs(helper: Any, failure: str | None = None) -> dict[str, Any]:
-    def user(name: str, uid: int, gid: int, home: str, shell: str) -> pwd.struct_passwd:
-        return pwd.struct_passwd((name, "*", uid, gid, "", home, shell))
-
-    bridge = user(
-        "hermes-email-bridge",
-        501,
-        601,
-        "/var/lib/hermes-email-bridge",
-        "/usr/sbin/nologin",
-    )
-    inference = user("_hermesmail", 502, 602, "/var/lib/hermes-email-agent", "/usr/sbin/nologin")
-    if failure == "same_uid":
-        inference = user(
-            "_hermesmail",
-            bridge.pw_uid,
-            602,
-            "/var/lib/hermes-email-agent",
-            "/usr/sbin/nologin",
-        )
-    elif failure == "wrong_home":
-        inference = user("_hermesmail", 502, 602, "/tmp", "/usr/sbin/nologin")
-    elif failure == "wrong_shell":
-        inference = user("_hermesmail", 502, 602, "/var/lib/hermes-email-agent", "/bin/bash")
-    elif failure == "wrong_group":
-        inference = user(
-            "_hermesmail", 502, 604, "/var/lib/hermes-email-agent", "/usr/sbin/nologin"
-        )
-    elif failure == "privileged":
-        inference = user("_hermesmail", 502, 0, "/var/lib/hermes-email-agent", "/usr/sbin/nologin")
-    accounts = {"hermes-email-bridge": bridge, "_hermesmail": inference}
-    group_items = [
-        helper.grp.struct_group(("root", "*", 0, [])),
-        helper.grp.struct_group(("hermes-email-bridge", "*", bridge.pw_gid, [])),
-        helper.grp.struct_group(("_hermesmail", "*", inference.pw_gid, [])),
-    ]
-    if failure == "supplementary":
-        group_items.append(helper.grp.struct_group(("extra", "*", 700, ["_hermesmail"])))
-    elif failure == "shared_bridge_group_member":
-        group_items[1] = helper.grp.struct_group(("hermes-email-bridge", "*", 601, ["other_user"]))
-    elif failure == "shared_inference_group_member":
-        group_items[2] = helper.grp.struct_group(("_hermesmail", "*", 602, ["other_user"]))
-    by_name = {group.gr_name: group for group in group_items}
-    by_gid = {group.gr_gid: group for group in group_items}
-    if failure == "wrong_group":
-        by_gid[inference.pw_gid] = helper.grp.struct_group(("other", "*", 604, []))
-    return {
-        "user_lookup": accounts.__getitem__,
-        "users": lambda: list(accounts.values()),
-        "group_lookup": by_name.__getitem__,
-        "gid_lookup": by_gid.__getitem__,
-        "groups": lambda: group_items,
-    }
-
-
-def test_linux_account_invariants_accept_only_valid_dedicated_identities() -> None:
-    helper = _load_linux_boundary_helper()
-    evidence = helper.validate_accounts("hermes-email-bridge", **_linux_account_inputs(helper))
-    assert evidence == {
-        "bridge_uid": 501,
-        "inference_uid": 502,
-        "inference_user": "_hermesmail",
-    }
-    for reserved in ("root", "_hermesmail"):
-        with pytest.raises(ValueError, match="name"):
-            helper.validate_accounts(reserved, **_linux_account_inputs(helper))
-    missing = _linux_account_inputs(helper)
-    missing["user_lookup"] = {}.__getitem__
-    with pytest.raises(ValueError, match="missing"):
-        helper.validate_accounts("hermes-email-bridge", **missing)
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "same_uid",
-        "wrong_home",
-        "wrong_shell",
-        "wrong_group",
-        "privileged",
-        "supplementary",
-    ],
-)
-def test_linux_account_invariants_fail_closed(failure: str) -> None:
-    helper = _load_linux_boundary_helper()
-    with pytest.raises(ValueError):
-        helper.validate_accounts("hermes-email-bridge", **_linux_account_inputs(helper, failure))
-
-
-@pytest.mark.parametrize("failure", ["shared_bridge_group_member", "shared_inference_group_member"])
-def test_linux_shared_group_member_fails_closed(failure: str) -> None:
-    helper = _load_linux_boundary_helper()
-    with pytest.raises(ValueError, match="primary group"):
-        helper.validate_accounts("hermes-email-bridge", **_linux_account_inputs(helper, failure))
 
 
 def test_privileged_helper_rejects_args_and_broadened_policy(

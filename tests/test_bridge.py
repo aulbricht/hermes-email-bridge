@@ -459,6 +459,38 @@ def test_protocol_failure_is_redacted_processed_once_and_never_delivered(
         assert "provider_message_id" not in record.__dict__
 
 
+def test_oversized_json_integer_is_redacted_processed_once_and_never_delivered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    huge_integer = "9" * 5000
+    raw = (
+        f'{{"protocol":{huge_integer},"reply":"must not send","session_id":"session_123"}}\n'
+    ).encode()
+    with pytest.raises(HermesProtocolError) as rejected:
+        parse_hermes_protocol(raw, b"", 0)
+    assert rejected.value.code == "malformed_json"
+
+    message = _message()
+    provider = FakeProvider([message])
+    script = f"import os;os.write(1,{raw!r})"
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=SubprocessHermesRunner(shlex.join([sys.executable, "-c", script])),
+            send_replies=True,
+            dry_run=False,
+        )
+        with caplog.at_level(logging.WARNING):
+            assert service.handle(message) == "processed"
+        assert service.handle(message) == "skipped"
+        assert provider.replies == []
+        assert store.list_mappings() == []
+        assert huge_integer[:100] not in caplog.text
+        assert caplog.records[-1].__dict__["reason"] == "malformed_json"
+
+
 def test_resumed_session_may_rotate_and_preserves_threaded_reply() -> None:
     message = _message()
     provider = FakeProvider([message])

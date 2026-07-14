@@ -18,6 +18,7 @@ PROVIDER = "openai-codex"
 TOOLSETS = ["context_engine"]
 MAX_TURNS = 1
 MAX_PROTOCOL_BYTES = 256 * 1024
+NORMAL_TURN_EXIT_REASON = "text_response(finish_reason=stop)"
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 _FORBIDDEN_MARKERS = (
     "[HERMES EMAIL BRIDGE",
@@ -121,6 +122,14 @@ def _run_hermes(query: str, resume: str | None) -> bytes | None:
             or result.get("partial") is not False
             or result.get("interrupted") is not False
             or result.get("cleanup_errors") not in (None, [])
+            or result.get("turn_exit_reason") != NORMAL_TURN_EXIT_REASON
+            or result.get("response_transformed") is not False
+            or result.get("response_previewed") is not False
+            or "pending_steer" in result
+            or result.get("model") != MODEL
+            or getattr(agent, "model", None) != MODEL
+            or result.get("provider") != PROVIDER
+            or getattr(agent, "provider", None) != PROVIDER
             or getattr(agent, "session_id", None) != session_id
         ):
             return None

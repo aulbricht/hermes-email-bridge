@@ -88,6 +88,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
         'TOOLSETS = ["context_engine"]',
         'PROVIDER = "openai-codex"',
         'MODEL = "gpt-5.5"',
+        'NORMAL_TURN_EXIT_REASON = "text_response(finish_reason=stop)"',
         "os.dup2(devnull, 1)",
         "_finalize_single_query",
     ):
@@ -104,6 +105,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "PROVENANCE_FILE" in fetcher
     runtime_installer = runtime_installer_path.read_text()
     assert "get_tool_definitions" in runtime_installer
+    assert "AIAgent.run_conversation" in runtime_installer
     assert 'enabled_toolsets=["context_engine"]' in runtime_installer
     assert "ADAPTER_SHA256" in runtime_installer
     assert '"adapter_protocol": "hermes-email-bridge/1"' in runtime_installer
@@ -128,27 +130,6 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert plist["Umask"] == 0o77
     assert plist["WorkingDirectory"] == "__WORKSPACE__"
     assert "HERMES_HOME" not in plist["EnvironmentVariables"]
-
-
-def test_linux_systemd_sudo_and_wrapper_assets_are_fail_closed() -> None:
-    directory = ROOT / "deploy/linux"
-    wrapper = (directory / "hermes-email-agent-wrapper.py").read_text()
-    helper = (directory / "hermes-email-boundary-verify.py").read_text()
-    sudoers = (directory / "hermes-email-agent.sudoers").read_text()
-    unit = (directory / "hermes-email-bridge.service").read_text()
-    assert "/opt/hermes-email-agent/runtime/venv/bin/python" in wrapper
-    assert '"-I"' in wrapper and '"-B"' in wrapper
-    assert "hermes-email-agent-adapter.py" in wrapper
-    assert "ADAPTER_SHA256" in helper and "WRAPPER_SHA256" in helper
-    assert sudoers.count("__BRIDGE_USER__") == 3
-    assert "(_hermesmail) NOPASSWD: /usr/local/libexec/hermes-email-agent" in sudoers
-    assert "ExecStartPre=/usr/bin/sudo -n -H -u root" in unit
-    assert "ProtectSystem=strict" in unit
-    assert "UMask=0077" in unit
-    readme = (ROOT / "README.md").read_text()
-    assert "deploy/macos/hermes-email-agent-adapter.py" in readme
-    assert "platform-neutral shared adapter" in readme
-    assert not (directory / "hermes-email-agent-adapter.py").exists()
 
 
 def test_shipping_docs_and_assets_have_no_deployment_personalization() -> None:

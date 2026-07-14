@@ -139,7 +139,7 @@ def parse_hermes_protocol(
     malformed = False
     try:
         payload = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
-    except (json.JSONDecodeError, _DuplicateKey, RecursionError):
+    except (ValueError, RecursionError):
         malformed = True
     if malformed:
         raise HermesProtocolError("malformed_json")

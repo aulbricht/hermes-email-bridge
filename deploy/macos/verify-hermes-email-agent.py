@@ -70,6 +70,7 @@ def verify_adapter_shape(adapter: Path) -> None:
         or namespace.get("PROVIDER") != "openai-codex"
         or namespace.get("TOOLSETS") != ["context_engine"]
         or namespace.get("MAX_TURNS") != 1
+        or namespace.get("NORMAL_TURN_EXIT_REASON") != "text_response(finish_reason=stop)"
     ):
         raise ValueError("adapter does not pin the reviewed programmatic contract")
 

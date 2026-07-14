@@ -46,7 +46,7 @@ BUILD_BACKEND = "setuptools.build_meta"
 BUILD_BACKEND_VERSION = "81.0.0"
 BUILD_BACKEND_WHEEL_SHA256 = "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6"
 WRAPPER_SHA256 = "45f98b00e022a789fe168204da220e3146699c37a6368dfdf481a5f998c8985e"
-ADAPTER_SHA256 = "69bbf6825ff523b925bf753c5e1202d6a69096f73c4c6f6881a36df5233f24c2"
+ADAPTER_SHA256 = "cb7dcc90186dbbcddc69ef67b4362e0c96246dcc42414ec09f05ba677822c016"
 SUDOERS_TEMPLATE_SHA256 = "493400bf54b26c1c988b43e0c5edcbd599d9a7a6e555e8eabdd2a25d3717da55"
 BOUNDARY_HELPER_SHA256 = "4ae0a9337e0f1205c8268e82d0b5c1a4bf692ce53016fcc74b84ce1b4967f9fb"
 FETCHER = Path(__file__).with_name("fetch-hermes-email-agent.py")
@@ -98,7 +98,9 @@ from model_tools import get_tool_definitions
 definitions = get_tool_definitions(enabled_toolsets=["context_engine"], quiet_mode=True)
 assert definitions == []
 import cli
+from run_agent import AIAgent
 assert callable(cli.HermesCLI) and callable(cli._finalize_single_query)
+assert callable(AIAgent.run_conversation)
 for method in ("_claim_active_session", "_ensure_runtime_credentials",
                "_resolve_turn_agent_config", "_init_agent"):
     assert callable(getattr(cli.HermesCLI, method, None))
@@ -109,6 +111,7 @@ assert adapter_ns["MODEL"] == "gpt-5.5"
 assert adapter_ns["PROVIDER"] == "openai-codex"
 assert adapter_ns["TOOLSETS"] == ["context_engine"]
 assert adapter_ns["MAX_TURNS"] == 1
+assert adapter_ns["NORMAL_TURN_EXIT_REASON"] == "text_response(finish_reason=stop)"
 assert adapter_ns["parse_arguments"](["--query", "probe"]) == ("probe", None)
 assert adapter_ns["parse_arguments"](
     ["--resume", "probe_session", "--query", "probe"]

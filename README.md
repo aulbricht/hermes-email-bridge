@@ -114,8 +114,10 @@ HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-ema
 ```
 
 The adapter redirects operating-system file descriptors 1 and 2 to `/dev/null` before importing
-Hermes, calls the pinned Hermes 0.18.2 `HermesCLI`/`AIAgent` result API, rejects failed, partial,
-interrupted, incomplete, or cleanup-error turns, finalizes the session, then emits only the
+Hermes and calls the pinned Hermes 0.18.2 `HermesCLI`/`AIAgent` result API. It accepts only the
+exact normal `text_response(finish_reason=stop)` provenance with completed, untransformed,
+unpreviewed output; pinned result and agent model/provider/session values; no pending steer; and
+no failed, partial, interrupted, or cleanup state. It finalizes the session, then emits only the
 canonical record through a saved non-inheritable descriptor. This preserves new and resumed
 sessions, including a validated session ID rotated by Hermes compression. The email instructions
 tell Hermes to return only the user-visible body, never discuss or perform delivery, and use
@@ -556,54 +558,19 @@ environment-file path, AgentMail/Composio/bridge variables, proxy variables, `PY
 its fixed service-account environment. Same-user `0600` files alone are not an isolation
 boundary against an email-driven agent.
 
-## Linux systemd isolation
+## Linux deployment status
 
-Minimal Linux templates live in `deploy/linux`. They preserve the same live command expected by
-the bridge while using a root-owned wrapper, a root-only exact-byte boundary verifier, a narrow
-sudoers policy, `_hermesmail` as the inference identity, and a separate unprivileged bridge
-service identity. The systemd unit uses a private temporary directory, private devices, a
-read-only system filesystem except for declared state/log paths, and umask `0077`.
+Version 0.4.0 supports live email-triggered Hermes execution only through the fully attested
+macOS boundary above. Linux and same-user deployments are intentionally unsupported and fail
+closed; this repository does not ship Linux systemd, sudoers, wrapper, or verifier assets.
+The provider-neutral bridge code remains portable, but that does not provide a safe inference
+execution boundary.
 
-Before enabling the unit, create the exact dedicated identities and private, non-overlapping
-homes expected by the recurring verifier. The bridge username may be changed only if the same
-name is used for its unique primary group and every `__BRIDGE_USER__` placeholder; its home and
-shell remain fixed:
-
-```bash
-sudo /usr/sbin/groupadd --system _hermesmail
-sudo /usr/sbin/useradd --system --gid _hermesmail --home-dir /var/lib/hermes-email-agent \
-  --create-home --shell /usr/sbin/nologin _hermesmail
-sudo /usr/sbin/groupadd --system hermes-email-bridge
-sudo /usr/sbin/useradd --system --gid hermes-email-bridge \
-  --home-dir /var/lib/hermes-email-bridge --create-home \
-  --shell /usr/sbin/nologin hermes-email-bridge
-sudo /usr/bin/install -d -o _hermesmail -g _hermesmail -m 0700 /var/lib/hermes-email-agent
-sudo /usr/bin/install -d -o hermes-email-bridge -g hermes-email-bridge \
-  -m 0700 /var/lib/hermes-email-bridge
-```
-
-Neither account may have supplementary membership; both private primary groups must have empty
-explicit member lists and may not be shared with another user or be privileged. Render both systemd bridge identity placeholders as
-`hermes-email-bridge`, use `/var/lib/hermes-email-bridge` as `__STATE_DIR__`, and keep the
-environment, database, sidecars, and logs below that private bridge home. Install the frozen
-Hermes 0.18.2 venv under
-`/opt/hermes-email-agent/runtime`, then install the reviewed
-`deploy/macos/hermes-email-agent-adapter.py` source there as root:root `0755`. Despite that source
-path, this is the platform-neutral shared adapter used by both deployment templates; do not
-maintain a second Linux copy. Make the full `/opt/hermes-email-agent` tree root-owned with no
-group/other write bits. Install the Linux wrapper and verifier under `/usr/local/libexec` as
-root:root `0755`; render
-`__BRIDGE_USER__` in the sudoers template, validate it with `visudo -cf`, and install it under
-`/etc/sudoers.d/hermes-email-agent` as root:root `0440`. Replace the remaining systemd
-placeholders, keep the environment file owned by the bridge user at `0600`, and run the boundary
-verifier plus new/resume protocol canaries before `systemctl enable --now`.
-
-The bridge environment file, SQLite database and `-wal`/`-shm` sidecars, provider credentials,
-and logs must be in a bridge-private `0700` tree unreadable to `_hermesmail`. Inference OAuth and
-session state under `/var/lib/hermes-email-agent` must be `_hermesmail`-private and unreadable to
-the bridge identity. A same-user service, a user-writable wrapper/runtime, or an
-unattested equivalent is not supported for live replies; leave replies disabled until an
-equivalent OS boundary passes these checks.
+Linux support requires an equivalent complete implementation and review: recursive trusted-path
+ownership, modes, ACL and symlink checks; a pinned runtime digest and distribution/import-origin
+provenance; the exact private Hermes API seam; zero tool schemas; distinct private identities and
+state; and recurring startup plus live protocol verification. A manually copied adapter or
+root-owned wrapper is not sufficient and must not be used for live email execution.
 
 ## Release notes
 
@@ -614,7 +581,7 @@ equivalent OS boundary passes these checks.
 - Added a pinned programmatic Hermes adapter that suppresses all process/UI output and fails
   closed on incomplete or contaminated turns.
 - Made every email-triggered invocation require the exact dedicated-account sudo wrapper and
-  added recurring account/adapter attestation plus Linux systemd/sudo reference assets.
+  added recurring macOS account, runtime, and adapter attestation.
 - Added incident replay, malformed-output, resumed-session rotation, secret-canary isolation,
   redacted-log, and exact delivered-body regression tests.
 
