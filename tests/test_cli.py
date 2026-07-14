@@ -152,4 +152,4 @@ def test_version_reports_project_version(capsys: pytest.CaptureFixture[str]) -> 
     with pytest.raises(SystemExit) as stopped:
         main(["--version"])
     assert stopped.value.code == 0
-    assert capsys.readouterr().out.strip() == "0.3.0"
+    assert capsys.readouterr().out.strip() == "0.4.0"

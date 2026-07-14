@@ -44,9 +44,10 @@ BUILD_CONSTRAINT_SHA256 = "a7d4688bc5ddc6d0bd3a0ee477b8f68c6bf7d4d27345cf9e54901
 BUILD_BACKEND = "setuptools.build_meta"
 BUILD_BACKEND_VERSION = "81.0.0"
 BUILD_BACKEND_WHEEL_SHA256 = "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6"
-WRAPPER_SHA256 = "52c610e34d1156a0fa3bd60834940da56d10503d16b1d4589fe012ea6826d79c"
+WRAPPER_SHA256 = "45f98b00e022a789fe168204da220e3146699c37a6368dfdf481a5f998c8985e"
+ADAPTER_SHA256 = "69bbf6825ff523b925bf753c5e1202d6a69096f73c4c6f6881a36df5233f24c2"
 SUDOERS_TEMPLATE_SHA256 = "493400bf54b26c1c988b43e0c5edcbd599d9a7a6e555e8eabdd2a25d3717da55"
-BOUNDARY_HELPER_SHA256 = "1556cc9088f19e955b9df549e368236a523d2814e0fafb28b32826a973b04ad0"
+BOUNDARY_HELPER_SHA256 = "591d3a275f251e5cad3bf2f51000370c8b40ae99cca4bf991432882e32b90d66"
 FETCHER = Path(__file__).with_name("fetch-hermes-email-agent.py")
 PROVENANCE_FILE = ".hermes-email-agent-provenance.json"
 ATTESTATION_ASSETS = (
@@ -54,6 +55,7 @@ ATTESTATION_ASSETS = (
     "install-hermes-email-runtime.py",
     "verify-hermes-email-agent.py",
     "hermes-email-agent-wrapper.py",
+    "hermes-email-agent-adapter.py",
     "hermes-email-boundary-verify.py",
     "hermes-email-agent.sudoers",
     BUILD_CONSTRAINT,
@@ -67,10 +69,11 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 AclValidator = Callable[[Sequence[Path]], None]
 
 _RUNTIME_CODE = r"""
-import importlib.metadata, importlib.util, json, pathlib, sys
+import importlib.metadata, importlib.util, json, pathlib, runpy, sys
 venv = pathlib.Path(sys.argv[1]).resolve()
 source = pathlib.Path(sys.argv[2]).resolve()
 expected_direct = json.loads(sys.argv[3])
+adapter = pathlib.Path(sys.argv[4]).resolve()
 assert sys.version_info[:2] == (3, 11)
 site = pathlib.Path(importlib.metadata.distribution("hermes-agent").locate_file("")).resolve()
 assert site.is_relative_to(venv)
@@ -81,7 +84,7 @@ assert direct == expected_direct
 entries = {entry.name: entry.value for entry in distribution.entry_points}
 assert entries.get("hermes") == "hermes_cli.main:main"
 origins = {}
-for name in ("hermes_cli", "run_agent", "model_tools", "toolsets"):
+for name in ("cli", "hermes_cli", "run_agent", "model_tools", "toolsets"):
     spec = importlib.util.find_spec(name)
     assert spec is not None and spec.origin is not None
     origin = pathlib.Path(spec.origin).resolve()
@@ -93,7 +96,24 @@ assert toolsets.resolve_toolset("context_engine") == []
 from model_tools import get_tool_definitions
 definitions = get_tool_definitions(enabled_toolsets=["context_engine"], quiet_mode=True)
 assert definitions == []
+import cli
+assert callable(cli.HermesCLI) and callable(cli._finalize_single_query)
+for method in ("_claim_active_session", "_ensure_runtime_credentials",
+               "_resolve_turn_agent_config", "_init_agent"):
+    assert callable(getattr(cli.HermesCLI, method, None))
+adapter_ns = runpy.run_path(str(adapter))
+assert adapter_ns["PROTOCOL"] == "hermes-email-bridge/1"
+assert adapter_ns["HERMES_VERSION"] == "0.18.2"
+assert adapter_ns["MODEL"] == "gpt-5.5"
+assert adapter_ns["PROVIDER"] == "openai-codex"
+assert adapter_ns["TOOLSETS"] == ["context_engine"]
+assert adapter_ns["MAX_TURNS"] == 1
+assert adapter_ns["parse_arguments"](["--query", "probe"]) == ("probe", None)
+assert adapter_ns["parse_arguments"](
+    ["--resume", "probe_session", "--query", "probe"]
+) == ("probe", "probe_session")
 print(json.dumps({"direct_url": direct, "origins": origins, "tool_schemas": 0,
+                  "adapter_protocol": adapter_ns["PROTOCOL"],
                   "version": distribution.version}, sort_keys=True))
 """
 
@@ -590,6 +610,7 @@ def probe_runtime(
 ) -> dict[str, Any]:
     python = paths.venv / "bin/python"
     hermes = paths.venv / "bin/hermes"
+    adapter = paths.runtime_root / "hermes-email-agent-adapter.py"
     expected_shebang = "#!" + str(python)
     if hermes.is_symlink() or not hermes.is_file():
         raise ValueError("Hermes console entrypoint is missing or unsafe")
@@ -623,6 +644,7 @@ def probe_runtime(
                 json.dumps(
                     expected_direct_url(paths, active=executable_entrypoint), sort_keys=True
                 ),
+                str(adapter),
             ],
             capture_output=True,
             check=False,
@@ -636,12 +658,17 @@ def probe_runtime(
             evidence = cast(dict[str, Any], json.loads(result.stdout))
         except json.JSONDecodeError as exc:
             raise ValueError("installed Hermes probe returned malformed evidence") from exc
-        if evidence.get("tool_schemas") != 0 or evidence.get("version") != VERSION:
+        if (
+            evidence.get("tool_schemas") != 0
+            or evidence.get("version") != VERSION
+            or evidence.get("adapter_protocol") != "hermes-email-bridge/1"
+        ):
             raise ValueError("installed Hermes probe returned unexpected evidence")
         if evidence.get("direct_url") != expected_direct:
             raise ValueError("installed Hermes direct_url provenance is editable or unexpected")
         origins = evidence.get("origins")
         if not isinstance(origins, dict) or set(origins) != {
+            "cli",
             "hermes_cli",
             "run_agent",
             "model_tools",
@@ -669,36 +696,6 @@ def probe_runtime(
             or not version.stdout.startswith("Hermes Agent v0.18.2")
         ):
             raise ValueError("installed Hermes console version contract failed")
-        base = [
-            *entrypoint,
-            "chat",
-            "--quiet",
-            "--source",
-            "tool",
-            "--safe-mode",
-            "--toolsets",
-            "context_engine",
-            "--provider",
-            "openai-codex",
-            "--model",
-            "gpt-5.5",
-            "--max-turns",
-            "1",
-        ]
-        for suffix in (
-            ["--query", "probe", "--help"],
-            ["--resume", "probe_session", "--query", "probe", "--help"],
-        ):
-            parsed = runner(
-                [*base, *suffix],
-                capture_output=True,
-                check=False,
-                env=environment,
-                text=True,
-                timeout=60,
-            )
-            if parsed.returncode != 0 or parsed.stderr or "--quiet" not in parsed.stdout:
-                raise ValueError("installed Hermes console parser contract failed")
         return evidence
 
 
@@ -715,16 +712,20 @@ def expected_attestation(paths: RuntimePaths) -> dict[str, Any]:
     constraint = paths.runtime_root / BUILD_CONSTRAINT
     verify_build_inputs(paths.source, constraint)
     wrapper_hash = sha256_file(paths.runtime_root / "hermes-email-agent-wrapper.py")
+    adapter_hash = sha256_file(paths.runtime_root / "hermes-email-agent-adapter.py")
     helper_hash = sha256_file(paths.runtime_root / "hermes-email-boundary-verify.py")
     sudoers_hash = sha256_file(paths.runtime_root / "hermes-email-agent.sudoers")
     if (
         wrapper_hash != WRAPPER_SHA256
+        or adapter_hash != ADAPTER_SHA256
         or helper_hash != BOUNDARY_HELPER_SHA256
         or sudoers_hash != SUDOERS_TEMPLATE_SHA256
     ):
         raise ValueError("runtime boundary candidates do not match reviewed hashes")
     return {
         "archive_sha256": ARCHIVE_SHA256,
+        "adapter_protocol": "hermes-email-bridge/1",
+        "adapter_sha256": adapter_hash,
         "attestation_assets": {
             name: sha256_file(paths.runtime_root / name) for name in ATTESTATION_ASSETS
         },
@@ -824,6 +825,12 @@ def verify_attestation(
     )
     _safe_details(paths.venv / "bin/python", expected_uid=uid, expected_gid=gid)
     _safe_details(paths.venv / "bin/hermes", expected_uid=uid, expected_gid=gid, exact_mode=0o755)
+    _safe_details(
+        paths.runtime_root / "hermes-email-agent-adapter.py",
+        expected_uid=uid,
+        expected_gid=gid,
+        exact_mode=0o755,
+    )
     _safe_details(paths.attestation, expected_uid=uid, expected_gid=gid, exact_mode=0o644)
     acl_validator([paths.attestation])
     try:

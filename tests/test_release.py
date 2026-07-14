@@ -14,9 +14,9 @@ ROOT = Path(__file__).parents[1]
 
 def test_version_has_one_project_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert project["project"]["version"] == "0.3.0"
-    assert __version__ == "0.3.0"
-    assert '__version__ = "0.3.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
+    assert project["project"]["version"] == "0.4.0"
+    assert __version__ == "0.4.0"
+    assert '__version__ = "0.4.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
 
 
 def test_docs_and_example_config_cover_composio_allowlisting_and_start_now() -> None:
@@ -38,6 +38,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     plist_path = ROOT / "deploy/macos/com.example.hermes.email-bridge.plist"
     launcher_path = ROOT / "deploy/macos/run-email-bridge.sh"
     wrapper_path = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
+    adapter_path = ROOT / "deploy/macos/hermes-email-agent-adapter.py"
     helper_path = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
     fetcher_path = ROOT / "deploy/macos/fetch-hermes-email-agent.py"
     probe_path = ROOT / "deploy/macos/verify-hermes-email-agent.py"
@@ -49,7 +50,8 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     launcher = launcher_path.read_text()
     wrapper = wrapper_path.read_text()
     sudoers = sudoers_path.read_text()
-    combined = plist_text + launcher + wrapper + helper_path.read_text() + sudoers
+    adapter = adapter_path.read_text()
+    combined = plist_text + launcher + wrapper + adapter + helper_path.read_text() + sudoers
     assert "snowcapconsulting" not in combined
     assert "aulbricht" not in combined
     assert "/Users/" not in combined
@@ -59,6 +61,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     if os.name == "posix":
         assert launcher_path.stat().st_mode & 0o111
         assert wrapper_path.stat().st_mode & 0o111
+        assert adapter_path.stat().st_mode & 0o111
         assert helper_path.stat().st_mode & 0o111
         assert fetcher_path.stat().st_mode & 0o111
         assert probe_path.stat().st_mode & 0o111
@@ -74,13 +77,22 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     ) in sudoers
     for fixed in (
         "/var/db/hermes-email-agent/workspace",
-        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/hermes",
-        '"--safe-mode"',
-        '"context_engine"',
-        '"openai-codex"',
-        '"gpt-5.5"',
+        "/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/venv/bin/python",
+        "hermes-email-agent-adapter.py",
+        '"-I"',
+        '"-B"',
     ):
         assert fixed in wrapper
+    for fixed in (
+        'PROTOCOL = "hermes-email-bridge/1"',
+        'HERMES_VERSION = "0.18.2"',
+        'TOOLSETS = ["context_engine"]',
+        'PROVIDER = "openai-codex"',
+        'MODEL = "gpt-5.5"',
+        "os.dup2(devnull, 1)",
+        "_finalize_single_query",
+    ):
+        assert fixed in adapter
     installer = (ROOT / "deploy/macos/install-hermes-email-agent.py").read_text()
     assert 'rooted("/usr/local/libexec")' in installer
     assert 'rooted("/private/etc/sudoers.d")' in installer
@@ -94,6 +106,8 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     runtime_installer = runtime_installer_path.read_text()
     assert "get_tool_definitions" in runtime_installer
     assert 'enabled_toolsets=["context_engine"]' in runtime_installer
+    assert "ADAPTER_SHA256" in runtime_installer
+    assert '"adapter_protocol": "hermes-email-bridge/1"' in runtime_installer
     assert "--no-editable" in runtime_installer
     assert "LOCK_SHA256" in runtime_installer
     assert "runtime-attestation.json" in runtime_installer
@@ -115,6 +129,27 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert plist["Umask"] == 0o77
     assert plist["WorkingDirectory"] == "__WORKSPACE__"
     assert "HERMES_HOME" not in plist["EnvironmentVariables"]
+
+
+def test_linux_systemd_sudo_and_wrapper_assets_are_fail_closed() -> None:
+    directory = ROOT / "deploy/linux"
+    wrapper = (directory / "hermes-email-agent-wrapper.py").read_text()
+    helper = (directory / "hermes-email-boundary-verify.py").read_text()
+    sudoers = (directory / "hermes-email-agent.sudoers").read_text()
+    unit = (directory / "hermes-email-bridge.service").read_text()
+    assert "/opt/hermes-email-agent/runtime/venv/bin/python" in wrapper
+    assert '"-I"' in wrapper and '"-B"' in wrapper
+    assert "hermes-email-agent-adapter.py" in wrapper
+    assert "ADAPTER_SHA256" in helper and "WRAPPER_SHA256" in helper
+    assert sudoers.count("__BRIDGE_USER__") == 3
+    assert "(_hermesmail) NOPASSWD: /usr/local/libexec/hermes-email-agent" in sudoers
+    assert "ExecStartPre=/usr/bin/sudo -n -H -u root" in unit
+    assert "ProtectSystem=strict" in unit
+    assert "UMask=0077" in unit
+    readme = (ROOT / "README.md").read_text()
+    assert "deploy/macos/hermes-email-agent-adapter.py" in readme
+    assert "platform-neutral shared adapter" in readme
+    assert not (directory / "hermes-email-agent-adapter.py").exists()
 
 
 def test_shipping_docs_and_assets_have_no_deployment_personalization() -> None:

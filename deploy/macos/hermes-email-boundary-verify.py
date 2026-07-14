@@ -15,7 +15,7 @@ from pathlib import Path
 
 WRAPPER = Path("/usr/local/libexec/hermes-email-agent")
 SUDOERS = Path("/private/etc/sudoers.d/hermes-email-agent")
-WRAPPER_SHA256 = "52c610e34d1156a0fa3bd60834940da56d10503d16b1d4589fe012ea6826d79c"
+WRAPPER_SHA256 = "45f98b00e022a789fe168204da220e3146699c37a6368dfdf481a5f998c8985e"
 _USER = r"[A-Za-z_][A-Za-z0-9_-]{0,31}"
 _POLICY = re.compile(
     rf"Defaults:(?P<user>{_USER}) env_reset, secure_path=/usr/bin:/bin:/usr/sbin:/sbin\n"

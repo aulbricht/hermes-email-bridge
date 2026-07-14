@@ -5,7 +5,11 @@ from typing import Any
 
 import pytest
 
-from hermes_email_bridge.config import ConfigError, Settings
+from hermes_email_bridge.config import (
+    ISOLATED_HERMES_COMMAND,
+    ConfigError,
+    Settings,
+)
 from hermes_email_bridge.models import SenderAuthentication
 from hermes_email_bridge.providers.agentmail import (
     AgentMailError,
@@ -316,10 +320,28 @@ def test_settings_reject_remote_http_and_defaults_raw_storage_off() -> None:
     assert settings.allow_subject_resume is False
 
 
+def test_live_replies_require_exact_isolated_protocol_wrapper() -> None:
+    live = {
+        "EMAIL_BRIDGE_SEND_REPLIES": "true",
+        "EMAIL_BRIDGE_DRY_RUN": "false",
+    }
+    with pytest.raises(ConfigError, match="exact isolated Hermes protocol wrapper"):
+        Settings.from_env(live)
+    with pytest.raises(ConfigError, match="exact isolated Hermes protocol wrapper"):
+        Settings.from_env({**live, "HERMES_COMMAND": "hermes chat --quiet --source tool"})
+    settings = Settings.from_env({**live, "HERMES_COMMAND": ISOLATED_HERMES_COMMAND})
+    assert settings.hermes_command == ISOLATED_HERMES_COMMAND
+
+
+def test_legacy_command_remains_available_only_when_delivery_cannot_happen() -> None:
+    assert Settings.from_env({}).hermes_command.startswith("hermes chat")
+    assert Settings.from_env(
+        {"EMAIL_BRIDGE_SEND_REPLIES": "true", "EMAIL_BRIDGE_DRY_RUN": "true"}
+    ).dry_run
+
+
 def test_settings_normalize_and_validate_reply_domains() -> None:
-    settings = Settings.from_env(
-        {"EMAIL_BRIDGE_REPLY_DOMAINS": "@Example.COM,43560.com"}
-    )
+    settings = Settings.from_env({"EMAIL_BRIDGE_REPLY_DOMAINS": "@Example.COM,43560.com"})
     assert settings.reply_domains == frozenset({"example.com", "43560.com"})
     with pytest.raises(ConfigError, match="comma-separated email domains"):
         Settings.from_env({"EMAIL_BRIDGE_REPLY_DOMAINS": "example.com,evil@example.com"})

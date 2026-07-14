@@ -279,6 +279,29 @@ class MappingStore:
                 raise KeyError(mapping_id)
             return self._get_mapping(mapping_id)
 
+    def update_mapping_session(
+        self,
+        mapping_id: int,
+        *,
+        expected_session: str,
+        new_session: str,
+    ) -> ConversationMapping:
+        """Atomically accept a valid session rotation returned by Hermes."""
+
+        if not new_session.strip():
+            raise ValueError("new_session cannot be empty")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE mappings SET hermes_session = ?, updated_at = ?
+                WHERE id = ? AND hermes_session = ?
+                """,
+                (new_session, utc_now().isoformat(), mapping_id, expected_session),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("mapping session changed concurrently")
+            return self._get_mapping(mapping_id)
+
     def add_message_link(self, provider: str, message_id: str, mapping_id: int) -> None:
         with self._lock, self._connection:
             self._link_message(provider, message_id, mapping_id)

@@ -54,7 +54,7 @@ def _opener() -> urllib.request.OpenerDirector:
 def download(destination: Path, *, timeout: float = 30.0) -> None:
     request = urllib.request.Request(
         ARCHIVE_URL,
-        headers={"User-Agent": "hermes-email-bridge-source-fetch/0.3.0"},
+        headers={"User-Agent": "hermes-email-bridge-source-fetch/0.4.0"},
         method="GET",
     )
     with _opener().open(request, timeout=timeout) as response:
