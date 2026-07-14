@@ -67,6 +67,7 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_DB_PATH` | `~/.local/state/hermes-email-bridge/bridge.db` | SQLite database |
 | `EMAIL_BRIDGE_SEND_REPLIES` | `false` | Allow outbound replies |
 | `EMAIL_BRIDGE_DRY_RUN` | `true` | Skip provider send even when replies are enabled |
+| `EMAIL_BRIDGE_REPLY_DOMAINS` | empty | Optional comma-separated exact domains allowed to receive replies |
 | `AGENTMAIL_BASE_URL` | `https://api.agentmail.to/v0` | HTTPS AgentMail API base URL |
 | `AGENTMAIL_ALLOW_INSECURE_LOCAL_HTTP` | `false` | Permit HTTP only to `localhost` or a loopback IP for local tests |
 | `EMAIL_BRIDGE_COMPOSIO_API_KEY` | required for Composio | Bridge-only project key scoped to Proxy Execute |
@@ -157,7 +158,11 @@ allowlist checks still apply before Hermes invocation, mapping changes, or repli
 ```bash
 export EMAIL_BRIDGE_SEND_REPLIES=true
 export EMAIL_BRIDGE_DRY_RUN=false
+export EMAIL_BRIDGE_REPLY_DOMAINS=example.com,example.org
 ```
+
+The domain gate restricts outbound replies only. It does not authorize a sender; every
+sender must still pass authentication and the exact-address allowlist.
 
 AgentMail's reply endpoint preserves the original email thread, including `In-Reply-To` and `References` semantics.
 

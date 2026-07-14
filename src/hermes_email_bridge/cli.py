@@ -96,6 +96,7 @@ def _service(
         ),
         send_replies=settings.send_replies,
         dry_run=settings.dry_run,
+        reply_domains=settings.reply_domains,
         store_raw=settings.store_raw,
         raw_retention_days=settings.raw_retention_days,
         allow_subject_resume=settings.allow_subject_resume,

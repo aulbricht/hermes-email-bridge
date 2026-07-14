@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from .mapping import normalize_email_address
 from .models import NormalizedEmail, PollSummary, ResolutionStatus, SenderAuthentication
 from .providers.base import EmailProvider
 from .runner import HermesRunner
@@ -21,6 +22,7 @@ class BridgeService:
         runner: HermesRunner,
         send_replies: bool = False,
         dry_run: bool = True,
+        reply_domains: frozenset[str] = frozenset(),
         store_raw: bool = False,
         raw_retention_days: int = 30,
         allow_subject_resume: bool = False,
@@ -30,6 +32,7 @@ class BridgeService:
         self.runner = runner
         self.send_replies = send_replies
         self.dry_run = dry_run
+        self.reply_domains = reply_domains
         self.store_raw = store_raw
         self.raw_retention_days = raw_retention_days
         self.allow_subject_resume = allow_subject_resume
@@ -143,6 +146,12 @@ class BridgeService:
         elif self.dry_run:
             outcome = "reply_dry_run"
             self._log_reply_skipped("dry_run", context)
+        elif (
+            self.reply_domains
+            and self._email_domain(message.from_email) not in self.reply_domains
+        ):
+            outcome = "reply_domain_denied"
+            self._log_reply_skipped("sender_domain", context)
         elif not result.reply:
             outcome = "reply_empty"
             self._log_reply_skipped("empty_hermes_response", context)
@@ -173,6 +182,13 @@ class BridgeService:
             raw_retention_days=self.raw_retention_days,
         )
         return "processed"
+
+    @staticmethod
+    def _email_domain(address: str) -> str | None:
+        try:
+            return normalize_email_address(address).rsplit("@", 1)[1]
+        except ValueError:
+            return None
 
     @staticmethod
     def _log_reply_skipped(reason: str, context: dict[str, object]) -> None:

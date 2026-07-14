@@ -58,7 +58,8 @@ class ComposioAgentMailProvider(AgentMailProvider):
         for name, raw_value in (params or {}).items():
             values = raw_value if isinstance(raw_value, (list, tuple)) else [raw_value]
             parameters.extend(
-                {"name": str(name), "value": str(value), "in": "query"} for value in values
+                {"name": str(name), "value": str(value), "in": "query", "type": "query"}
+                for value in values
             )
         proxy_body: dict[str, Any] = {
             "endpoint": f"/v0{path}",

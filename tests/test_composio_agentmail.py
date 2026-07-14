@@ -86,9 +86,9 @@ def test_proxy_wraps_fixed_agentmail_path_and_multivalue_query() -> None:
         "endpoint": "/v0/inboxes/bridge%40agentmail.test/messages",
         "method": "GET",
         "parameters": [
-            {"in": "query", "name": "labels", "value": "sent"},
-            {"in": "query", "name": "labels", "value": "received"},
-            {"in": "query", "name": "limit", "value": "100"},
+            {"in": "query", "name": "labels", "type": "query", "value": "sent"},
+            {"in": "query", "name": "labels", "type": "query", "value": "received"},
+            {"in": "query", "name": "limit", "type": "query", "value": "100"},
         ],
     }
 
