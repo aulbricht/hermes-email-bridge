@@ -88,6 +88,7 @@ def verify_fixed_boundary(
     candidate_directory: Optional[Path] = None,
     enforce_invoker: bool = True,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    account_validator: Optional[Callable[[str], dict[str, object]]] = None,
 ) -> dict[str, str]:
     candidates = Path(__file__).parent if candidate_directory is None else candidate_directory
     candidate_wrapper = candidates / "hermes-email-agent-wrapper.py"
@@ -140,6 +141,7 @@ def verify_fixed_boundary(
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("privileged boundary attestation is malformed") from exc
     if not isinstance(evidence, dict) or set(evidence) != {
+        "accounts",
         "bridge_user",
         "sudoers_sha256",
         "wrapper_sha256",
@@ -150,7 +152,16 @@ def verify_fixed_boundary(
         raise ValueError("privileged boundary bridge user is malformed")
     if template.count(_PLACEHOLDER) != 3:
         raise ValueError("attested sudoers template is malformed")
+    if account_validator is None:
+        helper_namespace = runpy.run_path(str(candidate_helper))
+        validator = helper_namespace.get("validate_accounts")
+        if not callable(validator):
+            raise ValueError("attested boundary helper lacks account validation")
+        account_evidence = validator(bridge_user)
+    else:
+        account_evidence = account_validator(bridge_user)
     expected = {
+        "accounts": account_evidence,
         "bridge_user": bridge_user,
         "sudoers_sha256": _sha256(template.replace(_PLACEHOLDER, bridge_user).encode()),
         "wrapper_sha256": runtime.WRAPPER_SHA256,

@@ -22,6 +22,7 @@ ADAPTER_PATH = ROOT / "deploy/macos/hermes-email-agent-adapter.py"
 PROBE_PATH = ROOT / "deploy/macos/verify-hermes-email-agent.py"
 BOUNDARY_HELPER_PATH = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
 RUNTIME_PATH = ROOT / "deploy/macos/install-hermes-email-runtime.py"
+LINUX_BOUNDARY_HELPER_PATH = ROOT / "deploy/linux/hermes-email-boundary-verify.py"
 
 
 def _load_wrapper() -> Any:
@@ -57,6 +58,25 @@ def _load_boundary_helper() -> Any:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_linux_boundary_helper() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "hermes_email_linux_boundary_helper", LINUX_BOUNDARY_HELPER_PATH
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _synthetic_account_evidence(_bridge_user: str) -> dict[str, object]:
+    return {
+        "bridge_uid": 501,
+        "build_uid": 503,
+        "inference_uid": 502,
+        "inference_user": "_hermesmail",
+    }
 
 
 def test_wrapper_accepts_only_runner_argument_shapes() -> None:
@@ -334,6 +354,7 @@ def _boundary_fixture(tmp_path: Path) -> tuple[Any, Any, Path, Path, Path, Path,
         if policy != rendered:
             return subprocess.CompletedProcess(argv, 1, "", "boundary failure")
         evidence = {
+            "accounts": _synthetic_account_evidence(configured_user),
             "bridge_user": configured_user,
             "sudoers_sha256": hashlib.sha256(rendered.encode()).hexdigest(),
             "wrapper_sha256": runtime.WRAPPER_SHA256,
@@ -358,10 +379,35 @@ def test_runtime_verifier_requires_exact_attested_wrapper_and_sudoers_bytes(
         helper=helper,
         candidate_directory=candidates,
         runner=runner,
+        account_validator=_synthetic_account_evidence,
     )
     assert evidence["bridge_user"] == pwd.getpwuid(uid).pw_name
     assert len(evidence["wrapper_sha256"]) == 64
     assert len(evidence["sudoers_sha256"]) == 64
+
+
+def test_runtime_verifier_rejects_mismatched_account_evidence(tmp_path: Path) -> None:
+    probe, runtime, candidates, wrapper, helper, _sudoers, runner = _boundary_fixture(tmp_path)
+
+    def tampered(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        result = runner(argv, **kwargs)
+        evidence = json.loads(result.stdout)
+        evidence["accounts"]["inference_uid"] = 999
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n", ""
+        )
+
+    with pytest.raises(ValueError, match="does not match"):
+        probe.verify_fixed_boundary(
+            runtime,
+            uid=os.getuid(),
+            gid=os.getgid(),
+            wrapper=wrapper,
+            helper=helper,
+            candidate_directory=candidates,
+            runner=tampered,
+            account_validator=_synthetic_account_evidence,
+        )
 
 
 @pytest.mark.parametrize(
@@ -414,7 +460,202 @@ def test_runtime_verifier_rejects_tampered_boundary_bytes(
             helper=helper,
             candidate_directory=candidates,
             runner=runner,
+            account_validator=_synthetic_account_evidence,
         )
+
+
+def _mac_account_inputs(helper: Any, failure: str | None = None) -> dict[str, Any]:
+    def user(name: str, uid: int, gid: int, home: str, shell: str) -> pwd.struct_passwd:
+        return pwd.struct_passwd((name, "*", uid, gid, "", home, shell))
+
+    bridge = user("bridge_user", 501, 601, "/Users/bridge_user", "/bin/zsh")
+    inference = user("_hermesmail", 502, 602, "/var/db/hermes-email-agent", "/usr/bin/false")
+    builder = user("_hermesbuild", 503, 603, "/var/empty", "/usr/bin/false")
+    if failure == "same_uid":
+        inference = user(
+            "_hermesmail", bridge.pw_uid, 602, "/var/db/hermes-email-agent", "/usr/bin/false"
+        )
+    elif failure == "wrong_home":
+        inference = user("_hermesmail", 502, 602, "/tmp", "/usr/bin/false")
+    elif failure == "wrong_shell":
+        inference = user("_hermesmail", 502, 602, "/var/db/hermes-email-agent", "/bin/zsh")
+    elif failure == "wrong_group":
+        inference = user("_hermesmail", 502, 604, "/var/db/hermes-email-agent", "/usr/bin/false")
+    elif failure == "admin":
+        inference = user("_hermesmail", 502, 80, "/var/db/hermes-email-agent", "/usr/bin/false")
+    elif failure == "staff":
+        inference = user("_hermesmail", 502, 20, "/var/db/hermes-email-agent", "/usr/bin/false")
+    accounts = {
+        "bridge_user": bridge,
+        "_hermesmail": inference,
+        "_hermesbuild": builder,
+    }
+    group_items = [
+        helper.grp.struct_group(("admin", "*", 80, [])),
+        helper.grp.struct_group(("staff", "*", 20, [])),
+        helper.grp.struct_group(("bridge_user", "*", 601, [])),
+        helper.grp.struct_group(("_hermesmail", "*", inference.pw_gid, [])),
+        helper.grp.struct_group(("_hermesbuild", "*", 603, [])),
+    ]
+    if failure == "supplementary":
+        group_items.append(helper.grp.struct_group(("extra", "*", 700, ["_hermesmail"])))
+    elif failure == "shared_group_member":
+        group_items[3] = helper.grp.struct_group(("_hermesmail", "*", 602, ["other_user"]))
+    by_name = {group.gr_name: group for group in group_items}
+    by_gid = {group.gr_gid: group for group in group_items}
+    if failure == "wrong_group":
+        by_gid[inference.pw_gid] = helper.grp.struct_group(("other", "*", 604, []))
+
+    def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[0] == "/usr/bin/dscl":
+            output = "IsHidden: 0\n" if failure == "not_hidden" else "IsHidden: 1\n"
+        else:
+            group_name = argv[-1]
+            member = failure == group_name
+            output = (
+                "user is a member of the group\n"
+                if member
+                else "user is not a member of the group\n"
+            )
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    return {
+        "user_lookup": accounts.__getitem__,
+        "users": lambda: list(accounts.values()),
+        "group_lookup": by_name.__getitem__,
+        "gid_lookup": by_gid.__getitem__,
+        "groups": lambda: group_items,
+        "runner": runner,
+    }
+
+
+def test_macos_account_invariants_accept_only_valid_dedicated_identities() -> None:
+    helper = _load_boundary_helper()
+    evidence = helper.validate_accounts("bridge_user", **_mac_account_inputs(helper))
+    assert evidence == _synthetic_account_evidence("bridge_user")
+    for reserved in ("root", "_hermesmail", "_hermesbuild"):
+        with pytest.raises(ValueError, match="name"):
+            helper.validate_accounts(reserved, **_mac_account_inputs(helper))
+    missing = _mac_account_inputs(helper)
+    missing["user_lookup"] = {}.__getitem__
+    with pytest.raises(ValueError, match="missing"):
+        helper.validate_accounts("bridge_user", **missing)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "same_uid",
+        "wrong_home",
+        "wrong_shell",
+        "wrong_group",
+        "admin",
+        "staff",
+        "supplementary",
+        "shared_group_member",
+        "not_hidden",
+    ],
+)
+def test_macos_account_invariants_fail_closed(failure: str) -> None:
+    helper = _load_boundary_helper()
+    with pytest.raises(ValueError):
+        helper.validate_accounts("bridge_user", **_mac_account_inputs(helper, failure))
+
+
+def _linux_account_inputs(helper: Any, failure: str | None = None) -> dict[str, Any]:
+    def user(name: str, uid: int, gid: int, home: str, shell: str) -> pwd.struct_passwd:
+        return pwd.struct_passwd((name, "*", uid, gid, "", home, shell))
+
+    bridge = user(
+        "hermes-email-bridge",
+        501,
+        601,
+        "/var/lib/hermes-email-bridge",
+        "/usr/sbin/nologin",
+    )
+    inference = user("_hermesmail", 502, 602, "/var/lib/hermes-email-agent", "/usr/sbin/nologin")
+    if failure == "same_uid":
+        inference = user(
+            "_hermesmail",
+            bridge.pw_uid,
+            602,
+            "/var/lib/hermes-email-agent",
+            "/usr/sbin/nologin",
+        )
+    elif failure == "wrong_home":
+        inference = user("_hermesmail", 502, 602, "/tmp", "/usr/sbin/nologin")
+    elif failure == "wrong_shell":
+        inference = user("_hermesmail", 502, 602, "/var/lib/hermes-email-agent", "/bin/bash")
+    elif failure == "wrong_group":
+        inference = user(
+            "_hermesmail", 502, 604, "/var/lib/hermes-email-agent", "/usr/sbin/nologin"
+        )
+    elif failure == "privileged":
+        inference = user("_hermesmail", 502, 0, "/var/lib/hermes-email-agent", "/usr/sbin/nologin")
+    accounts = {"hermes-email-bridge": bridge, "_hermesmail": inference}
+    group_items = [
+        helper.grp.struct_group(("root", "*", 0, [])),
+        helper.grp.struct_group(("hermes-email-bridge", "*", bridge.pw_gid, [])),
+        helper.grp.struct_group(("_hermesmail", "*", inference.pw_gid, [])),
+    ]
+    if failure == "supplementary":
+        group_items.append(helper.grp.struct_group(("extra", "*", 700, ["_hermesmail"])))
+    elif failure == "shared_bridge_group_member":
+        group_items[1] = helper.grp.struct_group(("hermes-email-bridge", "*", 601, ["other_user"]))
+    elif failure == "shared_inference_group_member":
+        group_items[2] = helper.grp.struct_group(("_hermesmail", "*", 602, ["other_user"]))
+    by_name = {group.gr_name: group for group in group_items}
+    by_gid = {group.gr_gid: group for group in group_items}
+    if failure == "wrong_group":
+        by_gid[inference.pw_gid] = helper.grp.struct_group(("other", "*", 604, []))
+    return {
+        "user_lookup": accounts.__getitem__,
+        "users": lambda: list(accounts.values()),
+        "group_lookup": by_name.__getitem__,
+        "gid_lookup": by_gid.__getitem__,
+        "groups": lambda: group_items,
+    }
+
+
+def test_linux_account_invariants_accept_only_valid_dedicated_identities() -> None:
+    helper = _load_linux_boundary_helper()
+    evidence = helper.validate_accounts("hermes-email-bridge", **_linux_account_inputs(helper))
+    assert evidence == {
+        "bridge_uid": 501,
+        "inference_uid": 502,
+        "inference_user": "_hermesmail",
+    }
+    for reserved in ("root", "_hermesmail"):
+        with pytest.raises(ValueError, match="name"):
+            helper.validate_accounts(reserved, **_linux_account_inputs(helper))
+    missing = _linux_account_inputs(helper)
+    missing["user_lookup"] = {}.__getitem__
+    with pytest.raises(ValueError, match="missing"):
+        helper.validate_accounts("hermes-email-bridge", **missing)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "same_uid",
+        "wrong_home",
+        "wrong_shell",
+        "wrong_group",
+        "privileged",
+        "supplementary",
+    ],
+)
+def test_linux_account_invariants_fail_closed(failure: str) -> None:
+    helper = _load_linux_boundary_helper()
+    with pytest.raises(ValueError):
+        helper.validate_accounts("hermes-email-bridge", **_linux_account_inputs(helper, failure))
+
+
+@pytest.mark.parametrize("failure", ["shared_bridge_group_member", "shared_inference_group_member"])
+def test_linux_shared_group_member_fails_closed(failure: str) -> None:
+    helper = _load_linux_boundary_helper()
+    with pytest.raises(ValueError, match="primary group"):
+        helper.validate_accounts("hermes-email-bridge", **_linux_account_inputs(helper, failure))
 
 
 def test_privileged_helper_rejects_args_and_broadened_policy(
@@ -430,6 +671,7 @@ def test_privileged_helper_rejects_args_and_broadened_policy(
         "_read_fixed",
         lambda path, _mode: WRAPPER_PATH.read_bytes() if path == helper.WRAPPER else policy,
     )
+    monkeypatch.setattr(helper, "validate_accounts", _synthetic_account_evidence)
     assert helper.verify()["bridge_user"] == "bridge_user"
     with pytest.raises(ValueError, match="no arguments"):
         helper.main(["--alternate-path"])

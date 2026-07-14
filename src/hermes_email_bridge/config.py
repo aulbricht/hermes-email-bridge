@@ -12,7 +12,6 @@ from urllib.parse import urlsplit
 from .mapping import normalize_email_address
 
 ISOLATED_HERMES_COMMAND = "/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent"
-LEGACY_HERMES_COMMAND = "hermes chat --quiet --source tool"
 
 
 class ConfigError(ValueError):
@@ -145,9 +144,9 @@ class Settings:
             values.get("EMAIL_BRIDGE_DRY_RUN", "true"),
             "EMAIL_BRIDGE_DRY_RUN",
         )
-        hermes_command = values.get("HERMES_COMMAND", LEGACY_HERMES_COMMAND)
-        if send_replies and not dry_run and hermes_command != ISOLATED_HERMES_COMMAND:
-            raise ConfigError("live replies require the exact isolated Hermes protocol wrapper")
+        hermes_command = values.get("HERMES_COMMAND", ISOLATED_HERMES_COMMAND)
+        if hermes_command != ISOLATED_HERMES_COMMAND:
+            raise ConfigError("email-triggered Hermes requires the exact isolated protocol wrapper")
         return cls(
             provider=provider,
             db_path=db_path,

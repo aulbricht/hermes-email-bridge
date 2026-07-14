@@ -514,6 +514,32 @@ def test_build_account_requires_false_shell_empty_home_unique_group_and_no_suppl
         runtime.verify_build_account(builder, service, runner=hidden)
 
 
+def test_runtime_prerequisites_require_canonical_service_boundary_evidence() -> None:
+    runtime = _runtime()
+    evidence: dict[str, Any] = {
+        "accounts": {
+            "bridge_uid": 501,
+            "build_uid": 503,
+            "inference_uid": 502,
+            "inference_user": "_hermesmail",
+        },
+        "bridge_user": "bridge_user",
+        "sudoers_sha256": "a" * 64,
+        "wrapper_sha256": "b" * 64,
+    }
+
+    def runner(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        assert argv == [str(runtime.BOUNDARY_HELPER)]
+        return subprocess.CompletedProcess(
+            argv, 0, json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n", ""
+        )
+
+    assert runtime.verify_service_boundary(runner=runner) == evidence
+    evidence["accounts"]["bridge_uid"] = 0
+    with pytest.raises(ValueError, match="invalid identities"):
+        runtime.verify_service_boundary(runner=runner)
+
+
 @pytest.mark.skipif(
     not hasattr(os, "chflags") or not getattr(stat, "UF_IMMUTABLE", 0),
     reason="BSD immutable flags require macOS",

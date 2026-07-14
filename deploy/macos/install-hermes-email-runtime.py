@@ -29,6 +29,7 @@ ACTIVE_RUNTIME = INSTALL_ROOT / "runtime"
 VENV = ACTIVE_RUNTIME / "venv"
 PYTHON_INSTALLS = ACTIVE_RUNTIME / "python"
 ATTESTATION = ACTIVE_RUNTIME / "runtime-attestation.json"
+BOUNDARY_HELPER = Path("/usr/local/libexec/hermes-email-boundary-verify")
 PROBE_PARENT = Path("/private/tmp") if Path("/private/tmp").is_dir() else Path("/tmp")
 UV = Path("/usr/local/libexec/hermes-email-uv")
 UV_VERSION = "uv 0.11.16 (135a36367 2026-05-21 aarch64-apple-darwin)"
@@ -47,7 +48,7 @@ BUILD_BACKEND_WHEEL_SHA256 = "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81
 WRAPPER_SHA256 = "45f98b00e022a789fe168204da220e3146699c37a6368dfdf481a5f998c8985e"
 ADAPTER_SHA256 = "69bbf6825ff523b925bf753c5e1202d6a69096f73c4c6f6881a36df5233f24c2"
 SUDOERS_TEMPLATE_SHA256 = "493400bf54b26c1c988b43e0c5edcbd599d9a7a6e555e8eabdd2a25d3717da55"
-BOUNDARY_HELPER_SHA256 = "591d3a275f251e5cad3bf2f51000370c8b40ae99cca4bf991432882e32b90d66"
+BOUNDARY_HELPER_SHA256 = "4ae0a9337e0f1205c8268e82d0b5c1a4bf692ce53016fcc74b84ce1b4967f9fb"
 FETCHER = Path(__file__).with_name("fetch-hermes-email-agent.py")
 PROVENANCE_FILE = ".hermes-email-agent-provenance.json"
 ATTESTATION_ASSETS = (
@@ -434,6 +435,51 @@ def verify_build_account(
     )
     if hidden.returncode != 0 or hidden.stderr or hidden.stdout.strip() != "IsHidden: 1":
         raise ValueError("fixed build account is not hidden")
+
+
+def verify_service_boundary(*, runner: Runner = subprocess.run) -> dict[str, object]:
+    """Require the installed root helper's recurring service-account invariants."""
+
+    result = runner(
+        [str(BOUNDARY_HELPER)],
+        capture_output=True,
+        check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "C"},
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0 or result.stderr:
+        raise ValueError("dedicated service-account boundary verification failed")
+    try:
+        evidence = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("service-account boundary evidence is malformed") from exc
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "accounts",
+        "bridge_user",
+        "sudoers_sha256",
+        "wrapper_sha256",
+    }:
+        raise ValueError("service-account boundary evidence is incomplete")
+    accounts = evidence.get("accounts")
+    if not isinstance(accounts, dict) or set(accounts) != {
+        "bridge_uid",
+        "build_uid",
+        "inference_uid",
+        "inference_user",
+    }:
+        raise ValueError("service-account evidence has an invalid shape")
+    ids = (accounts.get("bridge_uid"), accounts.get("build_uid"), accounts.get("inference_uid"))
+    if (
+        accounts.get("inference_user") != "_hermesmail"
+        or any(not isinstance(uid, int) or isinstance(uid, bool) or uid <= 0 for uid in ids)
+        or len(set(ids)) != 3
+    ):
+        raise ValueError("service-account evidence has invalid identities")
+    canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":")) + "\n"
+    if result.stdout != canonical:
+        raise ValueError("service-account boundary evidence is not canonical")
+    return evidence
 
 
 def verify_uv(
@@ -1259,6 +1305,7 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
     paths = build_paths()
     uid = pwd.getpwnam("root").pw_uid
     wheel = grp.getgrnam("wheel").gr_gid
+    verify_service_boundary()
     builder = pwd.getpwnam(BUILD_ACCOUNT)
     service = pwd.getpwnam("_hermesmail")
     verify_build_account(builder, service)

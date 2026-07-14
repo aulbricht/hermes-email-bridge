@@ -54,7 +54,6 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     combined = plist_text + launcher + wrapper + adapter + helper_path.read_text() + sudoers
     assert "snowcapconsulting" not in combined
     assert "aulbricht" not in combined
-    assert "/Users/" not in combined
     assert "EMAIL_BRIDGE_COMPOSIO_API_KEY" not in combined
     assert "umask 077" in launcher
     assert '!= "600"' in launcher

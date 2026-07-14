@@ -78,16 +78,16 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME` | `false` | Enable authenticated exact-participant subject fallback |
 | `EMAIL_BRIDGE_POLL_INTERVAL` | `30` | Continuous poll interval in seconds |
 | `EMAIL_BRIDGE_LOG_LEVEL` | `INFO` | Python log level |
-| `HERMES_COMMAND` | legacy development command | Live replies require the exact isolated sudo wrapper below |
+| `HERMES_COMMAND` | exact isolated sudo wrapper | Every email-triggered invocation requires the fixed command below |
 | `HERMES_TIMEOUT` | `300` | Invocation timeout in seconds |
 | `EMAIL_BRIDGE_WEBHOOK_HOST` | `127.0.0.1` | Webhook listen host |
 | `EMAIL_BRIDGE_WEBHOOK_PORT` | `8787` | Webhook listen port |
 | `EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE` | `8` | Accepted webhook events waiting for a worker |
 
 The bridge appends `--resume SESSION` when mapped and always appends `--query PROMPT`; it
-never invokes a shell. The built-in legacy command is available only while replies are disabled
-or dry-run is active. Startup fails when live replies use anything except the exact isolated
-wrapper command described below.
+never invokes a shell. The isolated wrapper is the default and only accepted runtime command.
+Startup rejects direct or same-account Hermes commands in every mode, including dry-run and
+replies-disabled operation, because those modes still invoke Hermes on email content.
 
 ### Critical output-isolation boundary and 0.4 migration
 
@@ -106,7 +106,7 @@ trust-boundary markers. Output is captured with a hard bound. Any mismatch is re
 reason code—not child stdout, stderr, reply text, lengths, snippets, or hashes.
 
 This is an intentional fail-closed migration. An existing `HERMES_COMMAND` that invokes
-`hermes chat --quiet` directly will no longer send mail. Install and attest the 0.4 adapter,
+`hermes chat --quiet` directly will no longer start the bridge in any mode. Install and attest the 0.4 adapter,
 root-owned wrapper, and dedicated `_hermesmail` account first, then use exactly:
 
 ```bash
@@ -351,6 +351,9 @@ dscl . -create /Users/_hermesmail PrimaryGroupID __SERVICE_GID__
 dscl . -create /Users/_hermesmail NFSHomeDirectory /var/db/hermes-email-agent
 dscl . -create /Users/_hermesmail UserShell /usr/bin/false
 dscl . -create /Users/_hermesmail IsHidden 1
+! dscl . -read /Groups/_hermesmail GroupMembership
+dsmemberutil checkmembership -U _hermesmail -G admin | grep -q 'not a member'
+dsmemberutil checkmembership -U _hermesmail -G staff | grep -q 'not a member'
 install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent
 install -d -o _hermesmail -g _hermesmail -m 0700 /var/db/hermes-email-agent/workspace
 dscl . -create /Groups/_hermesbuild
@@ -410,6 +413,11 @@ explicit empty argument list. The helper itself rejects all arguments and reads 
 wrapper and `0440` policy, returning canonical identity and hash evidence. The unprivileged
 LaunchAgent never reads sudoers directly; it exact-byte checks the readable attested helper and
 accepts only the fixed helper command and exact evidence for its own configured bridge identity.
+Installation rejects root, `_hermesmail`, `_hermesbuild`, missing accounts, UID 0, and any UID
+collision. Every startup revalidates that the bridge identity is nonroot and distinct and that
+`_hermesmail` retains its exact hidden home, false shell, unique private primary group, no
+explicit members in that group, no supplementary groups, and no admin or staff membership. The runtime build/check calls the same
+root helper before touching the frozen runtime.
 The wrapper accepts only `--query TEXT` with one optional safe `--resume
 SESSION_ID`; it fixes the working directory and minimal environment, then executes the attested
 adapter with the frozen venv Python using `-I -B`. The adapter pins safe mode, ignored user
@@ -556,8 +564,29 @@ sudoers policy, `_hermesmail` as the inference identity, and a separate unprivil
 service identity. The systemd unit uses a private temporary directory, private devices, a
 read-only system filesystem except for declared state/log paths, and umask `0077`.
 
-Before enabling the unit, create `_hermesmail` and a separate bridge user with false shells and
-private, non-overlapping homes. Install the frozen Hermes 0.18.2 venv under
+Before enabling the unit, create the exact dedicated identities and private, non-overlapping
+homes expected by the recurring verifier. The bridge username may be changed only if the same
+name is used for its unique primary group and every `__BRIDGE_USER__` placeholder; its home and
+shell remain fixed:
+
+```bash
+sudo /usr/sbin/groupadd --system _hermesmail
+sudo /usr/sbin/useradd --system --gid _hermesmail --home-dir /var/lib/hermes-email-agent \
+  --create-home --shell /usr/sbin/nologin _hermesmail
+sudo /usr/sbin/groupadd --system hermes-email-bridge
+sudo /usr/sbin/useradd --system --gid hermes-email-bridge \
+  --home-dir /var/lib/hermes-email-bridge --create-home \
+  --shell /usr/sbin/nologin hermes-email-bridge
+sudo /usr/bin/install -d -o _hermesmail -g _hermesmail -m 0700 /var/lib/hermes-email-agent
+sudo /usr/bin/install -d -o hermes-email-bridge -g hermes-email-bridge \
+  -m 0700 /var/lib/hermes-email-bridge
+```
+
+Neither account may have supplementary membership; both private primary groups must have empty
+explicit member lists and may not be shared with another user or be privileged. Render both systemd bridge identity placeholders as
+`hermes-email-bridge`, use `/var/lib/hermes-email-bridge` as `__STATE_DIR__`, and keep the
+environment, database, sidecars, and logs below that private bridge home. Install the frozen
+Hermes 0.18.2 venv under
 `/opt/hermes-email-agent/runtime`, then install the reviewed
 `deploy/macos/hermes-email-agent-adapter.py` source there as root:root `0755`. Despite that source
 path, this is the platform-neutral shared adapter used by both deployment templates; do not
@@ -572,7 +601,7 @@ verifier plus new/resume protocol canaries before `systemctl enable --now`.
 The bridge environment file, SQLite database and `-wal`/`-shm` sidecars, provider credentials,
 and logs must be in a bridge-private `0700` tree unreadable to `_hermesmail`. Inference OAuth and
 session state under `/var/lib/hermes-email-agent` must be `_hermesmail`-private and unreadable to
-the bridge and build identities. A same-user service, a user-writable wrapper/runtime, or an
+the bridge identity. A same-user service, a user-writable wrapper/runtime, or an
 unattested equivalent is not supported for live replies; leave replies disabled until an
 equivalent OS boundary passes these checks.
 
@@ -584,8 +613,8 @@ equivalent OS boundary passes these checks.
   `hermes-email-bridge/1` JSON and bounded capture.
 - Added a pinned programmatic Hermes adapter that suppresses all process/UI output and fails
   closed on incomplete or contaminated turns.
-- Made live replies require the exact dedicated-account sudo wrapper and added recurring adapter
-  attestation plus Linux systemd/sudo reference assets.
+- Made every email-triggered invocation require the exact dedicated-account sudo wrapper and
+  added recurring account/adapter attestation plus Linux systemd/sudo reference assets.
 - Added incident replay, malformed-output, resumed-session rotation, secret-canary isolation,
   redacted-log, and exact delivered-body regression tests.
 
