@@ -101,6 +101,8 @@ class SubprocessHermesRunner(HermesRunner):
                 argv,
                 capture_output=True,
                 check=False,
+                # The isolated Hermes account cannot traverse bridge state directories.
+                cwd=os.path.abspath(os.sep),
                 env=env,
                 timeout=self.timeout,
             )

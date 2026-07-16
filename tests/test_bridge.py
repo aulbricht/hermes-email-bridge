@@ -264,7 +264,7 @@ def test_subprocess_runner_passes_only_minimal_execution_environment(
         "import json, os; "
         f"reply=json.dumps({{name: os.getenv(name) for name in {forbidden_names!r}}} | "
         "{'PATH': os.getenv('PATH'), 'LANG': os.getenv('LANG'), "
-        "'ENV_KEYS': sorted(os.environ)}); "
+        "'ENV_KEYS': sorted(os.environ), 'CWD': os.getcwd()}); "
         "print(json.dumps({'protocol':'hermes.chat.result.v1','reply':reply,"
         "'session_id':'session-new'},separators=(',',':')))"
     )
@@ -275,6 +275,7 @@ def test_subprocess_runner_passes_only_minimal_execution_environment(
     assert all(child_env[name] is None for name in forbidden_names)
     assert child_env["PATH"] == os.environ["PATH"]
     assert child_env["LANG"] == "en_US.UTF-8"
+    assert child_env["CWD"] == os.path.abspath(os.sep)
     # macOS may synthesize this Cocoa text-encoding variable after execve.
     assert set(child_env["ENV_KEYS"]) <= {
         "LANG",
