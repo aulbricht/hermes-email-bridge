@@ -202,6 +202,8 @@ def _run_bounded(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         close_fds=True,
+        # The isolated Hermes account cannot traverse bridge-private state directories.
+        cwd=os.path.abspath(os.sep),
         env=env,
         start_new_session=os.name == "posix",
     )
