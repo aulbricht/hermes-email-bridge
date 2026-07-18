@@ -15,6 +15,8 @@ PROTOCOL = "hermes-email-bridge/2"
 HERMES_VERSION = "0.18.2"
 MODEL = "gpt-5.5"
 PROVIDER = "openai-codex"
+OPENROUTER_MODEL = "z-ai/glm-5.2"
+OPENROUTER_PROVIDER = "openrouter"
 TOOLSETS = ["context_engine"]
 MAX_TURNS = 1
 MAX_PROTOCOL_BYTES = 256 * 1024
@@ -34,7 +36,11 @@ class _DuplicateKey(ValueError):
     pass
 
 
-def parse_arguments(arguments: Sequence[str]) -> tuple[str, str | None]:
+def parse_arguments(arguments: Sequence[str]) -> tuple[str, str | None, str]:
+    runtime = "openai-codex"
+    if list(arguments[:2]) == ["--runtime", "openrouter"]:
+        runtime = "openrouter"
+        arguments = arguments[2:]
     resume: str | None = None
     if len(arguments) == 2 and arguments[0] == "--query":
         query = arguments[1]
@@ -47,7 +53,7 @@ def parse_arguments(arguments: Sequence[str]) -> tuple[str, str | None]:
         raise ValueError("invalid query")
     if resume is not None and _SESSION_ID.fullmatch(resume) is None:
         raise ValueError("invalid session")
-    return query, resume
+    return query, resume, runtime
 
 
 def _valid_reply(reply: str) -> bool:
@@ -130,14 +136,20 @@ def _has_zero_tool_surface(cli_module: object, hermes_cli: object, agent: object
     )
 
 
-def _run_hermes(query: str, resume: str | None) -> bytes | None:
+def _run_hermes(query: str, resume: str | None, runtime: str) -> bytes | None:
     if importlib.metadata.version("hermes-agent") != HERMES_VERSION:
+        return None
+    if runtime == "openrouter":
+        model, provider = OPENROUTER_MODEL, OPENROUTER_PROVIDER
+    elif runtime == "openai-codex":
+        model, provider = MODEL, PROVIDER
+    else:
         return None
     cli_module = importlib.import_module("cli")
     hermes_cli = cli_module.HermesCLI(
-        model=MODEL,
+        model=model,
         toolsets=TOOLSETS,
-        provider=PROVIDER,
+        provider=provider,
         max_turns=MAX_TURNS,
         resume=resume,
         ignore_rules=True,
@@ -187,10 +199,10 @@ def _run_hermes(query: str, resume: str | None) -> bytes | None:
             or result.get("response_transformed") is not False
             or result.get("response_previewed") is not False
             or "pending_steer" in result
-            or result.get("model") != MODEL
-            or getattr(agent, "model", None) != MODEL
-            or result.get("provider") != PROVIDER
-            or getattr(agent, "provider", None) != PROVIDER
+            or result.get("model") != model
+            or getattr(agent, "model", None) != model
+            or result.get("provider") != provider
+            or getattr(agent, "provider", None) != provider
             or getattr(agent, "session_id", None) != session_id
             or not _has_zero_tool_surface(cli_module, hermes_cli, agent)
         ):
@@ -233,8 +245,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 "HERMES_SESSION_SOURCE": "tool",
             }
         )
-        query, resume = parse_arguments(sys.argv[1:] if arguments is None else arguments)
-        protocol = _run_hermes(query, resume)
+        query, resume, runtime = parse_arguments(
+            sys.argv[1:] if arguments is None else arguments
+        )
+        protocol = _run_hermes(query, resume, runtime)
         if protocol is None:
             return 1
         written = 0

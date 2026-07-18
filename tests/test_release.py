@@ -16,9 +16,9 @@ ROOT = Path(__file__).parents[1]
 
 def test_version_has_one_project_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert project["project"]["version"] == "0.5.0"
-    assert __version__ == "0.5.0"
-    assert '__version__ = "0.5.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
+    assert project["project"]["version"] == "0.5.1"
+    assert __version__ == "0.5.1"
+    assert '__version__ = "0.5.1"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
 
 
 def test_docs_and_example_config_cover_composio_allowlisting_and_start_now() -> None:
@@ -97,6 +97,8 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
         'TOOLSETS = ["context_engine"]',
         'PROVIDER = "openai-codex"',
         'MODEL = "gpt-5.5"',
+        'OPENROUTER_PROVIDER = "openrouter"',
+        'OPENROUTER_MODEL = "z-ai/glm-5.2"',
         'NORMAL_TURN_EXIT_REASON = "text_response(finish_reason=stop)"',
         "os.dup2(devnull, 1)",
         "_finalize_single_query",

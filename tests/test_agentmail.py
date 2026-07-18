@@ -349,6 +349,13 @@ def test_runtime_modes_accept_only_reviewed_protocol_adapter_shapes(tmp_path: Pa
     trusted_python.chmod(0o755)
     user_command = f"{trusted_python} -I -B {adapter}"
     assert Settings.from_env({"HERMES_COMMAND": user_command}).hermes_command == user_command
+    openrouter_command = f"{user_command} --runtime openrouter"
+    assert (
+        Settings.from_env({"HERMES_COMMAND": openrouter_command}).hermes_command
+        == openrouter_command
+    )
+    with pytest.raises(ConfigError, match="isolated wrapper or an absolute Python"):
+        Settings.from_env({"HERMES_COMMAND": f"{user_command} --runtime arbitrary"})
     adapter.write_bytes(adapter.read_bytes() + b"\n")
     with pytest.raises(ConfigError, match="reviewed release"):
         Settings.from_env({"HERMES_COMMAND": user_command})

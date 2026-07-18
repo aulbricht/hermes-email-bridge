@@ -187,8 +187,8 @@ os.write(2, b"IMPORT STDERR\\n")
 class Agent:
     def __init__(self, session):
         self.session_id = session
-        self.model = "gpt-5.5"
-        self.provider = "openai-codex"
+        self.model = os.environ.get("FAKE_EXPECTED_MODEL", "gpt-5.5")
+        self.provider = os.environ.get("FAKE_EXPECTED_PROVIDER", "openai-codex")
         self.tools = []
         self._context_engine_tool_names = set()
         self.context_compressor = self
@@ -241,8 +241,10 @@ class Agent:
         return result
 class HermesCLI:
     def __init__(self, **kwargs):
-        assert kwargs == {"model":"gpt-5.5","toolsets":["context_engine"],
-                          "provider":"openai-codex","max_turns":1,
+        model = os.environ.get("FAKE_EXPECTED_MODEL", "gpt-5.5")
+        provider = os.environ.get("FAKE_EXPECTED_PROVIDER", "openai-codex")
+        assert kwargs == {"model":model,"toolsets":["context_engine"],
+                          "provider":provider,"max_turns":1,
                           "resume":kwargs.get("resume"),"ignore_rules":True}
         self.session_id = kwargs.get("resume") or "fresh_session"
         self.agent = Agent(self.session_id)
@@ -253,7 +255,7 @@ class HermesCLI:
         return surface == "cli" and stderr is True
     def _ensure_runtime_credentials(self): return True
     def _resolve_turn_agent_config(self, query):
-        return {"model":"gpt-5.5","runtime":{},"request_overrides":None}
+        return {"model":self.agent.model,"runtime":{},"request_overrides":None}
     def _init_agent(self, **kwargs): return True
 def _finalize_single_query(cli):
     print("FINALIZE")
@@ -279,6 +281,9 @@ def get_tool_definitions(**kwargs):
         )
         if mode is not None:
             environment["FAKE_RESULT_MODE"] = mode
+        if arguments[:2] == ["--runtime", "openrouter"]:
+            environment["FAKE_EXPECTED_MODEL"] = "z-ai/glm-5.2"
+            environment["FAKE_EXPECTED_PROVIDER"] = "openrouter"
         return subprocess.run(
             [sys.executable, "-c", bootstrap, *arguments],
             capture_output=True,
@@ -304,6 +309,31 @@ def get_tool_definitions(**kwargs):
     resumed = run(["--resume", "session_123", "--query", "reply email"])
     assert resumed.returncode == 0 and resumed.stderr == ""
     assert json.loads(resumed.stdout)["session_id"] == "session_123"
+
+    openrouter = run(["--runtime", "openrouter", "--query", "new email"])
+    assert openrouter.returncode == 0 and openrouter.stderr == ""
+    assert json.loads(openrouter.stdout)["reply"] == "Short intended reply."
+
+    openrouter_resumed = run(
+        ["--runtime", "openrouter", "--resume", "session_456", "--query", "reply email"]
+    )
+    assert openrouter_resumed.returncode == 0 and openrouter_resumed.stderr == ""
+    assert json.loads(openrouter_resumed.stdout)["session_id"] == "session_456"
+
+    openrouter_mismatch = run(
+        ["--runtime", "openrouter", "--query", "new email"], "result-provider"
+    )
+    assert (
+        openrouter_mismatch.returncode == 1
+        and openrouter_mismatch.stdout == openrouter_mismatch.stderr == ""
+    )
+
+    for invalid in (
+        ["--runtime", "unknown", "--query", "new email"],
+        ["--runtime", "openrouter", "--runtime", "openrouter", "--query", "new email"],
+    ):
+        rejected = run(invalid)
+        assert rejected.returncode == 1 and rejected.stdout == rejected.stderr == ""
 
     for mode in (
         "failed",

@@ -22,7 +22,7 @@ ISOLATED_VERIFIER_PATH = Path(
     "verify-hermes-email-agent.py"
 )
 ISOLATED_VERIFIER_SHA256 = "77ef28ff214d5b197d765f90d72c9cbd43494e0d6984686f35b4469354259891"
-USER_ADAPTER_SHA256 = "06f1bf892061b0beb353e5f0032169622186baff5b4ab28549cd48d64a179c3a"
+USER_ADAPTER_SHA256 = "0f34ee02a77840f2d476ba3769d8b2e670427ae58c79d279b22b62a62e6623ae"
 
 
 class ConfigError(ValueError):
@@ -191,11 +191,12 @@ def validate_hermes_command(value: str) -> str:
     except ValueError as exc:
         raise ConfigError("HERMES_COMMAND is invalid") from exc
     if (
-        len(argv) != 4
+        len(argv) not in {4, 6}
         or argv[1:3] != ["-I", "-B"]
         or not Path(argv[0]).is_absolute()
         or not Path(argv[3]).is_absolute()
         or Path(argv[3]).name != "hermes-email-agent-adapter.py"
+        or (len(argv) == 6 and argv[4:] != ["--runtime", "openrouter"])
     ):
         raise ConfigError(
             "HERMES_COMMAND must be the isolated wrapper or an absolute Python -I -B "
