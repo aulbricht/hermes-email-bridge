@@ -1,7 +1,6 @@
 import json
 import os
 import shlex
-import sys
 import threading
 from datetime import UTC
 from hashlib import sha256
@@ -344,7 +343,11 @@ def test_runtime_modes_accept_only_reviewed_protocol_adapter_shapes(tmp_path: Pa
     adapter = tmp_path / "hermes-email-agent-adapter.py"
     adapter.write_bytes(source.read_bytes())
     adapter.chmod(0o755)
-    user_command = f"{sys.executable} -I -B {adapter}"
+    trusted_python = tmp_path / "trusted-python/python"
+    trusted_python.parent.mkdir(mode=0o755)
+    trusted_python.write_text("#!/bin/sh\nexit 1\n")
+    trusted_python.chmod(0o755)
+    user_command = f"{trusted_python} -I -B {adapter}"
     assert Settings.from_env({"HERMES_COMMAND": user_command}).hermes_command == user_command
     adapter.write_bytes(adapter.read_bytes() + b"\n")
     with pytest.raises(ConfigError, match="reviewed release"):
@@ -360,7 +363,7 @@ def test_runtime_modes_accept_only_reviewed_protocol_adapter_shapes(tmp_path: Pa
         Settings.from_env(
             {
                 "HERMES_COMMAND": (
-                    f"{sys.executable} -I -B {unsafe_adapter}"
+                    f"{trusted_python} -I -B {unsafe_adapter}"
                 )
             }
         )
