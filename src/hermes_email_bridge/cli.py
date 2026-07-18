@@ -10,9 +10,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 
 from . import __version__
-from .config import ConfigError, Settings
+from .config import ConfigError, Settings, preflight_hermes_command
 from .log import configure_logging
-from .models import ConversationMapping
+from .models import ApprovalStatus, ConversationMapping
 from .providers.agentmail import AgentMailProvider
 from .providers.base import EmailProvider, RetryableProviderError
 from .providers.composio_agentmail import ComposioAgentMailProvider
@@ -60,6 +60,20 @@ def _parser() -> argparse.ArgumentParser:
     allowlist_add.add_argument("address")
     allowlist_remove = allowlist_commands.add_parser("remove", help="Remove one exact address")
     allowlist_remove.add_argument("address")
+    approvals = commands.add_parser(
+        "approvals", help="Review quarantined requests that cannot auto-dispatch"
+    )
+    approval_commands = approvals.add_subparsers(dest="approvals_command", required=True)
+    approval_list = approval_commands.add_parser("list", help="List pending requests")
+    approval_list.add_argument("--all", action="store_true", help="Include closed requests")
+    approval_resolve = approval_commands.add_parser(
+        "resolve", help="Mark a manually handled request resolved"
+    )
+    approval_resolve.add_argument("approval_id", type=int)
+    approval_reject = approval_commands.add_parser("reject", help="Reject a pending request")
+    approval_reject.add_argument("approval_id", type=int)
+    approval_purge = approval_commands.add_parser("purge", help="Delete old closed requests")
+    approval_purge.add_argument("--closed-older-than-days", type=int, required=True)
     return parser
 
 
@@ -93,6 +107,7 @@ def _service(
         runner=SubprocessHermesRunner(
             settings.hermes_command,
             settings.hermes_timeout,
+            command_preflight=lambda: preflight_hermes_command(settings.hermes_command),
         ),
         send_replies=settings.send_replies,
         dry_run=settings.dry_run,
@@ -173,6 +188,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                         default=str,
                     )
                 )
+                return 0
+            if args.command == "approvals":
+                provider_name = settings.logical_provider()
+                if args.approvals_command == "purge":
+                    print(
+                        json.dumps(
+                            {
+                                "purged": store.purge_closed_approvals(
+                                    args.closed_older_than_days
+                                )
+                            }
+                        )
+                    )
+                    return 0
+                if args.approvals_command == "resolve":
+                    status = ApprovalStatus.RESOLVED
+                elif args.approvals_command == "reject":
+                    status = ApprovalStatus.REJECTED
+                else:
+                    requests = store.list_approvals(
+                        provider_name, include_closed=args.all
+                    )
+                    print(json.dumps([asdict(item) for item in requests], default=str))
+                    return 0
+                try:
+                    request = store.set_approval_status(
+                        provider_name, args.approval_id, status
+                    )
+                except KeyError as exc:
+                    raise ConfigError(
+                        f"pending approval {args.approval_id} does not exist"
+                    ) from exc
+                print(json.dumps(asdict(request), default=str))
                 return 0
             if args.command == "mappings":
                 if args.mappings_command == "rotate":

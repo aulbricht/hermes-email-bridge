@@ -1,6 +1,12 @@
+import json
+import os
+import shlex
+import sys
 import threading
 from datetime import UTC
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -9,6 +15,7 @@ from hermes_email_bridge.config import (
     ISOLATED_HERMES_COMMAND,
     ConfigError,
     Settings,
+    _preflight_isolated_runtime,
 )
 from hermes_email_bridge.models import SenderAuthentication
 from hermes_email_bridge.providers.agentmail import (
@@ -320,12 +327,12 @@ def test_settings_reject_remote_http_and_defaults_raw_storage_off() -> None:
     assert settings.allow_subject_resume is False
 
 
-def test_every_runtime_mode_requires_exact_isolated_protocol_wrapper() -> None:
+def test_runtime_modes_accept_only_reviewed_protocol_adapter_shapes(tmp_path: Path) -> None:
     settings = Settings.from_env({})
     assert settings.hermes_command == ISOLATED_HERMES_COMMAND
     for send_replies in ("false", "true"):
         for dry_run in ("false", "true"):
-            with pytest.raises(ConfigError, match="exact isolated protocol wrapper"):
+            with pytest.raises(ConfigError, match="isolated wrapper or an absolute Python"):
                 Settings.from_env(
                     {
                         "EMAIL_BRIDGE_SEND_REPLIES": send_replies,
@@ -333,6 +340,75 @@ def test_every_runtime_mode_requires_exact_isolated_protocol_wrapper() -> None:
                         "HERMES_COMMAND": "hermes chat --quiet --source tool",
                     }
                 )
+    source = Path(__file__).parents[1] / "deploy/macos/hermes-email-agent-adapter.py"
+    adapter = tmp_path / "hermes-email-agent-adapter.py"
+    adapter.write_bytes(source.read_bytes())
+    adapter.chmod(0o755)
+    user_command = f"{sys.executable} -I -B {adapter}"
+    assert Settings.from_env({"HERMES_COMMAND": user_command}).hermes_command == user_command
+    adapter.write_bytes(adapter.read_bytes() + b"\n")
+    with pytest.raises(ConfigError, match="reviewed release"):
+        Settings.from_env({"HERMES_COMMAND": user_command})
+
+    unsafe_parent = tmp_path / "unsafe"
+    unsafe_parent.mkdir(mode=0o777)
+    unsafe_parent.chmod(0o777)
+    unsafe_adapter = unsafe_parent / "hermes-email-agent-adapter.py"
+    unsafe_adapter.write_bytes(source.read_bytes())
+    unsafe_adapter.chmod(0o755)
+    with pytest.raises(ConfigError, match="parent path"):
+        Settings.from_env(
+            {
+                "HERMES_COMMAND": (
+                    f"{sys.executable} -I -B {unsafe_adapter}"
+                )
+            }
+        )
+
+    mutable_parent = tmp_path / "mutable-python"
+    mutable_parent.mkdir(mode=0o755)
+    fake_python = mutable_parent / "python"
+    fake_python.write_text("#!/bin/sh\nexit 1\n")
+    fake_python.chmod(0o755)
+    safe_adapter = tmp_path / "reviewed/hermes-email-agent-adapter.py"
+    safe_adapter.parent.mkdir(mode=0o755)
+    safe_adapter.write_bytes(source.read_bytes())
+    safe_adapter.chmod(0o755)
+    mutable_command = f"{fake_python} -I -B {safe_adapter}"
+    assert Settings.from_env({"HERMES_COMMAND": mutable_command}).hermes_command == mutable_command
+    mutable_parent.chmod(0o777)
+    with pytest.raises(ConfigError, match=r"Python executable.*parent path"):
+        Settings.from_env({"HERMES_COMMAND": mutable_command})
+
+
+def test_isolated_runtime_preflight_requires_exact_v2_attestation(tmp_path: Path) -> None:
+    verifier = tmp_path / "verify-hermes-email-agent.py"
+    evidence = {
+        "attestation": "verified",
+        "bridge_user": "bridge",
+        "live_canary": False,
+        "tool_schemas": 0,
+        "version": "0.18.2",
+    }
+    verifier.write_text(
+        "#!/bin/sh\nprintf '%s\\n' "
+        + shlex.quote(json.dumps(evidence, sort_keys=True))
+        + "\n"
+    )
+    verifier.chmod(0o755)
+    verifier_hash = sha256(verifier.read_bytes()).hexdigest()
+    trusted = frozenset({0, os.getuid()})
+    _preflight_isolated_runtime(
+        verifier=verifier,
+        expected_hash=verifier_hash,
+        trusted_uids=trusted,
+    )
+    with pytest.raises(ConfigError, match="must be upgraded"):
+        _preflight_isolated_runtime(
+            verifier=verifier,
+            expected_hash="0" * 64,
+            trusted_uids=trusted,
+        )
 
 
 def test_settings_normalize_and_validate_reply_domains() -> None:

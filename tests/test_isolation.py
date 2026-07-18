@@ -189,11 +189,17 @@ class Agent:
         self.session_id = session
         self.model = "gpt-5.5"
         self.provider = "openai-codex"
+        self.tools = []
+        self._context_engine_tool_names = set()
+        self.context_compressor = self
+    def get_tool_schemas(self):
+        return ["unexpected"] if os.environ.get("FAKE_RESULT_MODE") == "context-tools" else []
     def run_conversation(self, **kwargs):
         incident = Path(os.environ["INCIDENT_FIXTURE"]).read_text().replace("\u241b", "\x1b")
         os.write(1, incident.encode())
         os.write(2, b"TIMEOUT AND SECRET-CANARY\\n")
-        result = {"final_response":"Short intended reply.","session_id":self.session_id,
+        result = {"final_response":'{"action":"reply","reply":"Short intended reply."}',
+                  "session_id":self.session_id,
                   "completed":True,"failed":False,"partial":False,"interrupted":False,
                   "turn_exit_reason":"text_response(finish_reason=stop)",
                   "response_transformed":False,"response_previewed":False,
@@ -221,6 +227,17 @@ class Agent:
         if mode == "agent-model": self.model = "different-model"
         if mode == "result-provider": result["provider"] = "different-provider"
         if mode == "agent-provider": self.provider = "different-provider"
+        if mode == "decision-text": result["final_response"] = "Short intended reply."
+        if mode == "decision-extra":
+            result["final_response"] = '{"action":"reply","reply":"ok","extra":true}'
+        if mode == "decision-duplicate":
+            result["final_response"] = (
+                '{"action":"reply","action":"approval_required","reply":"ok"}'
+            )
+        if mode == "decision-action":
+            result["final_response"] = '{"action":"run_tools","reply":"ok"}'
+        if mode == "agent-tools": self.tools = ["unexpected"]
+        if mode == "context-tool-names": self._context_engine_tool_names = {"unexpected"}
         return result
 class HermesCLI:
     def __init__(self, **kwargs):
@@ -229,6 +246,7 @@ class HermesCLI:
                           "resume":kwargs.get("resume"),"ignore_rules":True}
         self.session_id = kwargs.get("resume") or "fresh_session"
         self.agent = Agent(self.session_id)
+        self.enabled_toolsets = ["context_engine"]
         self.conversation_history = []
     def _claim_active_session(self, surface, stderr=False):
         print("CLAIM")
@@ -241,6 +259,9 @@ def _finalize_single_query(cli):
     print("FINALIZE")
     os.write(2, b"CLEANUP STDERR\\n")
     if os.environ.get("FAKE_RESULT_MODE") == "finalize": raise RuntimeError("SECRET-CANARY")
+def get_tool_definitions(**kwargs):
+    assert kwargs == {"enabled_toolsets":["context_engine"],"quiet_mode":True}
+    return ["unexpected"] if os.environ.get("FAKE_RESULT_MODE") == "model-tools" else []
 """
     )
     bootstrap = (
@@ -269,12 +290,14 @@ def _finalize_single_query(cli):
     fresh = run(["--query", "new email"])
     assert fresh.returncode == 0 and fresh.stderr == ""
     assert json.loads(fresh.stdout) == {
-        "protocol": "hermes-email-bridge/1",
+        "action": "reply",
+        "protocol": "hermes-email-bridge/2",
         "reply": "Short intended reply.",
         "session_id": "fresh_session",
     }
     assert fresh.stdout == (
-        '{"protocol":"hermes-email-bridge/1","reply":"Short intended reply.",'
+        '{"action":"reply","protocol":"hermes-email-bridge/2",'
+        '"reply":"Short intended reply.",'
         '"session_id":"fresh_session"}\n'
     )
 
@@ -306,6 +329,14 @@ def _finalize_single_query(cli):
         "agent-model",
         "result-provider",
         "agent-provider",
+        "decision-text",
+        "decision-extra",
+        "decision-duplicate",
+        "decision-action",
+        "context-tools",
+        "model-tools",
+        "agent-tools",
+        "context-tool-names",
     ):
         rejected = run(["--query", "new email"], mode)
         assert rejected.returncode == 1
@@ -357,7 +388,8 @@ def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
                 [],
                 0,
                 stdout=(
-                    '{"protocol":"hermes-email-bridge/1","reply":"EMAIL_BRIDGE_PROBE_OK",'
+                    '{"action":"reply","protocol":"hermes-email-bridge/2",'
+                    '"reply":"EMAIL_BRIDGE_PROBE_OK",'
                     '"session_id":"live_session"}\n'
                 ),
                 stderr="",
@@ -366,7 +398,8 @@ def test_runtime_probe_validates_wrapper_and_live_new_resume_streams() -> None:
                 [],
                 0,
                 stdout=(
-                    '{"protocol":"hermes-email-bridge/1","reply":"EMAIL_BRIDGE_RESUME_OK",'
+                    '{"action":"reply","protocol":"hermes-email-bridge/2",'
+                    '"reply":"EMAIL_BRIDGE_RESUME_OK",'
                     '"session_id":"rotated_session"}\n'
                 ),
                 stderr="",

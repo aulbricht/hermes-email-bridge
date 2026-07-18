@@ -11,7 +11,7 @@ import re
 import sys
 from collections.abc import Sequence
 
-PROTOCOL = "hermes-email-bridge/1"
+PROTOCOL = "hermes-email-bridge/2"
 HERMES_VERSION = "0.18.2"
 MODEL = "gpt-5.5"
 PROVIDER = "openai-codex"
@@ -26,6 +26,12 @@ _FORBIDDEN_MARKERS = (
     "[UNTRUSTED EMAIL USER CONTENT]",
     "[END UNTRUSTED EMAIL USER CONTENT]",
 )
+_DECISION_KEYS = {"action", "reply"}
+_ACTIONS = {"reply", "approval_required"}
+
+
+class _DuplicateKey(ValueError):
+    pass
 
 
 def parse_arguments(arguments: Sequence[str]) -> tuple[str, str | None]:
@@ -61,13 +67,66 @@ def _valid_reply(reply: str) -> bool:
     return True
 
 
-def _protocol_record(reply: str, session_id: str) -> bytes:
-    payload = {"protocol": PROTOCOL, "reply": reply, "session_id": session_id}
+def _reject_duplicate_keys(pairs: Sequence[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateKey
+        value[key] = item
+    return value
+
+
+def _decision(value: str) -> tuple[str, str] | None:
+    try:
+        payload = json.loads(value, object_pairs_hook=_reject_duplicate_keys)
+    except (ValueError, RecursionError):
+        return None
+    if type(payload) is not dict or set(payload) != _DECISION_KEYS:
+        return None
+    action = payload.get("action")
+    reply = payload.get("reply")
+    if type(action) is not str or action not in _ACTIONS:
+        return None
+    if type(reply) is not str or not _valid_reply(reply):
+        return None
+    return action, reply
+
+
+def _protocol_record(action: str, reply: str, session_id: str) -> bytes:
+    payload = {
+        "action": action,
+        "protocol": PROTOCOL,
+        "reply": reply,
+        "session_id": session_id,
+    }
     return (
         json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
             "utf-8"
         )
         + b"\n"
+    )
+
+
+def _has_zero_tool_surface(cli_module: object, hermes_cli: object, agent: object) -> bool:
+    """Attest the actual initialized model tool surface, not just requested toolsets."""
+
+    try:
+        definitions = cli_module.get_tool_definitions(  # type: ignore[attr-defined]
+            enabled_toolsets=TOOLSETS, quiet_mode=True
+        )
+        compressor = agent.context_compressor  # type: ignore[attr-defined]
+        schemas = compressor.get_tool_schemas()
+    except BaseException:
+        return False
+    return (
+        type(definitions) is list
+        and not definitions
+        and getattr(hermes_cli, "enabled_toolsets", None) == TOOLSETS
+        and type(getattr(agent, "tools", None)) is list
+        and not agent.tools  # type: ignore[attr-defined]
+        and type(schemas) is list
+        and not schemas
+        and getattr(agent, "_context_engine_tool_names", None) == set()
     )
 
 
@@ -100,6 +159,8 @@ def _run_hermes(query: str, resume: str | None) -> bytes | None:
         ):
             return None
         agent = hermes_cli.agent
+        if not _has_zero_tool_surface(cli_module, hermes_cli, agent):
+            return None
         agent.quiet_mode = True
         agent.suppress_status_output = True
         agent.stream_delta_callback = None
@@ -110,11 +171,11 @@ def _run_hermes(query: str, resume: str | None) -> bytes | None:
         )
         if type(result) is not dict:
             return None
-        reply = result.get("final_response")
+        response = result.get("final_response")
         session_id = result.get("session_id")
+        decision = _decision(response) if type(response) is str else None
         if (
-            type(reply) is not str
-            or not _valid_reply(reply)
+            decision is None
             or type(session_id) is not str
             or _SESSION_ID.fullmatch(session_id) is None
             or result.get("completed") is not True
@@ -131,10 +192,12 @@ def _run_hermes(query: str, resume: str | None) -> bytes | None:
             or result.get("provider") != PROVIDER
             or getattr(agent, "provider", None) != PROVIDER
             or getattr(agent, "session_id", None) != session_id
+            or not _has_zero_tool_surface(cli_module, hermes_cli, agent)
         ):
             return None
+        action, reply = decision
         hermes_cli.session_id = session_id
-        candidate = _protocol_record(reply, session_id)
+        candidate = _protocol_record(action, reply, session_id)
         if len(candidate) > MAX_PROTOCOL_BYTES:
             return None
         protocol = candidate

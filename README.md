@@ -4,7 +4,7 @@
 
 AgentMail is the first adapter, not a core dependency. The bridge contract is intentionally small enough for future IMAP, Gmail API, Postmark, SendGrid, or SES adapters.
 
-> Version: **0.4.0 (alpha)**. Start with replies disabled and dry-run enabled.
+> Version: **0.5.0 (alpha)**. Start with replies disabled and dry-run enabled.
 
 ## What works
 
@@ -15,6 +15,7 @@ AgentMail is the first adapter, not a core dependency. The bridge contract is in
 - JSON structured logs with secret-field redaction
 - Persistent poll cursor, processed-message idempotency, and optional raw payload storage
 - Exact sender allowlisting with automatic enrollment from trusted outbound mail
+- No-tools automatic replies with a non-dispatchable local inbox for requests that need tools
 - No runtime Python dependencies
 
 ## Install
@@ -78,18 +79,18 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME` | `false` | Enable authenticated exact-participant subject fallback |
 | `EMAIL_BRIDGE_POLL_INTERVAL` | `30` | Continuous poll interval in seconds |
 | `EMAIL_BRIDGE_LOG_LEVEL` | `INFO` | Python log level |
-| `HERMES_COMMAND` | exact isolated sudo wrapper | Every email-triggered invocation requires the fixed command below |
+| `HERMES_COMMAND` | exact isolated sudo wrapper | Isolated wrapper or absolute Python `-I -B` adapter invocation |
 | `HERMES_TIMEOUT` | `300` | Invocation timeout in seconds |
 | `EMAIL_BRIDGE_WEBHOOK_HOST` | `127.0.0.1` | Webhook listen host |
 | `EMAIL_BRIDGE_WEBHOOK_PORT` | `8787` | Webhook listen port |
 | `EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE` | `8` | Accepted webhook events waiting for a worker |
 
 The bridge appends `--resume SESSION` when mapped and always appends `--query PROMPT`; it
-never invokes a shell. The isolated wrapper is the default and only accepted runtime command.
-Startup rejects direct or same-account Hermes commands in every mode, including dry-run and
-replies-disabled operation, because those modes still invoke Hermes on email content.
+never invokes a shell. Startup accepts only the optional isolated wrapper or an absolute Python
+`-I -B` invocation of `hermes-email-agent-adapter.py`. Direct `hermes chat`, arbitrary commands,
+and unstructured quiet-mode output remain rejected.
 
-### Critical output-isolation boundary and 0.4 migration
+### Critical output-isolation boundary and 0.5 no-tools mode
 
 Version 0.4.0 replaces Hermes terminal stdout as an email transport. Earlier releases could
 mistake reasoning panels, tool previews, timeouts, terminal UI, duplicated passages, or trusted
@@ -98,31 +99,54 @@ with bridge secrets on an unsafe deployment, contaminated stdout was a potential
 exfiltration path.
 
 The only accepted subprocess output is one canonical UTF-8 JSON line using protocol
-`hermes-email-bridge/1`, with keys exactly `protocol`, `reply`, and `session_id`. The bridge
+`hermes-email-bridge/2`, with keys exactly `action`, `protocol`, `reply`, and `session_id`.
+The only accepted actions are `reply` and `approval_required`. The bridge
 requires a nonempty reply, a validated session ID, empty stderr, a zero exit status, canonical
 serialization, and no extra bytes, BOM, ANSI/control characters, terminal borders, or bridge
 trust-boundary markers. Output is captured with a hard bound. Any mismatch is recorded once as
 `hermes_protocol_error`; no email or mapping/link mutation occurs, and logs contain only a fixed
 reason code—not child stdout, stderr, reply text, lengths, snippets, or hashes.
 
-This is an intentional fail-closed migration. An existing `HERMES_COMMAND` that invokes
-`hermes chat --quiet` directly will no longer start the bridge in any mode. Install and attest the 0.4 adapter,
-root-owned wrapper, and dedicated `_hermesmail` account first, then use exactly:
+This remains an intentional fail-closed migration. An existing `HERMES_COMMAND` that invokes
+`hermes chat --quiet` directly will not start the bridge in any mode. The recommended simple
+deployment uses the existing Hermes 0.18.2 Python environment and the reviewed adapter:
 
 ```bash
-HERMES_COMMAND='/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent'
+HERMES_COMMAND='/absolute/path/to/hermes/venv/bin/python -I -B /absolute/path/to/hermes-email-agent-adapter.py'
 ```
 
 The adapter redirects operating-system file descriptors 1 and 2 to `/dev/null` before importing
 Hermes and calls the pinned Hermes 0.18.2 `HermesCLI`/`AIAgent` result API. It accepts only the
 exact normal `text_response(finish_reason=stop)` provenance with completed, untransformed,
 unpreviewed output; pinned result and agent model/provider/session values; no pending steer; and
-no failed, partial, interrupted, or cleanup state. It finalizes the session, then emits only the
+no failed, partial, interrupted, or cleanup state. Startup also hashes the adapter against the
+reviewed release, and every invocation verifies that both Hermes and its context engine expose
+zero tool schemas. It finalizes the session, then emits only the
 canonical record through a saved non-inheritable descriptor. This preserves new and resumed
-sessions, including a validated session ID rotated by Hermes compression. The email instructions
-tell Hermes to return only the user-visible body, never discuss or perform delivery, and use
-tools only when the request genuinely requires them; the fixed `context_engine` toolset resolves
-to exactly zero tool schemas.
+sessions, including a validated session ID rotated by Hermes compression. The fixed
+`context_engine` toolset resolves to exactly zero tool schemas. Hermes must return a strict
+two-field decision: answer directly without tools, or request approval. Tool-required requests
+are recorded in the bridge SQLite database as pending approval metadata and are never posted to
+Hermes Kanban or auto-dispatched. The email body and raw payload are not copied into the approval
+table. The bridge sends the acknowledgment only after that idempotent local record exists.
+Replies-disabled and dry-run modes create no approval records.
+
+This queue is deliberately intake-only. A human reviews the original provider message, handles
+approved work in the full agent workflow separately, and sends any resulting response manually; v0.5 has no
+automatic approval-to-execution or execution-to-email callback. This avoids presenting AgentOS
+Kanban triage as a security gate—it is not one, because triage may be auto-decomposed and
+dispatched.
+
+The same-account mode prevents prompt-driven file access by exposing zero tool schemas and
+scrubbing bridge secrets from the child environment, but it is not an OS filesystem boundary:
+a compromised Hermes runtime or Python dependency could still read files available to that
+account. Operators who require protection from that threat should use the optional isolated
+account below or a VM/container boundary.
+
+When the isolated wrapper is selected, the macOS launcher hashes the installed verifier and
+requires the exact protocol-v2 runtime before it starts the bridge. Upgrading the Python package
+without upgrading that root-owned runtime therefore fails at startup instead of consuming mail
+with an incompatible protocol.
 
 ## Use
 
@@ -159,6 +183,18 @@ Inspect how a provider message normalizes (add `--raw` to include the raw payloa
 
 ```bash
 hermes-email-bridge inspect '<message-id@agentmail.to>'
+```
+
+List requests that Hermes classified as needing tools. Use the recorded provider message ID with
+`inspect` to review the original mail, handle it manually in the full agent workflow, then close
+the local record:
+
+```bash
+hermes-email-bridge approvals list
+hermes-email-bridge inspect '<provider-message-id>'
+hermes-email-bridge approvals resolve 1
+# or: hermes-email-bridge approvals reject 1
+hermes-email-bridge approvals purge --closed-older-than-days 30
 ```
 
 List persistent mappings:
@@ -205,7 +241,7 @@ AgentMail's reply endpoint preserves the original email thread, including `In-Re
 ## Seed a mapping
 
 Inbound mail with no existing mapping starts a new Hermes session. The runner accepts the
-validated `session_id` field from the canonical `hermes-email-bridge/1` JSON record and persists
+validated `session_id` field from the canonical `hermes-email-bridge/2` JSON record and persists
 the new thread mapping automatically. Legacy `session_id:` terminal markers are incompatible
 with 0.4 and fail closed without sending an email.
 
@@ -240,7 +276,10 @@ flowchart LR
     C --> D{"Authenticated and allowlisted exact sender?"}
     D -->|"denied"| J["Record denial; no Hermes or mapping mutation"]
     D -->|"authorized / new"| E["SQLite resolver and Hermes runner"]
-    E --> F{"Reply gates"}
+    E --> K{"Strict no-tools decision"}
+    K -->|"direct reply"| F{"Reply gates"}
+    K -->|"tools required"| L["Local pending approval; never auto-dispatched"]
+    L --> F
     F -->|"disabled / dry-run"| G["Structured skip log"]
     F -->|"enabled"| H["Provider threaded reply"]
     E --> I["Marker, message IDs, thread; optional subject"]
@@ -273,7 +312,7 @@ Additional safeguards:
 - Configurable replies plus independent dry-run gate
 - No shell evaluation of `HERMES_COMMAND`
 - Minimal Hermes child environment: only `PATH` and present locale fields reach the command
-- Production Hermes runs as a separate non-staff account through a root-owned fixed wrapper
+- Optional hardened deployments run Hermes as a separate non-staff account through a root-owned fixed wrapper
 - Canonical versioned JSON reply protocol; terminal output and stderr fail closed without delivery
 - Protocol failures are logged by reason code only; contaminated child bytes are never logged
 - API keys and webhook secrets never logged
@@ -281,6 +320,7 @@ Additional safeguards:
 - AgentMail bearer credentials are sent only to a validated HTTPS origin; redirects are rejected
 - Composio requests use one fixed HTTPS origin and fixed AgentMail `/v0` paths; upstream bodies and headers are never logged
 - Raw payloads default off and, when enabled, are stored only in SQLite and logically purged after the configured retention period
+- Tool-required requests persist only minimal approval metadata locally; they never enter an auto-dispatch queue
 
 Raw emails can contain sensitive data. Leave `EMAIL_BRIDGE_STORE_RAW=false` unless debugging requires them. The bridge creates a new state directory with mode `0700` and a new database with mode `0600` on POSIX systems, but existing directories, database copies, SQLite sidecars, and backups remain the operator's responsibility. Logical purge sets expired payloads to `NULL`; use your normal SQLite maintenance if physical page reclamation is required.
 
@@ -294,7 +334,7 @@ uv run mypy
 uv run python -m build
 ```
 
-Tests cover authentication and spoofing rejection, every mapping path, schema migration, marker rotation and expiry, raw retention, URL and redirect rejection, bounded webhook processing, normalization, dry-run behavior, the subprocess runner, and Svix verification.
+Tests cover authentication and spoofing rejection, every mapping path, schema migration, marker rotation and expiry, raw retention, the non-dispatchable approval inbox, bounded webhook processing, normalization, dry-run behavior, the subprocess runner, and Svix verification.
 
 ## Composio transport
 
@@ -312,8 +352,9 @@ configuration, and malformed-response failures stop rather than retry forever.
 ## macOS LaunchAgent
 
 Generic templates live in `deploy/macos`. The bridge remains a user LaunchAgent, but
-email-driven Hermes runs as the separate hidden `_hermesmail` account. Do not run either
-component from the repository or from another Hermes user's state directory.
+the recommended mode invokes the zero-tools adapter through the existing Hermes Python
+environment. Do not run the bridge from the repository or from another Hermes user's state
+directory.
 
 1. Create separate workspace, configuration, state, and log directories with mode `0700`.
 2. Copy `run-email-bridge.sh` into the install directory and keep it executable.
@@ -321,11 +362,12 @@ component from the repository or from another Hermes user's state directory.
    `EMAIL_BRIDGE_VENV` to the Python 3.11+ environment, then set the file to mode `0600`.
 4. Replace every `__PLACEHOLDER__` in the plist, including a unique label, absolute paths,
    and a neutral bridge `HOME`. Keep the plist free of secrets.
-5. Run `init-db --start-now`, add initial exact addresses with `allowlist add`, run the fixed
-   runtime verifier and live canary below, then load the plist as a user LaunchAgent.
+5. Copy `hermes-email-agent-adapter.py` into the private install directory, configure an absolute
+   Python `-I -B` adapter command, then run `init-db --start-now`, add initial exact addresses
+   with `allowlist add`, and load the plist as a user LaunchAgent.
 
-The launcher runs the root-owned fixed runtime verifier before reading the bridge environment
-file, so a stale or modified runtime fails before bridge secrets enter the process. The template
+When the optional isolated command is configured, the launcher runs its root-owned verifier
+with an empty environment. The template
 uses umask `077`, a neutral working directory, stderr-only logging,
 `RunAtLoad`, restart after unsuccessful exit, and a 30-second launchd throttle. The bridge
 does not internally retry permanent authentication, configuration, or malformed-response
@@ -335,7 +377,7 @@ Protect the database, SQLite sidecars, environment, workspace, and logs from oth
 A user LaunchAgent starts only after login; with FileVault enabled, it cannot run before
 the user unlocks and logs into the Mac after reboot.
 
-### Isolated Hermes account and wrapper
+### Optional hardened Hermes account and wrapper
 
 Before installation, list existing IDs with `dscl . -list /Users UniqueID` and
 `dscl . -list /Groups PrimaryGroupID`. Choose four distinct unused values for
@@ -585,8 +627,8 @@ tool list, and exposes zero schemas in safe mode. The values `none`, `no_mcp`, e
 default fallbacks are forbidden.
 
 Before initial start and every Hermes upgrade, keep the LaunchAgent unloaded and verify the
-attestation. This read-only command is also executed automatically on every LaunchAgent start,
-before the environment file is sourced:
+attestation. This read-only command is also executed automatically with an empty environment on
+every LaunchAgent start that selects the optional isolated command:
 
 ```bash
 '/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/verify-hermes-email-agent.py'
@@ -618,19 +660,26 @@ boundary against an email-driven agent.
 
 ## Linux deployment status
 
-Version 0.4.0 supports live email-triggered Hermes execution only through the fully attested
-macOS boundary above. Linux and same-user deployments are intentionally unsupported and fail
-closed; this repository does not ship Linux systemd, sudoers, wrapper, or verifier assets.
-The provider-neutral bridge code remains portable, but that does not provide a safe inference
-execution boundary.
-
-Linux support requires an equivalent complete implementation and review: recursive trusted-path
-ownership, modes, ACL and symlink checks; a pinned runtime digest and distribution/import-origin
-provenance; the exact private Hermes API seam; zero tool schemas; distinct private identities and
-state; and recurring startup plus live protocol verification. A manually copied adapter or
-root-owned wrapper is not sufficient and must not be used for live email execution.
+The provider-neutral bridge and zero-tools adapter are portable, but this repository does not
+ship a systemd unit. Use the same absolute Python `-I -B` adapter shape and protect the bridge
+environment and database with normal service-manager permissions. The same-account residual risk
+described above applies. A stronger Linux deployment needs an equivalent service account,
+container, or VM boundary and its own reviewed startup attestation.
 
 ## Release notes
+
+### 0.5.0
+
+- Added strict `hermes-email-bridge/2` actions for no-tools replies and human-gated requests.
+- Added an idempotent, bridge-local approval inbox that stores no email body and cannot dispatch
+  work; dry-run and replies-disabled modes do not write approval records.
+- Documented the intentionally manual v0.5 approval handoff and result-delivery behavior instead
+  of treating AgentOS Kanban triage as an authorization boundary.
+- Added a reviewed same-account adapter command for simpler deployments while retaining the
+  optional dedicated-account boundary for operators who need stronger filesystem isolation.
+- Added adapter hash verification and per-invocation zero-tool-surface attestation.
+- Preserved sender authentication, allowlisting, session resumption, reply-domain controls,
+  Composio delivery, transcript rejection, and redacted protocol-error logging.
 
 ### 0.4.0
 

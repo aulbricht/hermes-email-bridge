@@ -3,8 +3,6 @@ set -eu
 
 umask 077
 
-'/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/verify-hermes-email-agent.py' 1>&2
-
 : "${EMAIL_BRIDGE_ENV_FILE:?EMAIL_BRIDGE_ENV_FILE is required}"
 if [ ! -f "$EMAIL_BRIDGE_ENV_FILE" ]; then
     echo "email bridge environment file does not exist" >&2
@@ -21,4 +19,20 @@ set -a
 set +a
 
 : "${EMAIL_BRIDGE_VENV:?EMAIL_BRIDGE_VENV is required}"
+if [ "${HERMES_COMMAND:-}" = '/usr/bin/sudo -n -H -u _hermesmail /usr/local/libexec/hermes-email-agent' ]; then
+    verifier='/Library/Application Support/HermesEmailAgent/hermes-agent/runtime/verify-hermes-email-agent.py'
+    expected_verifier='77ef28ff214d5b197d765f90d72c9cbd43494e0d6984686f35b4469354259891'
+    if [ ! -f "$verifier" ]; then
+        echo "Hermes v2 runtime verifier is missing" >&2
+        exit 78
+    fi
+    actual_verifier=$(/usr/bin/shasum -a 256 "$verifier")
+    if [ "${actual_verifier%% *}" != "$expected_verifier" ]; then
+        echo "Hermes runtime must be upgraded for email protocol v2" >&2
+        exit 78
+    fi
+    /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C \
+        "$verifier" \
+        1>&2
+fi
 exec "$EMAIL_BRIDGE_VENV/bin/hermes-email-bridge" poll --continuous 1>&2

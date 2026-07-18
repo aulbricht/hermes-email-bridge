@@ -120,7 +120,7 @@ def _fixture(
                     name: str(site / (name + ".py"))
                     for name in ("cli", "hermes_cli", "run_agent", "model_tools", "toolsets")
                 },
-                "adapter_protocol": "hermes-email-bridge/1",
+                "adapter_protocol": "hermes-email-bridge/2",
                 "tool_schemas": 0,
                 "version": runtime.VERSION,
             }
@@ -148,7 +148,7 @@ def test_attestation_verifies_actual_import_and_entrypoint_seams(
     )
     assert evidence["tool_schemas"] == 0
     assert any(call[:2] == [str(paths.venv / "bin/hermes"), "--version"] for call in calls)
-    assert evidence["adapter_protocol"] == "hermes-email-bridge/1"
+    assert evidence["adapter_protocol"] == "hermes-email-bridge/2"
 
 
 def test_attestation_binds_build_identity_constraints_backend_and_boundary_hashes(
@@ -168,7 +168,7 @@ def test_attestation_binds_build_identity_constraints_backend_and_boundary_hashe
     assert attestation["dependency_sync_no_build"] is True
     assert attestation["wrapper_sha256"] == runtime.WRAPPER_SHA256
     assert attestation["adapter_sha256"] == runtime.ADAPTER_SHA256
-    assert attestation["adapter_protocol"] == "hermes-email-bridge/1"
+    assert attestation["adapter_protocol"] == "hermes-email-bridge/2"
     assert attestation["boundary_helper_sha256"] == runtime.BOUNDARY_HELPER_SHA256
     assert attestation["sudoers_template_sha256"] == runtime.SUDOERS_TEMPLATE_SHA256
     assert len(attestation["wheel_sha256"]) == 64
@@ -744,7 +744,7 @@ def test_rebase_resolves_tmp_alias_and_final_active_verification_passes(
                             "toolsets",
                         )
                     },
-                    "adapter_protocol": "hermes-email-bridge/1",
+                    "adapter_protocol": "hermes-email-bridge/2",
                     "tool_schemas": 0,
                     "version": runtime.VERSION,
                 }

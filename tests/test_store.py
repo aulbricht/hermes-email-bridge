@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 
 from hermes_email_bridge.models import (
+    ApprovalStatus,
+    HermesAction,
+    HermesResult,
     NormalizedEmail,
     ResolutionStatus,
     SenderAuthentication,
@@ -228,7 +231,10 @@ def test_v0_database_migrates_without_data_loss(tmp_path: Path) -> None:
             store.resolve(_message(thread_id="legacy-thread")).status is ResolutionStatus.AUTHORIZED
         )
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        indexes = {row[1] for row in connection.execute("PRAGMA index_list(mappings)").fetchall()}
+        assert "mappings_provider_thread" not in indexes
+        assert "mappings_provider_thread_participant" in indexes
 
 
 def test_v1_database_with_shared_thread_across_participants_migrates(tmp_path: Path) -> None:
@@ -263,10 +269,49 @@ def test_v1_database_with_shared_thread_across_participants_migrates(tmp_path: P
             "session-2",
         ]
     with sqlite3.connect(path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        indexes = {row[1] for row in connection.execute("PRAGMA index_list(mappings)").fetchall()}
-        assert "mappings_provider_thread" not in indexes
-        assert "mappings_provider_thread_participant" in indexes
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_approval_queue_is_minimal_idempotent_and_human_controlled(tmp_path: Path) -> None:
+    message = _message()
+    result = HermesResult(
+        "Queued for review.", "session-approval", HermesAction.APPROVAL_REQUIRED
+    )
+    path = tmp_path / "bridge.db"
+    with MappingStore(path) as store:
+        first = store.enqueue_approval(message, result)
+        second = store.enqueue_approval(message, result)
+        assert first.id == second.id
+        assert first.status is ApprovalStatus.PENDING
+        assert store.list_approvals("agentmail") == [second]
+        rotated = store.enqueue_approval(
+            _message(subject="Updated subject"),
+            HermesResult(
+                "Still queued.", "session-rotated", HermesAction.APPROVAL_REQUIRED
+            ),
+        )
+        assert rotated.id == first.id
+        assert rotated.subject == "Updated subject"
+        assert rotated.hermes_session == "session-rotated"
+        closed = store.set_approval_status(
+            "agentmail", first.id, ApprovalStatus.RESOLVED
+        )
+        assert closed.status is ApprovalStatus.RESOLVED
+        assert store.list_approvals("agentmail") == []
+        assert store.list_approvals("agentmail", include_closed=True) == [closed]
+        with pytest.raises(KeyError):
+            store.set_approval_status("agentmail", first.id, ApprovalStatus.REJECTED)
+        assert store.purge_closed_approvals(
+            30, now=datetime.now(UTC) + timedelta(days=31)
+        ) == 1
+        assert store.list_approvals("agentmail", include_closed=True) == []
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(approval_requests)")
+        }
+        assert "text_body" not in columns
+        assert "raw_payload" not in columns
 
 
 def test_rejects_newer_database_version(tmp_path: Path) -> None:
