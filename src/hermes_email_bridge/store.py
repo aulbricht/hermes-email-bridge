@@ -14,7 +14,10 @@ from typing import Any
 from .mapping import extract_bridge_marker, normalize_email_address, normalize_subject
 from .models import (
     AllowlistEntry,
+    ApprovalRequest,
+    ApprovalStatus,
     ConversationMapping,
+    HermesResult,
     MappingResolution,
     NormalizedEmail,
     ResolutionStatus,
@@ -23,7 +26,7 @@ from .models import (
     utc_now,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _LEGACY_SCHEMA = (
     """
     CREATE TABLE IF NOT EXISTS mappings (
@@ -172,6 +175,30 @@ class MappingStore:
                         cursor_key TEXT PRIMARY KEY,
                         started_at TEXT NOT NULL
                     )
+                    """
+                )
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS approval_requests (
+                        id INTEGER PRIMARY KEY,
+                        provider TEXT NOT NULL,
+                        provider_message_id TEXT NOT NULL,
+                        participant_email TEXT NOT NULL,
+                        subject TEXT NOT NULL,
+                        hermes_session TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK (
+                            status IN ('pending', 'resolved', 'rejected')
+                        ),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(provider, provider_message_id)
+                    )
+                    """
+                )
+                self._connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS approval_requests_status
+                    ON approval_requests(provider, status, created_at)
                     """
                 )
                 self._connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
@@ -515,6 +542,111 @@ class MappingStore:
             ).fetchall()
             return [self._row_to_allowlist(row) for row in rows]
 
+    def enqueue_approval(
+        self, message: NormalizedEmail, result: HermesResult
+    ) -> ApprovalRequest:
+        """Quarantine minimal request metadata without dispatching work or storing the body."""
+
+        now = utc_now().isoformat()
+        participant = normalize_email_address(message.from_email)
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO approval_requests(
+                    provider, provider_message_id, participant_email, subject,
+                    hermes_session, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                ON CONFLICT(provider, provider_message_id) DO UPDATE SET
+                    subject = excluded.subject,
+                    hermes_session = excluded.hermes_session,
+                    updated_at = excluded.updated_at
+                WHERE approval_requests.status = 'pending'
+                """,
+                (
+                    message.provider,
+                    message.provider_message_id,
+                    participant,
+                    message.subject,
+                    result.session_id,
+                    now,
+                    now,
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT * FROM approval_requests
+                WHERE provider = ? AND provider_message_id = ?
+                """,
+                (message.provider, message.provider_message_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("approval insert failed")
+            request = self._row_to_approval(row)
+            if request.participant_email != participant:
+                raise ValueError("approval request conflicts with an existing message")
+            return request
+
+    def list_approvals(
+        self, provider: str, *, include_closed: bool = False
+    ) -> list[ApprovalRequest]:
+        with self._lock:
+            if include_closed:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM approval_requests
+                    WHERE provider = ? ORDER BY created_at
+                    """,
+                    (provider,),
+                ).fetchall()
+            else:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM approval_requests
+                    WHERE provider = ? AND status = 'pending' ORDER BY created_at
+                    """,
+                    (provider,),
+                ).fetchall()
+            return [self._row_to_approval(row) for row in rows]
+
+    def set_approval_status(
+        self, provider: str, approval_id: int, status: ApprovalStatus
+    ) -> ApprovalRequest:
+        if status is ApprovalStatus.PENDING:
+            raise ValueError("closed approval status is required")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE approval_requests SET status = ?, updated_at = ?
+                WHERE provider = ? AND id = ? AND status = 'pending'
+                """,
+                (status, utc_now().isoformat(), provider, approval_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(approval_id)
+            row = self._connection.execute(
+                "SELECT * FROM approval_requests WHERE provider = ? AND id = ?",
+                (provider, approval_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("approval update failed")
+            return self._row_to_approval(row)
+
+    def purge_closed_approvals(
+        self, older_than_days: int, *, now: datetime | None = None
+    ) -> int:
+        if older_than_days <= 0:
+            raise ValueError("approval retention days must be positive")
+        cutoff = (now or utc_now()) - timedelta(days=older_than_days)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                DELETE FROM approval_requests
+                WHERE status != 'pending' AND updated_at < ?
+                """,
+                (cutoff.isoformat(),),
+            )
+            return cursor.rowcount
+
     def enroll_sent_message(self, message: SentEmail) -> int:
         """Authorize recipients once per trusted outbound message."""
 
@@ -714,6 +846,20 @@ class MappingStore:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
             revoked_at=_optional_datetime(row["revoked_at"]),
+        )
+
+    @staticmethod
+    def _row_to_approval(row: sqlite3.Row) -> ApprovalRequest:
+        return ApprovalRequest(
+            id=int(row["id"]),
+            provider=str(row["provider"]),
+            provider_message_id=str(row["provider_message_id"]),
+            participant_email=str(row["participant_email"]),
+            subject=str(row["subject"]),
+            hermes_session=str(row["hermes_session"]),
+            status=ApprovalStatus(str(row["status"])),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
 
 

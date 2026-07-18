@@ -11,6 +11,7 @@ import pytest
 
 from hermes_email_bridge.models import (
     ConversationMapping,
+    HermesAction,
     HermesResult,
     NormalizedEmail,
     SenderAuthentication,
@@ -231,7 +232,7 @@ def _protocol_script(reply_expression: str = "sys.argv[-1]") -> str:
     return (
         "import json,sys; "
         f"reply={reply_expression}; "
-        "print(json.dumps({'protocol':'hermes-email-bridge/1','reply':reply,"
+        "print(json.dumps({'action':'reply','protocol':'hermes-email-bridge/2','reply':reply,"
         "'session_id':'session-new'},sort_keys=True,ensure_ascii=False,separators=(',',':')))"
     )
 
@@ -293,10 +294,19 @@ def test_subprocess_runner_passes_only_minimal_execution_environment(
     }
 
 
-def _record(reply: str = "Short final answer.", session_id: str = "session_123") -> bytes:
+def _record(
+    reply: str = "Short final answer.",
+    session_id: str = "session_123",
+    action: str = "reply",
+) -> bytes:
     return (
         json.dumps(
-            {"protocol": HERMES_PROTOCOL, "reply": reply, "session_id": session_id},
+            {
+                "action": action,
+                "protocol": HERMES_PROTOCOL,
+                "reply": reply,
+                "session_id": session_id,
+            },
             sort_keys=True,
             ensure_ascii=False,
             separators=(",", ":"),
@@ -308,6 +318,14 @@ def _record(reply: str = "Short final answer.", session_id: str = "session_123")
 def test_protocol_accepts_only_clean_canonical_final_response() -> None:
     result = parse_hermes_protocol(_record("Hello.\n\nThis is the final answer."), b"", 0)
     assert result == HermesResult("Hello.\n\nThis is the final answer.", "session_123")
+
+
+def test_protocol_accepts_only_declared_actions() -> None:
+    result = parse_hermes_protocol(_record(action="approval_required"), b"", 0)
+    assert result.action is HermesAction.APPROVAL_REQUIRED
+    with pytest.raises(HermesProtocolError) as rejected:
+        parse_hermes_protocol(_record(action="run_tools"), b"", 0)
+    assert rejected.value.code == "invalid_action"
 
 
 @pytest.mark.parametrize(
@@ -541,3 +559,135 @@ def test_end_to_end_delivered_body_exactly_equals_protocol_reply() -> None:
         )
         assert service.handle(message) == "processed"
         assert provider.replies == [(message.provider_message_id, expected)]
+
+
+def test_subprocess_command_preflight_runs_immediately_before_each_invocation() -> None:
+    expected = "Preflight passed."
+    command = shlex.join([sys.executable, "-c", _protocol_script(repr(expected))])
+    calls: list[str] = []
+    runner = SubprocessHermesRunner(command, command_preflight=lambda: calls.append("checked"))
+
+    assert runner.run(_message(), None).reply == expected
+    assert runner.run(_message(), None).reply == expected
+    assert calls == ["checked", "checked"]
+
+
+def test_tool_request_is_queued_before_acknowledgment() -> None:
+    message = _message()
+    events: list[str] = []
+
+    class ApprovalRunner(HermesRunner):
+        def run(
+            self,
+            message: NormalizedEmail,
+            mapping: ConversationMapping | None,
+        ) -> HermesResult:
+            return HermesResult(
+                "I queued this for approval.",
+                "approval-session",
+                HermesAction.APPROVAL_REQUIRED,
+            )
+
+    with MappingStore(":memory:") as store:
+        class OrderedProvider(FakeProvider):
+            def reply(self, inbound: NormalizedEmail, text: str) -> str:
+                assert len(store.list_approvals("fake")) == 1
+                events.append("replied")
+                return super().reply(inbound, text)
+
+        provider = OrderedProvider([message])
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=ApprovalRunner(),
+            send_replies=True,
+            dry_run=False,
+        )
+        assert service.handle(message) == "processed"
+        assert events == ["replied"]
+        approval = store.list_approvals("fake")[0]
+        assert approval.provider_message_id == message.provider_message_id
+        assert approval.hermes_session == "approval-session"
+        assert provider.replies == [(message.provider_message_id, "I queued this for approval.")]
+
+
+def test_interrupted_approval_ack_retry_updates_one_pending_session() -> None:
+    message = _message()
+
+    class InterruptOnceProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__([message])
+            self.interrupted = False
+
+        def reply(self, inbound: NormalizedEmail, text: str) -> str:
+            if not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+            return super().reply(inbound, text)
+
+    class RotatingApprovalRunner(HermesRunner):
+        def run(
+            self,
+            message: NormalizedEmail,
+            mapping: ConversationMapping | None,
+        ) -> HermesResult:
+            session = "approval-first" if mapping is None else "approval-retried"
+            return HermesResult(
+                "Queued for human review.", session, HermesAction.APPROVAL_REQUIRED
+            )
+
+    provider = InterruptOnceProvider()
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=RotatingApprovalRunner(),
+            send_replies=True,
+            dry_run=False,
+        )
+        with pytest.raises(KeyboardInterrupt):
+            service.handle(message)
+        assert not store.is_processed("fake", message.provider_message_id)
+        assert store.list_approvals("fake")[0].hermes_session == "approval-first"
+
+        assert service.handle(message) == "processed"
+        approvals = store.list_approvals("fake")
+        assert len(approvals) == 1
+        assert approvals[0].hermes_session == "approval-retried"
+        assert provider.replies == [
+            (message.provider_message_id, "Queued for human review.")
+        ]
+
+
+@pytest.mark.parametrize(
+    ("send_replies", "dry_run"),
+    [(False, False), (True, True)],
+)
+def test_tool_request_does_not_mutate_approval_queue_in_safe_modes(
+    send_replies: bool, dry_run: bool
+) -> None:
+    message = _message()
+    provider = FakeProvider([message])
+
+    class ApprovalRunner(HermesRunner):
+        def run(
+            self,
+            message: NormalizedEmail,
+            mapping: ConversationMapping | None,
+        ) -> HermesResult:
+            return HermesResult("Must not send", "session-new", HermesAction.APPROVAL_REQUIRED)
+
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=ApprovalRunner(),
+            send_replies=send_replies,
+            dry_run=dry_run,
+        )
+        assert service.handle(message) == "processed"
+        assert provider.replies == []
+        assert store.list_approvals("fake") == []

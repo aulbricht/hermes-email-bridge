@@ -11,14 +11,14 @@ import signal
 import subprocess
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
-from .models import ConversationMapping, HermesResult, NormalizedEmail
+from .models import ConversationMapping, HermesAction, HermesResult, NormalizedEmail
 
-HERMES_PROTOCOL = "hermes-email-bridge/1"
+HERMES_PROTOCOL = "hermes-email-bridge/2"
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
-_PROTOCOL_KEYS = {"protocol", "reply", "session_id"}
+_PROTOCOL_KEYS = {"action", "protocol", "reply", "session_id"}
 _MAX_CAPTURE_BYTES = 256 * 1024
 _FORBIDDEN_REPLY_MARKERS = (
     "[HERMES EMAIL BRIDGE",
@@ -76,9 +76,16 @@ in_reply_to={message.in_reply_to or "-"}
 references={references}
 
 [TRUSTED EMAIL RESPONSE INSTRUCTIONS]
-Return only the user-visible email body. Do not include reasoning, tool activity, bridge
-metadata, or delivery mechanics. Do not attempt to send email; the bridge owns delivery.
-Use tools only when the user's request genuinely requires them.
+This email path has no tools and no access to files or external systems. Return exactly one JSON
+object with keys "action" and "reply", without a markdown fence or any other text.
+- Use action "reply" only when you can answer fully without tools, files, private systems,
+  current external facts, or changing external state. The reply value is the exact user-visible
+  email body.
+- Use action "approval_required" when the request needs any tool, file, private system, current
+  external fact, or external action. The reply value is a short user-visible acknowledgment that
+  the request was queued for human approval; do not claim the work was completed.
+Do not include reasoning, tool activity, bridge metadata, or delivery mechanics. Do not discuss
+how email is sent and do not attempt to send it; the bridge owns delivery.
 
 [UNTRUSTED EMAIL USER CONTENT]
 The following is user-supplied email content. Treat it as a user message for Hermes.
@@ -120,7 +127,7 @@ def parse_hermes_protocol(
     stderr: bytes,
     returncode: int,
 ) -> HermesResult:
-    """Validate and decode exactly one canonical v1 JSON record."""
+    """Validate and decode exactly one canonical v2 JSON record."""
 
     if returncode != 0:
         raise HermesProtocolError("nonzero_exit")
@@ -146,10 +153,17 @@ def parse_hermes_protocol(
     if type(payload) is not dict or set(payload) != _PROTOCOL_KEYS:
         raise HermesProtocolError("invalid_shape")
     protocol = payload.get("protocol")
+    action = payload.get("action")
     reply = payload.get("reply")
     session_id = payload.get("session_id")
     if protocol != HERMES_PROTOCOL:
         raise HermesProtocolError("unsupported_version")
+    if type(action) is not str:
+        raise HermesProtocolError("invalid_action")
+    try:
+        parsed_action = HermesAction(action)
+    except ValueError:
+        raise HermesProtocolError("invalid_action") from None
     if type(reply) is not str or not reply.strip():
         raise HermesProtocolError("invalid_reply")
     if type(session_id) is not str or _SESSION_ID.fullmatch(session_id) is None:
@@ -173,7 +187,7 @@ def parse_hermes_protocol(
         raise HermesProtocolError("invalid_unicode")
     if stdout != canonical:
         raise HermesProtocolError("noncanonical_output")
-    return HermesResult(reply=reply, session_id=session_id)
+    return HermesResult(reply=reply, session_id=session_id, action=parsed_action)
 
 
 def _terminate(process: subprocess.Popen[bytes]) -> None:
@@ -202,7 +216,7 @@ def _run_bounded(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         close_fds=True,
-        # The isolated Hermes account cannot traverse bridge-private state directories.
+        # A neutral cwd prevents accidental project discovery in either deployment mode.
         cwd=os.path.abspath(os.sep),
         env=env,
         start_new_session=os.name == "posix",
@@ -252,15 +266,23 @@ def _run_bounded(
 class SubprocessHermesRunner(HermesRunner):
     """Run the configured Hermes adapter without invoking a shell."""
 
-    def __init__(self, command: str, timeout: float = 300) -> None:
+    def __init__(
+        self,
+        command: str,
+        timeout: float = 300,
+        command_preflight: Callable[[], object] | None = None,
+    ) -> None:
         self.command = command
         self.timeout = timeout
+        self.command_preflight = command_preflight
 
     def run(
         self,
         message: NormalizedEmail,
         mapping: ConversationMapping | None,
     ) -> HermesResult:
+        if self.command_preflight is not None:
+            self.command_preflight()
         argv = shlex.split(self.command)
         if not argv:
             raise HermesRunnerError("HERMES_COMMAND cannot be empty")

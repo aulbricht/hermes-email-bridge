@@ -46,7 +46,7 @@ BUILD_BACKEND = "setuptools.build_meta"
 BUILD_BACKEND_VERSION = "81.0.0"
 BUILD_BACKEND_WHEEL_SHA256 = "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6"
 WRAPPER_SHA256 = "45f98b00e022a789fe168204da220e3146699c37a6368dfdf481a5f998c8985e"
-ADAPTER_SHA256 = "cb7dcc90186dbbcddc69ef67b4362e0c96246dcc42414ec09f05ba677822c016"
+ADAPTER_SHA256 = "06f1bf892061b0beb353e5f0032169622186baff5b4ab28549cd48d64a179c3a"
 SUDOERS_TEMPLATE_SHA256 = "493400bf54b26c1c988b43e0c5edcbd599d9a7a6e555e8eabdd2a25d3717da55"
 BOUNDARY_HELPER_SHA256 = "4ae0a9337e0f1205c8268e82d0b5c1a4bf692ce53016fcc74b84ce1b4967f9fb"
 FETCHER = Path(__file__).with_name("fetch-hermes-email-agent.py")
@@ -106,7 +106,7 @@ for method in ("_claim_active_session", "_ensure_runtime_credentials",
                "_resolve_turn_agent_config", "_init_agent"):
     assert callable(getattr(cli.HermesCLI, method, None))
 adapter_ns = runpy.run_path(str(adapter))
-assert adapter_ns["PROTOCOL"] == "hermes-email-bridge/1"
+assert adapter_ns["PROTOCOL"] == "hermes-email-bridge/2"
 assert adapter_ns["HERMES_VERSION"] == "0.18.2"
 assert adapter_ns["MODEL"] == "gpt-5.5"
 assert adapter_ns["PROVIDER"] == "openai-codex"
@@ -711,7 +711,7 @@ def probe_runtime(
         if (
             evidence.get("tool_schemas") != 0
             or evidence.get("version") != VERSION
-            or evidence.get("adapter_protocol") != "hermes-email-bridge/1"
+            or evidence.get("adapter_protocol") != "hermes-email-bridge/2"
         ):
             raise ValueError("installed Hermes probe returned unexpected evidence")
         if evidence.get("direct_url") != expected_direct:
@@ -774,7 +774,7 @@ def expected_attestation(paths: RuntimePaths) -> dict[str, Any]:
         raise ValueError("runtime boundary candidates do not match reviewed hashes")
     return {
         "archive_sha256": ARCHIVE_SHA256,
-        "adapter_protocol": "hermes-email-bridge/1",
+        "adapter_protocol": "hermes-email-bridge/2",
         "adapter_sha256": adapter_hash,
         "attestation_assets": {
             name: sha256_file(paths.runtime_root / name) for name in ATTESTATION_ASSETS

@@ -3,20 +3,22 @@ import plistlib
 import subprocess
 import sys
 import tomllib
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 
 from hermes_email_bridge import __version__
+from hermes_email_bridge.config import ISOLATED_VERIFIER_SHA256, USER_ADAPTER_SHA256
 
 ROOT = Path(__file__).parents[1]
 
 
 def test_version_has_one_project_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert project["project"]["version"] == "0.4.0"
-    assert __version__ == "0.4.0"
-    assert '__version__ = "0.4.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
+    assert project["project"]["version"] == "0.5.0"
+    assert __version__ == "0.5.0"
+    assert '__version__ = "0.5.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
 
 
 def test_docs_and_example_config_cover_composio_allowlisting_and_start_now() -> None:
@@ -52,12 +54,17 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     wrapper = wrapper_path.read_text()
     sudoers = sudoers_path.read_text()
     adapter = adapter_path.read_text()
+    adapter_hash = sha256(adapter_path.read_bytes()).hexdigest()
+    verifier_hash = sha256(probe_path.read_bytes()).hexdigest()
     combined = plist_text + launcher + wrapper + adapter + helper_path.read_text() + sudoers
     assert "snowcapconsulting" not in combined
     assert "aulbricht" not in combined
     assert "EMAIL_BRIDGE_COMPOSIO_API_KEY" not in combined
     assert "umask 077" in launcher
     assert '!= "600"' in launcher
+    assert "Hermes runtime must be upgraded for email protocol v2" in launcher
+    assert verifier_hash in launcher
+    assert verifier_hash == ISOLATED_VERIFIER_SHA256
     if os.name == "posix":
         assert launcher_path.stat().st_mode & 0o111
         assert wrapper_path.stat().st_mode & 0o111
@@ -85,7 +92,7 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     ):
         assert fixed in wrapper
     for fixed in (
-        'PROTOCOL = "hermes-email-bridge/1"',
+        'PROTOCOL = "hermes-email-bridge/2"',
         'HERMES_VERSION = "0.18.2"',
         'TOOLSETS = ["context_engine"]',
         'PROVIDER = "openai-codex"',
@@ -93,8 +100,13 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
         'NORMAL_TURN_EXIT_REASON = "text_response(finish_reason=stop)"',
         "os.dup2(devnull, 1)",
         "_finalize_single_query",
+        "_has_zero_tool_surface",
     ):
         assert fixed in adapter
+    assert "USER_ADAPTER_SHA256" in (
+        ROOT / "src/hermes_email_bridge/config.py"
+    ).read_text()
+    assert adapter_hash == USER_ADAPTER_SHA256
     installer = (ROOT / "deploy/macos/install-hermes-email-agent.py").read_text()
     assert 'rooted("/usr/local/libexec")' in installer
     assert 'rooted("/private/etc/sudoers.d")' in installer
@@ -106,11 +118,12 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "MAX_DOWNLOAD_BYTES" in fetcher
     assert "PROVENANCE_FILE" in fetcher
     runtime_installer = runtime_installer_path.read_text()
+    assert f'ADAPTER_SHA256 = "{adapter_hash}"' in runtime_installer
     assert "get_tool_definitions" in runtime_installer
     assert "AIAgent.run_conversation" in runtime_installer
     assert 'enabled_toolsets=["context_engine"]' in runtime_installer
     assert "ADAPTER_SHA256" in runtime_installer
-    assert '"adapter_protocol": "hermes-email-bridge/1"' in runtime_installer
+    assert '"adapter_protocol": "hermes-email-bridge/2"' in runtime_installer
     assert "--no-editable" in runtime_installer
     assert "LOCK_SHA256" in runtime_installer
     assert "runtime-attestation.json" in runtime_installer
@@ -259,8 +272,21 @@ def test_macos_launcher_sources_realistic_protected_environment(tmp_path: Path) 
         "/Library/Application Support/HermesEmailAgent/hermes-agent/"
         "runtime/verify-hermes-email-agent.py"
     )
-    assert launcher_text.index(fixed_verifier) < (launcher_text.index('. "$EMAIL_BRIDGE_ENV_FILE"'))
-    launcher.write_text(launcher_text.replace(fixed_verifier, "/usr/bin/true"))
+    verifier_hash = sha256(
+        (ROOT / "deploy/macos/verify-hermes-email-agent.py").read_bytes()
+    ).hexdigest()
+    assert "/usr/bin/env -i" in launcher_text
+    assert launcher_text.index(fixed_verifier) > (launcher_text.index('. "$EMAIL_BRIDGE_ENV_FILE"'))
+    fake_verifier = tmp_path / "verify-hermes-email-agent.py"
+    fake_verifier.write_text("#!/bin/sh\nexit 0\n")
+    fake_verifier.chmod(0o755)
+    fake_hash = sha256(fake_verifier.read_bytes()).hexdigest()
+    launcher.write_text(
+        launcher_text.replace(fixed_verifier, str(fake_verifier)).replace(
+            verifier_hash,
+            fake_hash,
+        )
+    )
     launcher.chmod(0o755)
 
     result = subprocess.run(

@@ -24,6 +24,21 @@ class ResolutionStatus(StrEnum):
     NO_MATCH = "no_match"
 
 
+class HermesAction(StrEnum):
+    """Only actions accepted from the no-tools Hermes adapter."""
+
+    REPLY = "reply"
+    APPROVAL_REQUIRED = "approval_required"
+
+
+class ApprovalStatus(StrEnum):
+    """Human-controlled states for quarantined email requests."""
+
+    PENDING = "pending"
+    RESOLVED = "resolved"
+    REJECTED = "rejected"
+
+
 @dataclass(frozen=True, slots=True)
 class Attachment:
     """Attachment metadata; content is intentionally fetched on demand."""
@@ -121,6 +136,21 @@ class AllowlistEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class ApprovalRequest:
+    """Minimal metadata for a request that must not auto-dispatch."""
+
+    id: int
+    provider: str
+    provider_message_id: str
+    participant_email: str
+    subject: str
+    hermes_session: str
+    status: ApprovalStatus
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class PollSummary:
     received: int
     processed: int
@@ -132,6 +162,7 @@ class PollSummary:
 class HermesResult:
     reply: str
     session_id: str
+    action: HermesAction = HermesAction.REPLY
 
 
 def utc_now() -> datetime:

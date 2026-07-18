@@ -64,7 +64,7 @@ def verify_wrapper_shapes(wrapper: Path) -> None:
 def verify_adapter_shape(adapter: Path) -> None:
     namespace = runpy.run_path(str(adapter))
     if (
-        namespace.get("PROTOCOL") != "hermes-email-bridge/1"
+        namespace.get("PROTOCOL") != "hermes-email-bridge/2"
         or namespace.get("HERMES_VERSION") != "0.18.2"
         or namespace.get("MODEL") != "gpt-5.5"
         or namespace.get("PROVIDER") != "openai-codex"
@@ -206,12 +206,18 @@ def _parse_protocol(result: subprocess.CompletedProcess[str]) -> dict[str, str]:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise ValueError("Hermes live protocol is malformed") from exc
-    if not isinstance(payload, dict) or set(payload) != {"protocol", "reply", "session_id"}:
+    if not isinstance(payload, dict) or set(payload) != {
+        "action",
+        "protocol",
+        "reply",
+        "session_id",
+    }:
         raise ValueError("Hermes live protocol has an invalid shape")
     reply = payload.get("reply")
     session_id = payload.get("session_id")
     if (
-        payload.get("protocol") != "hermes-email-bridge/1"
+        payload.get("protocol") != "hermes-email-bridge/2"
+        or payload.get("action") != "reply"
         or not isinstance(reply, str)
         or not reply.strip()
         or not isinstance(session_id, str)
@@ -230,7 +236,13 @@ def verify_live(
     *,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> None:
-    fresh = _live_call(["--query", "Reply with exactly: EMAIL_BRIDGE_PROBE_OK"], runner=runner)
+    fresh = _live_call(
+        [
+            "--query",
+            'Return exactly: {"action":"reply","reply":"EMAIL_BRIDGE_PROBE_OK"}',
+        ],
+        runner=runner,
+    )
     fresh_payload = _parse_protocol(fresh)
     if fresh_payload["reply"] != "EMAIL_BRIDGE_PROBE_OK":
         raise ValueError("Hermes live new-session probe failed")
@@ -239,7 +251,7 @@ def verify_live(
             "--resume",
             fresh_payload["session_id"],
             "--query",
-            "Reply with exactly: EMAIL_BRIDGE_RESUME_OK",
+            'Return exactly: {"action":"reply","reply":"EMAIL_BRIDGE_RESUME_OK"}',
         ],
         runner=runner,
     )

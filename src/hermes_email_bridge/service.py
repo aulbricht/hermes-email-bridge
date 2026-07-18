@@ -5,7 +5,14 @@ from __future__ import annotations
 import logging
 
 from .mapping import normalize_email_address
-from .models import NormalizedEmail, PollSummary, ResolutionStatus, SenderAuthentication
+from .models import (
+    HermesAction,
+    HermesResult,
+    NormalizedEmail,
+    PollSummary,
+    ResolutionStatus,
+    SenderAuthentication,
+)
 from .providers.base import EmailProvider
 from .runner import HermesProtocolError, HermesRunner
 from .store import MappingStore
@@ -88,6 +95,7 @@ class BridgeService:
                 **context,
             },
         )
+
         resolution = self.store.resolve(message, allow_subject_resume=self.allow_subject_resume)
         if resolution.status is ResolutionStatus.DENIED:
             logger.warning(
@@ -161,20 +169,17 @@ class BridgeService:
                 message_ids=(message.provider_message_id,),
             )
 
-        if not self.send_replies:
-            outcome = "reply_disabled"
-            self._log_reply_skipped("send_disabled", context)
-        elif self.dry_run:
-            outcome = "reply_dry_run"
-            self._log_reply_skipped("dry_run", context)
-        elif (
-            self.reply_domains and self._email_domain(message.from_email) not in self.reply_domains
-        ):
-            outcome = "reply_domain_denied"
-            self._log_reply_skipped("sender_domain", context)
-        elif not result.reply:
-            outcome = "reply_empty"
-            self._log_reply_skipped("empty_hermes_response", context)
+        reply_skip_reason = self._reply_skip_reason(message, result)
+        if result.action is HermesAction.APPROVAL_REQUIRED and reply_skip_reason is None:
+            approval = self.store.enqueue_approval(message, result)
+            logger.info(
+                "approval queued",
+                extra={"event": "approval_queued", "approval_id": approval.id},
+            )
+
+        if reply_skip_reason is not None:
+            outcome, reason = reply_skip_reason
+            self._log_reply_skipped(reason, context)
         else:
             try:
                 reply_id = self.provider.reply(message, result.reply)
@@ -202,6 +207,19 @@ class BridgeService:
             raw_retention_days=self.raw_retention_days,
         )
         return "processed"
+
+    def _reply_skip_reason(
+        self, message: NormalizedEmail, result: HermesResult
+    ) -> tuple[str, str] | None:
+        if not self.send_replies:
+            return "reply_disabled", "send_disabled"
+        if self.dry_run:
+            return "reply_dry_run", "dry_run"
+        if self.reply_domains and self._email_domain(message.from_email) not in self.reply_domains:
+            return "reply_domain_denied", "sender_domain"
+        if not result.reply:
+            return "reply_empty", "empty_hermes_response"
+        return None
 
     @staticmethod
     def _email_domain(address: str) -> str | None:

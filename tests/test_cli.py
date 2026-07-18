@@ -7,7 +7,13 @@ from typing import cast
 import pytest
 
 from hermes_email_bridge.cli import _run_poll_loop, main
-from hermes_email_bridge.models import NormalizedEmail, PollSummary, SenderAuthentication
+from hermes_email_bridge.models import (
+    HermesAction,
+    HermesResult,
+    NormalizedEmail,
+    PollSummary,
+    SenderAuthentication,
+)
 from hermes_email_bridge.providers.base import RetryableProviderError
 from hermes_email_bridge.service import BridgeService
 from hermes_email_bridge.store import MappingStore
@@ -90,6 +96,38 @@ def test_allowlist_cli_add_list_remove(
     assert json.loads(capsys.readouterr().out) == {"removed": True}
 
 
+def test_approval_cli_lists_and_closes_local_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "bridge.db"
+    message = NormalizedEmail(
+        provider="agentmail",
+        provider_message_id="message-approval",
+        from_email="person@example.com",
+        to_email="bridge@example.com",
+        subject="Needs tools",
+        text_body="Sensitive body that must not enter the approval table",
+        received_at=datetime.now(UTC),
+    )
+    with MappingStore(path) as store:
+        request = store.enqueue_approval(
+            message,
+            HermesResult("Queued.", "session-1", HermesAction.APPROVAL_REQUIRED),
+        )
+    monkeypatch.setenv("EMAIL_BRIDGE_DB_PATH", str(path))
+
+    assert main(["approvals", "list"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed[0]["id"] == request.id
+    assert message.text_body not in json.dumps(listed)
+    assert main(["approvals", "resolve", str(request.id)]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "resolved"
+    assert main(["approvals", "list"]) == 0
+    assert json.loads(capsys.readouterr().out) == []
+
+
 def test_init_db_start_now_seeds_both_agentmail_cursors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -152,4 +190,4 @@ def test_version_reports_project_version(capsys: pytest.CaptureFixture[str]) -> 
     with pytest.raises(SystemExit) as stopped:
         main(["--version"])
     assert stopped.value.code == 0
-    assert capsys.readouterr().out.strip() == "0.4.0"
+    assert capsys.readouterr().out.strip() == "0.5.0"
