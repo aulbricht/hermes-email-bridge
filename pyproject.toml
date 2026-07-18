@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-email-bridge"
-version = "0.5.0"
+version = "0.5.1"
 description = "Provider-neutral inbound email bridge for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"

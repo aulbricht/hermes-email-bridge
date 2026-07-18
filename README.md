@@ -4,7 +4,7 @@
 
 AgentMail is the first adapter, not a core dependency. The bridge contract is intentionally small enough for future IMAP, Gmail API, Postmark, SendGrid, or SES adapters.
 
-> Version: **0.5.0 (alpha)**. Start with replies disabled and dry-run enabled.
+> Version: **0.5.1 (alpha)**. Start with replies disabled and dry-run enabled.
 
 ## What works
 
@@ -666,7 +666,22 @@ environment and database with normal service-manager permissions. The same-accou
 described above applies. A stronger Linux deployment needs an equivalent service account,
 container, or VM boundary and its own reviewed startup attestation.
 
+Linux runtimes that already use OpenRouter may select the adapter's only alternate reviewed
+runtime. This pins provider `openrouter`, model `z-ai/glm-5.2`, Hermes Agent 0.18.2, one turn, and
+the same zero-tool and protocol-v2 checks; arbitrary providers, models, or runtime names remain
+invalid:
+
+```bash
+HERMES_COMMAND='/absolute/hermes/venv/bin/python -I -B /absolute/hermes-email-agent-adapter.py --runtime openrouter'
+```
+
 ## Release notes
+
+### 0.5.1
+
+- Added one explicit, reviewed OpenRouter adapter runtime for existing Linux Hermes deployments.
+- Kept the default macOS/OpenAI-Codex invocation unchanged and continued rejecting arbitrary
+  provider, model, and command arguments.
 
 ### 0.5.0
 
