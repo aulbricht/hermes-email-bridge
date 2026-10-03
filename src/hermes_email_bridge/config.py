@@ -22,7 +22,7 @@ ISOLATED_VERIFIER_PATH = Path(
     "verify-hermes-email-agent.py"
 )
 ISOLATED_VERIFIER_SHA256 = "77ef28ff214d5b197d765f90d72c9cbd43494e0d6984686f35b4469354259891"
-USER_ADAPTER_SHA256 = "0f34ee02a77840f2d476ba3769d8b2e670427ae58c79d279b22b62a62e6623ae"
+USER_ADAPTER_SHA256 = "d37965f3f74aa06929b9068b4b6f7e33ef1e58e50c1500e5dd31f9c6bcad463f"
 
 
 class ConfigError(ValueError):
@@ -55,8 +55,25 @@ def _domains(value: str, name: str) -> frozenset[str]:
         raise ConfigError(f"{name} must be comma-separated email domains") from exc
 
 
-def validate_agentmail_base_url(value: str, *, allow_local_http: bool = False) -> str:
-    """Return a normalized, credential-free HTTPS AgentMail API base URL."""
+def _addresses(value: str, name: str) -> frozenset[str]:
+    if not value.strip():
+        return frozenset()
+    items = value.split(",")
+    if any(not item.strip() for item in items):
+        raise ConfigError(f"{name} must be comma-separated email addresses")
+    try:
+        return frozenset(normalize_email_address(item) for item in items)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be comma-separated email addresses") from exc
+
+
+def validate_api_base_url(
+    value: str,
+    *,
+    variable: str,
+    allow_local_http: bool = False,
+) -> str:
+    """Return a normalized, credential-free API base URL."""
 
     base_url = value.rstrip("/")
     try:
@@ -64,11 +81,11 @@ def validate_agentmail_base_url(value: str, *, allow_local_http: bool = False) -
         hostname = parsed.hostname
         _port = parsed.port
     except ValueError as exc:
-        raise ConfigError("AGENTMAIL_BASE_URL is invalid") from exc
+        raise ConfigError(f"{variable} is invalid") from exc
     if not hostname or parsed.username is not None or parsed.password is not None:
-        raise ConfigError("AGENTMAIL_BASE_URL must have a host and no credentials")
+        raise ConfigError(f"{variable} must have a host and no credentials")
     if parsed.query or parsed.fragment:
-        raise ConfigError("AGENTMAIL_BASE_URL cannot contain a query or fragment")
+        raise ConfigError(f"{variable} cannot contain a query or fragment")
     if parsed.scheme == "https":
         return base_url
     if hostname.lower() == "localhost":
@@ -81,8 +98,18 @@ def validate_agentmail_base_url(value: str, *, allow_local_http: bool = False) -
     if parsed.scheme == "http" and allow_local_http and is_loopback:
         return base_url
     raise ConfigError(
-        "AGENTMAIL_BASE_URL must use HTTPS; local HTTP requires "
-        "AGENTMAIL_ALLOW_INSECURE_LOCAL_HTTP=true and a loopback host"
+        f"{variable} must use HTTPS; local HTTP requires its insecure-local-HTTP gate "
+        "and a loopback host"
+    )
+
+
+def validate_agentmail_base_url(value: str, *, allow_local_http: bool = False) -> str:
+    """Return a normalized, credential-free HTTPS AgentMail API base URL."""
+
+    return validate_api_base_url(
+        value,
+        variable="AGENTMAIL_BASE_URL",
+        allow_local_http=allow_local_http,
     )
 
 
@@ -231,8 +258,11 @@ class Settings:
     provider: str
     db_path: Path
     send_replies: bool
+    send_initiated: bool
     dry_run: bool
+    allowed_senders: frozenset[str]
     reply_domains: frozenset[str]
+    reply_proof_max_age_days: int
     store_raw: bool
     raw_retention_days: int
     allow_subject_resume: bool
@@ -248,6 +278,11 @@ class Settings:
     bridge_composio_api_key: str | None
     composio_connected_account_id: str | None
     composio_inbox_id: str | None
+    nylas_api_key: str | None
+    nylas_grant_id: str | None
+    nylas_account_email: str | None
+    nylas_base_url: str
+    nylas_allow_insecure_local_http: bool
     webhook_host: str
     webhook_port: int
     webhook_queue_size: int
@@ -260,6 +295,9 @@ class Settings:
             hermes_timeout = float(values.get("HERMES_TIMEOUT", "300"))
             webhook_port = int(values.get("EMAIL_BRIDGE_WEBHOOK_PORT", "8787"))
             raw_retention_days = int(values.get("EMAIL_BRIDGE_RAW_RETENTION_DAYS", "30"))
+            reply_proof_max_age_days = int(
+                values.get("EMAIL_BRIDGE_REPLY_PROOF_MAX_AGE_DAYS", "90")
+            )
             webhook_queue_size = int(values.get("EMAIL_BRIDGE_WEBHOOK_QUEUE_SIZE", "8"))
         except ValueError as exc:
             raise ConfigError(f"invalid numeric configuration: {exc}") from exc
@@ -269,6 +307,8 @@ class Settings:
             raise ConfigError("webhook port must be between 1 and 65535")
         if raw_retention_days <= 0:
             raise ConfigError("raw retention days must be positive")
+        if reply_proof_max_age_days <= 0:
+            raise ConfigError("reply proof maximum age must be positive")
         if webhook_queue_size <= 0:
             raise ConfigError("webhook queue size must be positive")
 
@@ -287,9 +327,22 @@ class Settings:
             values.get("AGENTMAIL_BASE_URL", "https://api.agentmail.to/v0"),
             allow_local_http=allow_local_http,
         )
+        nylas_allow_local_http = _bool(
+            values.get("NYLAS_ALLOW_INSECURE_LOCAL_HTTP", "false"),
+            "NYLAS_ALLOW_INSECURE_LOCAL_HTTP",
+        )
+        nylas_base_url = validate_api_base_url(
+            values.get("NYLAS_BASE_URL", "https://api.us.nylas.com/v3"),
+            variable="NYLAS_BASE_URL",
+            allow_local_http=nylas_allow_local_http,
+        )
         send_replies = _bool(
             values.get("EMAIL_BRIDGE_SEND_REPLIES", "false"),
             "EMAIL_BRIDGE_SEND_REPLIES",
+        )
+        send_initiated = _bool(
+            values.get("EMAIL_BRIDGE_SEND_INITIATED", "false"),
+            "EMAIL_BRIDGE_SEND_INITIATED",
         )
         dry_run = _bool(
             values.get("EMAIL_BRIDGE_DRY_RUN", "true"),
@@ -302,7 +355,12 @@ class Settings:
             provider=provider,
             db_path=db_path,
             send_replies=send_replies,
+            send_initiated=send_initiated,
             dry_run=dry_run,
+            allowed_senders=_addresses(
+                values.get("EMAIL_BRIDGE_ALLOWED_SENDERS", ""),
+                "EMAIL_BRIDGE_ALLOWED_SENDERS",
+            ),
             reply_domains=_domains(
                 values.get("EMAIL_BRIDGE_REPLY_DOMAINS", ""),
                 "EMAIL_BRIDGE_REPLY_DOMAINS",
@@ -312,6 +370,7 @@ class Settings:
                 "EMAIL_BRIDGE_STORE_RAW",
             ),
             raw_retention_days=raw_retention_days,
+            reply_proof_max_age_days=reply_proof_max_age_days,
             allow_subject_resume=_bool(
                 values.get("EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME", "false"),
                 "EMAIL_BRIDGE_ALLOW_SUBJECT_RESUME",
@@ -328,10 +387,32 @@ class Settings:
             bridge_composio_api_key=values.get("EMAIL_BRIDGE_COMPOSIO_API_KEY"),
             composio_connected_account_id=values.get("COMPOSIO_AGENT_MAIL_CONNECTED_ACCOUNT_ID"),
             composio_inbox_id=values.get("COMPOSIO_AGENT_MAIL_INBOX_ID"),
+            nylas_api_key=values.get("NYLAS_API_KEY"),
+            nylas_grant_id=values.get("NYLAS_GRANT_ID"),
+            nylas_account_email=(
+                normalize_email_address(values["NYLAS_ACCOUNT_EMAIL"])
+                if values.get("NYLAS_ACCOUNT_EMAIL")
+                else None
+            ),
+            nylas_base_url=nylas_base_url,
+            nylas_allow_insecure_local_http=nylas_allow_local_http,
             webhook_host=values.get("EMAIL_BRIDGE_WEBHOOK_HOST", "127.0.0.1"),
             webhook_port=webhook_port,
             webhook_queue_size=webhook_queue_size,
         )
+
+    def require_nylas(self) -> tuple[str, str, str]:
+        if self.provider != "nylas":
+            raise ConfigError(f"unsupported provider: {self.provider}")
+        if not self.nylas_api_key:
+            raise ConfigError("NYLAS_API_KEY is required")
+        if not self.nylas_grant_id:
+            raise ConfigError("NYLAS_GRANT_ID is required")
+        if not self.nylas_account_email:
+            raise ConfigError("NYLAS_ACCOUNT_EMAIL is required")
+        if not self.allowed_senders:
+            raise ConfigError("EMAIL_BRIDGE_ALLOWED_SENDERS is required for Nylas")
+        return self.nylas_api_key, self.nylas_grant_id, self.nylas_account_email
 
     def require_agentmail(self) -> tuple[str, str]:
         if self.provider != "agentmail":
@@ -360,4 +441,6 @@ class Settings:
     def logical_provider(self) -> str:
         if self.provider in {"agentmail", "composio-agentmail"}:
             return "agentmail"
+        if self.provider == "nylas":
+            return "nylas"
         raise ConfigError(f"unsupported provider: {self.provider}")

@@ -3,6 +3,7 @@ import logging
 import os
 import shlex
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from hermes_email_bridge.models import (
     SenderAuthentication,
     SentEmail,
 )
+from hermes_email_bridge.providers.base import AmbiguousSendError
 from hermes_email_bridge.providers.fake import FakeProvider
 from hermes_email_bridge.runner import (
     HERMES_PROTOCOL,
@@ -55,6 +57,11 @@ class StubRunner(HermesRunner):
     ) -> HermesResult:
         self.calls += 1
         return HermesResult("Hermes reply", mapping.hermes_session if mapping else "session-new")
+
+
+class ReplyProofProvider(FakeProvider):
+    name = "nylas"
+    requires_reply_proof = True
 
 
 def test_dry_run_never_sends_reply() -> None:
@@ -196,6 +203,137 @@ def test_trusted_sent_enrollment_precedes_inbound_and_replies_exactly_once() -> 
         assert service.poll_once().skipped == 1
         assert runner.calls == 1
         assert len(provider.replies) == 1
+
+
+def test_reply_proof_and_runtime_allowlist_are_both_required() -> None:
+    message = replace(
+        _message(),
+        provider="nylas",
+        sender_authentication=SenderAuthentication.UNKNOWN,
+        in_reply_to="<observed@example.test>",
+    )
+    sent = SentEmail(
+        provider="nylas",
+        provider_message_id="<observed@example.test>",
+        recipients=(message.from_email,),
+        sent_at=message.received_at - timedelta(minutes=1),
+    )
+    provider = ReplyProofProvider([message], [sent])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+            allowed_senders=frozenset({message.from_email}),
+        )
+        assert service.poll_once().processed == 1
+        assert runner.calls == 1
+        assert provider.replies == [(message.provider_message_id, "Hermes reply")]
+
+
+def test_unknown_direct_mail_is_denied_even_when_sender_is_configured() -> None:
+    message = replace(
+        _message(),
+        provider="nylas",
+        sender_authentication=SenderAuthentication.UNKNOWN,
+        in_reply_to=None,
+    )
+    provider = ReplyProofProvider([message])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+            allowed_senders=frozenset({message.from_email}),
+        )
+        assert service.handle(message) == "skipped"
+        assert runner.calls == 0
+        assert provider.replies == []
+
+
+def test_runtime_allowlist_cannot_be_widened_by_observed_sent_mail() -> None:
+    message = replace(
+        _message(),
+        provider="nylas",
+        from_email="outside@example.test",
+        sender_authentication=SenderAuthentication.UNKNOWN,
+        in_reply_to="<observed@example.test>",
+    )
+    sent = SentEmail(
+        provider="nylas",
+        provider_message_id="<observed@example.test>",
+        recipients=(message.from_email,),
+        sent_at=message.received_at - timedelta(minutes=1),
+    )
+    provider = ReplyProofProvider([message], [sent])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            allowed_senders=frozenset({"configured@example.test"}),
+        )
+        summary = service.poll_once()
+        assert summary.skipped == 1
+        assert store.is_allowed("nylas", message.from_email)
+        assert runner.calls == 0
+
+
+def test_ambiguous_reply_is_terminal_and_never_retried() -> None:
+    class AmbiguousProvider(FakeProvider):
+        def reply(self, message: NormalizedEmail, text: str) -> str:
+            del message, text
+            raise AmbiguousSendError("result unavailable")
+
+    message = _message()
+    provider = AmbiguousProvider([message])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+        )
+        assert service.handle(message) == "processed"
+        assert service.handle(message) == "skipped"
+        row = store._connection.execute(
+            "SELECT outcome FROM processed_messages WHERE message_id = ?",
+            (message.provider_message_id,),
+        ).fetchone()
+        assert row is not None and row["outcome"] == "reply_uncertain"
+        assert runner.calls == 1
+
+
+def test_concurrent_duplicate_delivery_invokes_and_replies_once() -> None:
+    message = _message()
+    provider = FakeProvider([message])
+    runner = StubRunner()
+    with MappingStore(":memory:") as store:
+        store.add_allowed_address("fake", message.from_email)
+        service = BridgeService(
+            provider=provider,
+            store=store,
+            runner=runner,
+            send_replies=True,
+            dry_run=False,
+        )
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            outcomes = list(executor.map(service.handle, [message] * 8))
+
+        assert outcomes.count("processed") == 1
+        assert outcomes.count("skipped") == 7
+        assert runner.calls == 1
+        assert provider.replies == [(message.provider_message_id, "Hermes reply")]
 
 
 def test_start_now_ignores_historical_sent_and_inbound_messages() -> None:
