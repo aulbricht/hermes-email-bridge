@@ -4,17 +4,19 @@
 
 AgentMail is the first adapter, not a core dependency. The bridge contract is intentionally small enough for future IMAP, Gmail API, Postmark, SendGrid, or SES adapters.
 
-> Version: **0.5.1 (alpha)**. Start with replies disabled and dry-run enabled.
+> Version: **0.6.3 (alpha)**. Start with sending disabled and dry-run enabled.
 
 ## What works
 
+- Nylas Agent Account polling, message inspection, initiated sends, and threaded replies
 - Direct or Composio-backed AgentMail polling, message inspection, threaded replies, and verified webhooks
 - Provider-neutral typed message and attachment models
 - Authorization-aware SQLite mappings bound to a provider-authenticated participant
 - Hermes session creation and resume through a version-pinned programmatic adapter
 - JSON structured logs with secret-field redaction
 - Persistent poll cursor, processed-message idempotency, and optional raw payload storage
-- Exact sender allowlisting with automatic enrollment from trusted outbound mail
+- Exact runtime sender allowlisting, plus reply-possession proof for Nylas inbound mail
+- Journaled initiated sends with stable operation IDs and terminal uncertain outcomes
 - No-tools automatic replies with a non-dispatchable local inbox for requests that need tools
 - No runtime Python dependencies
 
@@ -61,14 +63,21 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `EMAIL_BRIDGE_PROVIDER` | `agentmail` | `agentmail` or `composio-agentmail` |
+| `EMAIL_BRIDGE_PROVIDER` | `agentmail` | `nylas`, `agentmail`, or `composio-agentmail` |
+| `NYLAS_API_KEY` | required for Nylas | Production-application API key |
+| `NYLAS_GRANT_ID` | required for Nylas | The one isolated Agent Account grant |
+| `NYLAS_ACCOUNT_EMAIL` | required for Nylas | Exact configured mailbox identity |
+| `NYLAS_BASE_URL` | `https://api.us.nylas.com/v3` | HTTPS Nylas regional API base URL |
 | `AGENTMAIL_API_KEY` | required | AgentMail bearer API key |
 | `AGENTMAIL_INBOX_ID` | required | Inbox address or ID |
 | `AGENTMAIL_WEBHOOK_SECRET` | required by `serve` | Svix signing secret (`whsec_…`) |
 | `EMAIL_BRIDGE_DB_PATH` | `~/.local/state/hermes-email-bridge/bridge.db` | SQLite database |
 | `EMAIL_BRIDGE_SEND_REPLIES` | `false` | Allow outbound replies |
+| `EMAIL_BRIDGE_SEND_INITIATED` | `false` | Allow caller-journaled initiated sends |
 | `EMAIL_BRIDGE_DRY_RUN` | `true` | Skip provider send even when replies are enabled |
+| `EMAIL_BRIDGE_ALLOWED_SENDERS` | empty | Required comma-separated exact inbound senders for Nylas |
 | `EMAIL_BRIDGE_REPLY_DOMAINS` | empty | Optional comma-separated exact domains allowed to receive replies |
+| `EMAIL_BRIDGE_REPLY_PROOF_MAX_AGE_DAYS` | `90` | Maximum age of an observed outbound Message-ID used as reply proof |
 | `AGENTMAIL_BASE_URL` | `https://api.agentmail.to/v0` | HTTPS AgentMail API base URL |
 | `AGENTMAIL_ALLOW_INSECURE_LOCAL_HTTP` | `false` | Permit HTTP only to `localhost` or a loopback IP for local tests |
 | `EMAIL_BRIDGE_COMPOSIO_API_KEY` | required for Composio | Bridge-only project key scoped to Proxy Execute |
@@ -172,12 +181,75 @@ Cc, and Bcc recipients on new messages sent from the configured inbox are added 
 the allowlist automatically. Removing an address remains effective across cursor
 overlap and restarts; only a later, newly observed outbound message can authorize it again.
 
+For Nylas, `EMAIL_BRIDGE_ALLOWED_SENDERS` is the authoritative upper bound and cannot
+be widened by sent mail or by the allowlist CLI. The bridge also requires the inbound
+message to be addressed only to the configured identity and to carry `In-Reply-To`
+for a recent outbound Message-ID observed through the configured grant. Direct mail,
+pre-cutover history, wrong-recipient mail, and From-only spoof attempts are denied
+before Hermes is invoked. Nylas message headers alone are never treated as an
+authentication verdict.
+
 Poll once, or continuously:
 
 ```bash
 hermes-email-bridge poll
 hermes-email-bridge poll --continuous --interval 15
 ```
+
+Initiated sends accept one exact JSON object on stdin. The identity is never an input,
+and CC/BCC are not supported. Reusing the same operation ID returns the stored result;
+an ambiguous provider outcome becomes terminal and is never retried automatically:
+
+```bash
+printf '%s' '{"operation_id":"run-20260713-001","to":"person@example.test","subject":"Update","text":"Open fmp://record/123","html":null}' \
+  | hermes-email-bridge send
+```
+
+The command remains blocked unless `EMAIL_BRIDGE_SEND_INITIATED=true` and
+`EMAIL_BRIDGE_DRY_RUN=false`. Nylas sends omit tracking options, so the bridge does not
+request click rewriting. Production activation still requires a mailbox canary that
+confirms literal custom-scheme content survives end to end.
+
+### Delivery evidence (0.7.0)
+
+Successful `send` output retains `provider_message_id` and `duplicate`, and adds
+`transport_state=accepted` and `delivery_state`. Acceptance
+means the provider accepted the request, not that the recipient received it.
+Delivery states are `awaiting`, `delivered`, `bounced`, `complaint`, and `rejected`.
+Inspect the additive delivery ledger without invoking the provider or sending mail:
+
+```bash
+hermes-email-bridge delivery-status run-20260713-001
+```
+
+Nylas acceptance records the available API message ID and RFC Message-ID alongside
+the stable request operation ID. Authenticated events reconcile by that identity; unmatched
+events are quarantined and duplicate events are durable no-ops. Adverse outcomes
+take precedence over delivery success, including when events arrive out of order.
+Accepted or ambiguous operations are never automatically resent.
+
+The optional delivery monitor requires `pip install 'hermes-email-bridge[aws]'`.
+`deploy/aws/nylas-delivery.yaml` and `nylas_receiver.py` provide a raw-body HMAC
+receiver and encrypted FIFO queue with a retained DLQ and alarms. Supply an existing
+SecureString parameter encrypted by a customer-managed KMS key and a confirmed
+operator alarm topic; never put secret values in stack parameters or logs. Subscribe
+only to the four delivery events listed in the template, with compression disabled.
+The pull-only worker requires queue-consumer permissions, not Nylas credentials:
+
+```bash
+python -m hermes_email_bridge.delivery_worker \
+  --db-path /absolute/bridge.db --queue-url "$DELIVERY_QUEUE_URL" \
+  --grant-id "$NYLAS_GRANT_ID" --region "$AWS_REGION"
+```
+
+The macOS wrapper reads an owner-only `config/email-delivery.env`; the LaunchAgent
+template runs it independently of inbound processing. Delivery tables are additive
+and preserve the existing database version for rollback. A `delivered` event proves
+provider delivery only: callers that promise inbox visibility must additionally
+verify the controlled recipient mailbox. Production rollout requires the target
+gate, signed receiver fixtures, worker verification, and a controlled-mailbox canary.
+Rollback disables ingress and the worker and restores the prior caller/release;
+retain queued events and delivery tables as evidence.
 
 Inspect how a provider message normalizes (add `--raw` to include the raw payload):
 
@@ -676,6 +748,40 @@ HERMES_COMMAND='/absolute/hermes/venv/bin/python -I -B /absolute/hermes-email-ag
 ```
 
 ## Release notes
+
+### 0.7.0
+
+- Distinguished provider acceptance from delivery while retaining existing send fields.
+- Added an additive, idempotent delivery ledger and a pull-only SQS monitor.
+- Added signed Nylas delivery ingress infrastructure with retained evidence and alarms.
+- Preserved accepted/uncertain send suppression and compatibility with the prior database.
+
+### 0.6.3
+
+- Added a reviewed same-account adapter pinned to Hermes Agent 0.20.4,
+  `openai-codex`, and `gpt-5.6-sol` without changing the optional isolated
+  Hermes 0.18.2 runtime.
+- Isolated the generic email MCP server on the compatible MCP SDK 1.28.1 and
+  removed the legacy AgentMail-named compatibility tool.
+
+### 0.6.2
+
+- Removed an unsupported message-list field projection for Nylas Agent Accounts.
+
+### 0.6.1
+
+- Added the live Nylas Agent Account system-folder shape to inbox and sent-folder discovery.
+
+### 0.6.0
+
+- Added a Nylas Agent Account transport without changing the provider-neutral bridge contract.
+- Added exact configured-recipient enforcement and reply-possession proof backed by recent sent
+  Message-IDs observed through the isolated grant.
+- Added an authoritative runtime sender allowlist that sent-mail enrollment cannot widen.
+- Added provider idempotency keys, durable initiated-send journaling, terminal uncertain outcomes,
+  and concurrent duplicate suppression.
+- Added the generic `email_send` MCP surface plus a temporary single-recipient compatibility alias.
+- Preserved the v0.5 database version and provider release as a side-by-side rollback target.
 
 ### 0.5.1
 

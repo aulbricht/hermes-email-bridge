@@ -20,6 +20,8 @@ from .models import (
     HermesResult,
     MappingResolution,
     NormalizedEmail,
+    OutboundOperation,
+    OutboundState,
     ResolutionStatus,
     SenderAuthentication,
     SentEmail,
@@ -124,6 +126,7 @@ class MappingStore:
                     f"version {_SCHEMA_VERSION}"
                 )
             if version == _SCHEMA_VERSION:
+                self._ensure_compatible_extensions()
                 return
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -202,10 +205,32 @@ class MappingStore:
                     """
                 )
                 self._connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                self._ensure_compatible_extensions()
                 self._connection.commit()
             except Exception:
                 self._connection.rollback()
                 raise
+
+    def _ensure_compatible_extensions(self) -> None:
+        """Create additive tables that older schema-v3 releases safely ignore."""
+
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbound_operations (
+                provider TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (
+                    state IN ('pending', 'sent', 'uncertain', 'failed')
+                ),
+                provider_message_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (provider, operation_id)
+            )
+            """
+        )
+        self._connection.commit()
 
     def add_mapping(
         self,
@@ -355,10 +380,10 @@ class MappingStore:
     def resolve(
         self, message: NormalizedEmail, *, allow_subject_resume: bool = False
     ) -> MappingResolution:
-        if (
-            message.sender_authentication is not SenderAuthentication.AUTHENTICATED
-            or not self._participant(message)
-        ):
+        if message.sender_authentication not in {
+            SenderAuthentication.AUTHENTICATED,
+            SenderAuthentication.REPLY_PROVEN,
+        } or not self._participant(message):
             return MappingResolution(ResolutionStatus.DENIED, matched_by="sender_authentication")
 
         with self._lock:
@@ -542,9 +567,7 @@ class MappingStore:
             ).fetchall()
             return [self._row_to_allowlist(row) for row in rows]
 
-    def enqueue_approval(
-        self, message: NormalizedEmail, result: HermesResult
-    ) -> ApprovalRequest:
+    def enqueue_approval(self, message: NormalizedEmail, result: HermesResult) -> ApprovalRequest:
         """Quarantine minimal request metadata without dispatching work or storing the body."""
 
         now = utc_now().isoformat()
@@ -631,9 +654,7 @@ class MappingStore:
                 raise RuntimeError("approval update failed")
             return self._row_to_approval(row)
 
-    def purge_closed_approvals(
-        self, older_than_days: int, *, now: datetime | None = None
-    ) -> int:
+    def purge_closed_approvals(self, older_than_days: int, *, now: datetime | None = None) -> int:
         if older_than_days <= 0:
             raise ValueError("approval retention days must be positive")
         cutoff = (now or utc_now()) - timedelta(days=older_than_days)
@@ -702,6 +723,29 @@ class MappingStore:
                 count += 1
             return count
 
+    def has_observed_sent_message(
+        self,
+        provider: str,
+        message_id: str,
+        *,
+        max_age_days: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Return whether a recent provider-observed send proves a reply capability."""
+
+        if max_age_days <= 0:
+            raise ValueError("maximum age must be positive")
+        cutoff = (now or utc_now()) - timedelta(days=max_age_days)
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM observed_sent_messages
+                WHERE provider = ? AND message_id = ? AND observed_at >= ?
+                """,
+                (provider, message_id, cutoff.isoformat()),
+            ).fetchone()
+            return row is not None
+
     def seed_poll_cursors(self, provider: str, *, now: datetime | None = None) -> tuple[str, ...]:
         """Atomically seed missing inbound/sent cursors and their no-history floors."""
 
@@ -752,6 +796,110 @@ class MappingStore:
                 """,
                 (provider, cursor, utc_now().isoformat()),
             )
+
+    def claim_outbound_operation(
+        self,
+        provider: str,
+        operation_id: str,
+        payload_hash: str,
+    ) -> tuple[OutboundOperation, bool]:
+        """Journal one logical send before the provider is contacted."""
+
+        now = utc_now().isoformat()
+        with self._lock, self._connection:
+            inserted = self._connection.execute(
+                """
+                INSERT INTO outbound_operations(
+                    provider, operation_id, payload_hash, state,
+                    provider_message_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', NULL, ?, ?)
+                ON CONFLICT(provider, operation_id) DO NOTHING
+                """,
+                (provider, operation_id, payload_hash, now, now),
+            )
+            row = self._connection.execute(
+                """
+                SELECT * FROM outbound_operations
+                WHERE provider = ? AND operation_id = ?
+                """,
+                (provider, operation_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("outbound operation journal insert failed")
+            operation = self._row_to_outbound_operation(row)
+            if operation.payload_hash != payload_hash:
+                raise ValueError("operation_id was already used for a different payload")
+            return operation, inserted.rowcount == 1
+
+    def set_outbound_state(
+        self,
+        provider: str,
+        operation_id: str,
+        state: OutboundState,
+        *,
+        provider_message_id: str | None = None,
+    ) -> OutboundOperation:
+        if state is OutboundState.PENDING:
+            raise ValueError("pending is created only by claim_outbound_operation")
+        if state is OutboundState.SENT and not provider_message_id:
+            raise ValueError("sent state requires a provider message id")
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                """
+                UPDATE outbound_operations
+                SET state = ?, provider_message_id = ?, updated_at = ?
+                WHERE provider = ? AND operation_id = ? AND state = 'pending'
+                """,
+                (
+                    state,
+                    provider_message_id,
+                    utc_now().isoformat(),
+                    provider,
+                    operation_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("outbound operation is not pending")
+            row = self._connection.execute(
+                """
+                SELECT * FROM outbound_operations
+                WHERE provider = ? AND operation_id = ?
+                """,
+                (provider, operation_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("outbound operation disappeared")
+            return self._row_to_outbound_operation(row)
+
+    def set_outbound_accepted(
+        self,
+        provider: str,
+        operation_id: str,
+        message_id: str,
+        identity: tuple[str, str | None, str | None] | None,
+    ) -> None:
+        """Atomically journal transport acceptance and optional delivery identity."""
+        from .delivery import DeliveryStore
+
+        ledger = DeliveryStore(connection=self._connection, lock=self._lock)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE outbound_operations SET state='sent', provider_message_id=?, updated_at=? "
+                "WHERE provider=? AND operation_id=? AND state='pending'",
+                (message_id, utc_now().isoformat(), provider, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("outbound operation is not pending")
+            if identity is not None:
+                grant_id, provider_id, rfc_id = identity
+                ledger.record_acceptance(
+                    provider,
+                    operation_id,
+                    grant_id=grant_id,
+                    provider_message_id=provider_id,
+                    rfc_message_id=rfc_id,
+                    commit=False,
+                )
 
     def is_processed(self, provider: str, message_id: str) -> bool:
         with self._lock:
@@ -846,6 +994,18 @@ class MappingStore:
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
             revoked_at=_optional_datetime(row["revoked_at"]),
+        )
+
+    @staticmethod
+    def _row_to_outbound_operation(row: sqlite3.Row) -> OutboundOperation:
+        return OutboundOperation(
+            provider=str(row["provider"]),
+            operation_id=str(row["operation_id"]),
+            payload_hash=str(row["payload_hash"]),
+            state=OutboundState(str(row["state"])),
+            provider_message_id=_optional_string(row["provider_message_id"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )
 
     @staticmethod

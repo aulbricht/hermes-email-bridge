@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+from dataclasses import replace
 
 from .mapping import normalize_email_address
 from .models import (
@@ -13,7 +15,7 @@ from .models import (
     ResolutionStatus,
     SenderAuthentication,
 )
-from .providers.base import EmailProvider
+from .providers.base import AmbiguousSendError, EmailProvider
 from .runner import HermesProtocolError, HermesRunner
 from .store import MappingStore
 
@@ -29,7 +31,9 @@ class BridgeService:
         runner: HermesRunner,
         send_replies: bool = False,
         dry_run: bool = True,
+        allowed_senders: frozenset[str] | None = None,
         reply_domains: frozenset[str] = frozenset(),
+        reply_proof_max_age_days: int = 90,
         store_raw: bool = False,
         raw_retention_days: int = 30,
         allow_subject_resume: bool = False,
@@ -39,13 +43,22 @@ class BridgeService:
         self.runner = runner
         self.send_replies = send_replies
         self.dry_run = dry_run
+        self.allowed_senders = allowed_senders
         self.reply_domains = reply_domains
+        self.reply_proof_max_age_days = reply_proof_max_age_days
         self.store_raw = store_raw
         self.raw_retention_days = raw_retention_days
         self.allow_subject_resume = allow_subject_resume
+        self._processing_lock = threading.Lock()
         self.store.purge_raw(raw_retention_days)
 
     def handle(self, message: NormalizedEmail) -> str:
+        """Serialize the full claim-to-terminal path to prevent duplicate replies."""
+
+        with self._processing_lock:
+            return self._handle_serialized(message)
+
+    def _handle_serialized(self, message: NormalizedEmail) -> str:
         if self.store.is_processed(message.provider, message.provider_message_id):
             logger.info(
                 "message skipped",
@@ -57,9 +70,34 @@ class BridgeService:
             )
             return "skipped"
 
+        if (
+            self.provider.requires_reply_proof
+            and message.sender_authentication is SenderAuthentication.UNKNOWN
+            and message.in_reply_to
+            and self.store.has_observed_sent_message(
+                message.provider,
+                message.in_reply_to,
+                max_age_days=self.reply_proof_max_age_days,
+            )
+        ):
+            message = replace(
+                message,
+                sender_authentication=SenderAuthentication.REPLY_PROVEN,
+            )
+
         denial_reason = None
-        if message.sender_authentication is not SenderAuthentication.AUTHENTICATED:
+        if message.sender_authentication not in {
+            SenderAuthentication.AUTHENTICATED,
+            SenderAuthentication.REPLY_PROVEN,
+        }:
             denial_reason = "sender_authentication"
+        elif self.allowed_senders is not None:
+            try:
+                allowed = normalize_email_address(message.from_email) in self.allowed_senders
+            except ValueError:
+                allowed = False
+            if not allowed:
+                denial_reason = "sender_allowlist"
         elif not self.store.is_allowed(message.provider, message.from_email):
             denial_reason = "sender_allowlist"
         if denial_reason:
@@ -183,6 +221,19 @@ class BridgeService:
         else:
             try:
                 reply_id = self.provider.reply(message, result.reply)
+            except AmbiguousSendError:
+                self.store.mark_processed(
+                    message,
+                    "reply_uncertain",
+                    store_raw=self.store_raw,
+                    raw_retention_days=self.raw_retention_days,
+                )
+                logger.critical(
+                    "reply outcome uncertain; automatic retry suppressed",
+                    extra={"event": "reply_uncertain", **context},
+                    exc_info=True,
+                )
+                return "processed"
             except Exception:
                 self.store.mark_processed(
                     message,

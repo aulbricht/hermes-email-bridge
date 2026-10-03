@@ -339,7 +339,10 @@ def test_runtime_modes_accept_only_reviewed_protocol_adapter_shapes(tmp_path: Pa
                         "HERMES_COMMAND": "hermes chat --quiet --source tool",
                     }
                 )
-    source = Path(__file__).parents[1] / "deploy/macos/hermes-email-agent-adapter.py"
+    source = (
+        Path(__file__).parents[1]
+        / "deploy/macos/user-runtime/hermes-email-agent-adapter.py"
+    )
     adapter = tmp_path / "hermes-email-agent-adapter.py"
     adapter.write_bytes(source.read_bytes())
     adapter.chmod(0o755)

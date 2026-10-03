@@ -12,6 +12,7 @@ class SenderAuthentication(StrEnum):
     """Provider-asserted sender authentication state."""
 
     AUTHENTICATED = "authenticated"
+    REPLY_PROVEN = "reply_proven"
     UNAUTHENTICATED = "unauthenticated"
     UNKNOWN = "unknown"
 
@@ -39,6 +40,15 @@ class ApprovalStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class OutboundState(StrEnum):
+    """Durable terminal states for one caller-supplied outbound operation."""
+
+    PENDING = "pending"
+    SENT = "sent"
+    UNCERTAIN = "uncertain"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True, slots=True)
 class Attachment:
     """Attachment metadata; content is intentionally fetched on demand."""
@@ -48,6 +58,17 @@ class Attachment:
     content_type: str | None = None
     size: int | None = None
     inline: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OutboundOperation:
+    provider: str
+    operation_id: str
+    payload_hash: str
+    state: OutboundState
+    provider_message_id: str | None
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

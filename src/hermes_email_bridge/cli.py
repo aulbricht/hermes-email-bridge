@@ -5,23 +5,36 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
+from typing import TypedDict
 
 from . import __version__
 from .config import ConfigError, Settings, preflight_hermes_command
+from .delivery import DeliveryStore
 from .log import configure_logging
 from .models import ApprovalStatus, ConversationMapping
+from .outbound import OutboundService
 from .providers.agentmail import AgentMailProvider
 from .providers.base import EmailProvider, RetryableProviderError
 from .providers.composio_agentmail import ComposioAgentMailProvider
+from .providers.nylas import NylasProvider
 from .runner import SubprocessHermesRunner
 from .service import BridgeService
 from .store import MappingStore
 from .webhook import serve_webhooks
 
 logger = logging.getLogger(__name__)
+
+
+class SendRequest(TypedDict):
+    operation_id: str
+    to: str
+    subject: str
+    text: str | None
+    html: str | None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -37,6 +50,12 @@ def _parser() -> argparse.ArgumentParser:
     poll.add_argument("--interval", type=float, help="Override polling interval in seconds")
 
     commands.add_parser("serve", help="Run the verified webhook server")
+    commands.add_parser(
+        "send",
+        help="Send one journaled message from an exact JSON object on stdin",
+    )
+    delivery = commands.add_parser("delivery-status", help="Read delivery evidence; never sends")
+    delivery.add_argument("operation_id")
     inspect = commands.add_parser("inspect", help="Fetch and normalize one provider message")
     inspect.add_argument("message_id")
     inspect.add_argument("--raw", action="store_true", help="Include the raw provider payload")
@@ -93,6 +112,15 @@ def _provider(settings: Settings) -> EmailProvider:
             connected_account_id=connected_account_id,
             inbox_id=inbox_id,
         )
+    if settings.provider == "nylas":
+        api_key, grant_id, account_email = settings.require_nylas()
+        return NylasProvider(
+            api_key=api_key,
+            grant_id=grant_id,
+            account_email=account_email,
+            base_url=settings.nylas_base_url,
+            allow_insecure_local_http=settings.nylas_allow_insecure_local_http,
+        )
     raise ConfigError(f"unsupported provider: {settings.provider}")
 
 
@@ -111,7 +139,9 @@ def _service(
         ),
         send_replies=settings.send_replies,
         dry_run=settings.dry_run,
+        allowed_senders=settings.allowed_senders or None,
         reply_domains=settings.reply_domains,
+        reply_proof_max_age_days=settings.reply_proof_max_age_days,
         store_raw=settings.store_raw,
         raw_retention_days=settings.raw_retention_days,
         allow_subject_resume=settings.allow_subject_resume,
@@ -124,6 +154,32 @@ def _masked_mapping(mapping: ConversationMapping) -> dict[str, object]:
     suffix = marker[-4:] if len(marker) > 4 else ""
     value["bridge_marker"] = f"v1:****{suffix}"
     return value
+
+
+def _read_send_request() -> SendRequest:
+    raw = sys.stdin.buffer.read(2_000_001)
+    if len(raw) > 2_000_000:
+        raise ConfigError("send request exceeds the safety limit")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigError("send request must be one UTF-8 JSON object") from exc
+    expected = {"operation_id", "to", "subject", "text", "html"}
+    if type(payload) is not dict or set(payload) != expected:
+        raise ConfigError("send request has an invalid schema")
+    for name in ("operation_id", "to", "subject"):
+        if type(payload.get(name)) is not str:
+            raise ConfigError(f"send request {name} must be a string")
+    for name in ("text", "html"):
+        if payload.get(name) is not None and type(payload.get(name)) is not str:
+            raise ConfigError(f"send request {name} must be a string or null")
+    return SendRequest(
+        operation_id=payload["operation_id"],
+        to=payload["to"],
+        subject=payload["subject"],
+        text=payload["text"],
+        html=payload["html"],
+    )
 
 
 def _run_poll_loop(
@@ -194,11 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.approvals_command == "purge":
                     print(
                         json.dumps(
-                            {
-                                "purged": store.purge_closed_approvals(
-                                    args.closed_older_than_days
-                                )
-                            }
+                            {"purged": store.purge_closed_approvals(args.closed_older_than_days)}
                         )
                     )
                     return 0
@@ -207,15 +259,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 elif args.approvals_command == "reject":
                     status = ApprovalStatus.REJECTED
                 else:
-                    requests = store.list_approvals(
-                        provider_name, include_closed=args.all
-                    )
+                    requests = store.list_approvals(provider_name, include_closed=args.all)
                     print(json.dumps([asdict(item) for item in requests], default=str))
                     return 0
                 try:
-                    request = store.set_approval_status(
-                        provider_name, args.approval_id, status
-                    )
+                    request = store.set_approval_status(provider_name, args.approval_id, status)
                 except KeyError as exc:
                     raise ConfigError(
                         f"pending approval {args.approval_id} does not exist"
@@ -257,7 +305,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps({"purged": store.purge_raw(days)}))
                 return 0
 
+            if args.command == "delivery-status":
+                ledger = DeliveryStore(connection=store._connection, lock=store._lock)
+                record = ledger.get(settings.provider, args.operation_id)
+                print(
+                    json.dumps(
+                        {
+                            "operation_id": args.operation_id,
+                            "transport_state": "accepted" if record else "unknown",
+                            "delivery_state": record.status.value if record else "awaiting",
+                            "evidence": asdict(record) if record else None,
+                        },
+                        default=str,
+                    )
+                )
+                return 0
             provider = _provider(settings)
+            if args.command == "send":
+                if not settings.send_initiated or settings.dry_run:
+                    raise ConfigError(
+                        "initiated sending requires EMAIL_BRIDGE_SEND_INITIATED=true "
+                        "and EMAIL_BRIDGE_DRY_RUN=false"
+                    )
+                send_request = _read_send_request()
+                result = OutboundService(provider=provider, store=store).send(**send_request)
+                print(
+                    json.dumps(
+                        {
+                            "duplicate": result.duplicate,
+                            "provider_message_id": result.provider_message_id,
+                            "transport_state": result.transport_state,
+                            "delivery_state": result.delivery_state,
+                        }
+                    )
+                )
+                return 0
             if args.command == "inspect":
                 message = provider.get(args.message_id)
                 print(json.dumps(message.as_dict(include_raw=args.raw), indent=2, default=str))

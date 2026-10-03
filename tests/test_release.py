@@ -1,5 +1,6 @@
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import tomllib
@@ -16,9 +17,9 @@ ROOT = Path(__file__).parents[1]
 
 def test_version_has_one_project_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert project["project"]["version"] == "0.5.1"
-    assert __version__ == "0.5.1"
-    assert '__version__ = "0.5.1"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
+    assert project["project"]["version"] == "0.7.0"
+    assert __version__ == "0.7.0"
+    assert '__version__ = "0.7.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
 
 
 def test_docs_and_example_config_cover_composio_allowlisting_and_start_now() -> None:
@@ -35,12 +36,27 @@ def test_docs_and_example_config_cover_composio_allowlisting_and_start_now() -> 
     ):
         assert required in readme or required in example
 
+    for required in (
+        "EMAIL_BRIDGE_PROVIDER=nylas",
+        "NYLAS_API_KEY",
+        "NYLAS_GRANT_ID",
+        "NYLAS_ACCOUNT_EMAIL",
+        "EMAIL_BRIDGE_ALLOWED_SENDERS",
+        "EMAIL_BRIDGE_SEND_INITIATED",
+        "operation_id",
+        "reply-possession proof",
+    ):
+        assert required in readme or required in example
+
 
 def test_macos_assets_are_generic_and_fail_closed() -> None:
     plist_path = ROOT / "deploy/macos/com.example.hermes.email-bridge.plist"
     launcher_path = ROOT / "deploy/macos/run-email-bridge.sh"
+    send_launcher_path = ROOT / "deploy/macos/run-email-send.sh"
+    email_mcp_path = ROOT / "deploy/macos/hermes-email-mcp.py"
     wrapper_path = ROOT / "deploy/macos/hermes-email-agent-wrapper.py"
     adapter_path = ROOT / "deploy/macos/hermes-email-agent-adapter.py"
+    user_adapter_path = ROOT / "deploy/macos/user-runtime/hermes-email-agent-adapter.py"
     helper_path = ROOT / "deploy/macos/hermes-email-boundary-verify.py"
     fetcher_path = ROOT / "deploy/macos/fetch-hermes-email-agent.py"
     probe_path = ROOT / "deploy/macos/verify-hermes-email-agent.py"
@@ -51,14 +67,26 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     build_constraint_path = ROOT / "deploy/macos/hermes-email-build-constraints.txt"
     plist_text = plist_path.read_text()
     launcher = launcher_path.read_text()
+    send_launcher = send_launcher_path.read_text()
+    email_mcp = email_mcp_path.read_text()
     wrapper = wrapper_path.read_text()
     sudoers = sudoers_path.read_text()
     adapter = adapter_path.read_text()
     adapter_hash = sha256(adapter_path.read_bytes()).hexdigest()
+    user_adapter_hash = sha256(user_adapter_path.read_bytes()).hexdigest()
     verifier_hash = sha256(probe_path.read_bytes()).hexdigest()
-    combined = plist_text + launcher + wrapper + adapter + helper_path.read_text() + sudoers
-    assert "snowcapconsulting" not in combined
-    assert "aulbricht" not in combined
+    combined = (
+        plist_text
+        + launcher
+        + send_launcher
+        + email_mcp
+        + wrapper
+        + adapter
+        + helper_path.read_text()
+        + sudoers
+    )
+    assert re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", combined) is None
+    assert re.search(r"/Users/(?!_)[A-Za-z0-9._-]+", combined) is None
     assert "EMAIL_BRIDGE_COMPOSIO_API_KEY" not in combined
     assert "umask 077" in launcher
     assert '!= "600"' in launcher
@@ -67,6 +95,8 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert verifier_hash == ISOLATED_VERIFIER_SHA256
     if os.name == "posix":
         assert launcher_path.stat().st_mode & 0o111
+        assert send_launcher_path.stat().st_mode & 0o111
+        assert email_mcp_path.stat().st_mode & 0o111
         assert wrapper_path.stat().st_mode & 0o111
         assert adapter_path.stat().st_mode & 0o111
         assert helper_path.stat().st_mode & 0o111
@@ -108,7 +138,11 @@ def test_macos_assets_are_generic_and_fail_closed() -> None:
     assert "USER_ADAPTER_SHA256" in (
         ROOT / "src/hermes_email_bridge/config.py"
     ).read_text()
-    assert adapter_hash == USER_ADAPTER_SHA256
+    assert user_adapter_hash == USER_ADAPTER_SHA256
+    user_adapter = user_adapter_path.read_text()
+    assert 'HERMES_VERSION = "0.20.4"' in user_adapter
+    assert 'PROVIDER = "openai-codex"' in user_adapter
+    assert 'MODEL = "gpt-5.6-sol"' in user_adapter
     installer = (ROOT / "deploy/macos/install-hermes-email-agent.py").read_text()
     assert 'rooted("/usr/local/libexec")' in installer
     assert 'rooted("/private/etc/sudoers.d")' in installer
@@ -188,13 +222,14 @@ def test_shipping_docs_and_assets_have_no_deployment_personalization() -> None:
     content = "\n".join(
         path.read_text() for path in paths if path.is_file() and "__pycache__" not in path.parts
     ).lower()
-    for forbidden in (
-        "jarvis",
-        "snowcapconsulting",
-        "@gmail.com",
-        "/users/allen",
-    ):
-        assert forbidden not in content
+    addresses = re.findall(r"[a-z0-9._%+-]+@([a-z0-9.-]+\.[a-z]{2,})", content)
+    assert all(
+        domain in {"example.com", "example.test", "agentmail.to"}
+        or domain.endswith(".example.test")
+        for domain in addresses
+    )
+    local_users = re.findall(r"/users/([a-z0-9._-]+)", content)
+    assert all(username.startswith("_") for username in local_users)
 
 
 def test_macos_isolation_installation_requirements_are_documented() -> None:

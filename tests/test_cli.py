@@ -1,11 +1,14 @@
+import io
 import json
 import sqlite3
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import hermes_email_bridge.cli as cli_module
 from hermes_email_bridge.cli import _run_poll_loop, main
 from hermes_email_bridge.models import (
     HermesAction,
@@ -15,6 +18,7 @@ from hermes_email_bridge.models import (
     SenderAuthentication,
 )
 from hermes_email_bridge.providers.base import RetryableProviderError
+from hermes_email_bridge.providers.fake import FakeProvider
 from hermes_email_bridge.service import BridgeService
 from hermes_email_bridge.store import MappingStore
 
@@ -190,4 +194,73 @@ def test_version_reports_project_version(capsys: pytest.CaptureFixture[str]) -> 
     with pytest.raises(SystemExit) as stopped:
         main(["--version"])
     assert stopped.value.code == 0
-    assert capsys.readouterr().out.strip() == "0.5.1"
+    assert capsys.readouterr().out.strip() == "0.7.0"
+
+
+def test_send_cli_requires_both_activation_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EMAIL_BRIDGE_DB_PATH", str(tmp_path / "bridge.db"))
+    monkeypatch.setenv("EMAIL_BRIDGE_PROVIDER", "nylas")
+    monkeypatch.setenv("NYLAS_API_KEY", "test")
+    monkeypatch.setenv("NYLAS_GRANT_ID", "grant-1")
+    monkeypatch.setenv("NYLAS_ACCOUNT_EMAIL", "mailbox@mail.example.test")
+    monkeypatch.setenv("EMAIL_BRIDGE_ALLOWED_SENDERS", "allowed@example.test")
+    monkeypatch.setattr(cli_module, "_provider", lambda _settings: FakeProvider())
+    assert main(["send"]) == 2
+
+
+def test_send_cli_journals_and_suppresses_duplicate_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class SendProvider(FakeProvider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.sends = 0
+
+        def send(
+            self,
+            *,
+            operation_id: str,
+            to: str,
+            subject: str,
+            text: str | None,
+            html: str | None,
+        ) -> str:
+            del operation_id, to, subject, text, html
+            self.sends += 1
+            return "sent-1"
+
+    provider = SendProvider()
+    monkeypatch.setenv("EMAIL_BRIDGE_DB_PATH", str(tmp_path / "bridge.db"))
+    monkeypatch.setenv("EMAIL_BRIDGE_PROVIDER", "nylas")
+    monkeypatch.setenv("NYLAS_API_KEY", "test")
+    monkeypatch.setenv("NYLAS_GRANT_ID", "grant-1")
+    monkeypatch.setenv("NYLAS_ACCOUNT_EMAIL", "mailbox@mail.example.test")
+    monkeypatch.setenv("EMAIL_BRIDGE_ALLOWED_SENDERS", "allowed@example.test")
+    monkeypatch.setenv("EMAIL_BRIDGE_SEND_INITIATED", "true")
+    monkeypatch.setenv("EMAIL_BRIDGE_DRY_RUN", "false")
+    monkeypatch.setattr(cli_module, "_provider", lambda _settings: provider)
+    payload = json.dumps(
+        {
+            "operation_id": "operation-1",
+            "to": "recipient@example.test",
+            "subject": "Subject",
+            "text": "Open fmp://record/123",
+            "html": None,
+        }
+    ).encode()
+    for duplicate in (False, True):
+        monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload)))
+        assert main(["send"]) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result == {
+            "duplicate": duplicate,
+            "provider_message_id": "sent-1",
+            "transport_state": "accepted",
+            "delivery_state": "awaiting",
+        }
+    assert provider.sends == 1
