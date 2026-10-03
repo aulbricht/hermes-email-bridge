@@ -103,10 +103,15 @@ def _send(
         raise RuntimeError("email send returned invalid output") from exc
     if (
         type(response) is not dict
-        or set(response) != {"duplicate", "provider_message_id"}
+        or not {"duplicate", "provider_message_id"}.issubset(response)
+        or set(response) - {"duplicate", "provider_message_id", "transport_state", "delivery_state"}
         or type(response.get("duplicate")) is not bool
         or type(response.get("provider_message_id")) is not str
         or not response["provider_message_id"]
+        or response.get("transport_state", "accepted") != "accepted"
+        or response.get("delivery_state", "awaiting") not in {
+            "awaiting", "delivered", "bounced", "complaint", "rejected"
+        }
     ):
         raise RuntimeError("email send returned an invalid result")
     return json.dumps(response, sort_keys=True)

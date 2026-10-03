@@ -6,6 +6,7 @@ import pytest
 
 from hermes_email_bridge.config import ConfigError, Settings
 from hermes_email_bridge.models import SenderAuthentication
+from hermes_email_bridge.outbound import OutboundService
 from hermes_email_bridge.providers.base import AmbiguousSendError
 from hermes_email_bridge.providers.nylas import (
     NylasError,
@@ -13,8 +14,34 @@ from hermes_email_bridge.providers.nylas import (
     normalize_nylas_message,
     normalize_nylas_sent_message,
 )
+from hermes_email_bridge.store import MappingStore
 
 ACCOUNT = "mailbox@mail.example.test"
+
+
+@pytest.mark.parametrize("response", [{}, {"data": []}])
+def test_invalid_accepted_response_is_uncertain_and_never_retried(response: dict[str, Any]) -> None:
+    class InvalidProvider(NylasProvider):
+        calls = 0
+
+        def _request(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            return response
+
+    provider = InvalidProvider(api_key="test", grant_id="grant-1", account_email=ACCOUNT)
+    with MappingStore(":memory:") as store:
+        service = OutboundService(provider=provider, store=store)
+        for _ in range(2):
+            with pytest.raises(AmbiguousSendError):
+                service.send(
+                    operation_id="operation",
+                    to="recipient@example.test",
+                    subject="Subject",
+                    text="Test",
+                )
+        assert provider.calls == 1
+        row = store._connection.execute("SELECT state FROM outbound_operations").fetchone()
+        assert row and row["state"] == "uncertain"
 
 
 def _payload(
@@ -101,9 +128,7 @@ def test_normalizer_rejects_ambiguous_identity_or_recipient(mutation: dict[str, 
 
 def test_sent_message_uses_rfc_message_id_as_reply_proof() -> None:
     payload = _payload(sender=ACCOUNT, recipient="allowed@example.test")
-    payload["headers"] = [
-        {"name": "Message-ID", "value": "<outbound@example.test>"}
-    ]
+    payload["headers"] = [{"name": "Message-ID", "value": "<outbound@example.test>"}]
     sent = normalize_nylas_sent_message(payload)
     assert sent.provider_message_id == "<outbound@example.test>"
     assert sent.recipients == ("allowed@example.test",)
@@ -201,9 +226,7 @@ def test_reply_preserves_custom_scheme_and_uses_stable_idempotency_key() -> None
             return {
                 "data": {
                     "id": "sent-1",
-                    "headers": [
-                        {"name": "Message-ID", "value": "<reply@example.test>"}
-                    ],
+                    "headers": [{"name": "Message-ID", "value": "<reply@example.test>"}],
                 }
             }
 
@@ -230,9 +253,7 @@ def test_nylas_settings_require_explicit_identity_and_sender_allowlist() -> None
     }
     settings = Settings.from_env(values)
     assert settings.require_nylas() == ("test-key", "grant-1", ACCOUNT)
-    assert settings.allowed_senders == frozenset(
-        {"first@example.test", "second@example.test"}
-    )
+    assert settings.allowed_senders == frozenset({"first@example.test", "second@example.test"})
     assert settings.logical_provider() == "nylas"
     values.pop("EMAIL_BRIDGE_ALLOWED_SENDERS")
     with pytest.raises(ConfigError, match="EMAIL_BRIDGE_ALLOWED_SENDERS"):

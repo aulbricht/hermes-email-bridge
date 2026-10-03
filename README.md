@@ -210,6 +210,47 @@ The command remains blocked unless `EMAIL_BRIDGE_SEND_INITIATED=true` and
 request click rewriting. Production activation still requires a mailbox canary that
 confirms literal custom-scheme content survives end to end.
 
+### Delivery evidence (0.7.0)
+
+Successful `send` output retains `provider_message_id` and `duplicate`, and adds
+`transport_state=accepted` and `delivery_state`. Acceptance
+means the provider accepted the request, not that the recipient received it.
+Delivery states are `awaiting`, `delivered`, `bounced`, `complaint`, and `rejected`.
+Inspect the additive delivery ledger without invoking the provider or sending mail:
+
+```bash
+hermes-email-bridge delivery-status run-20260713-001
+```
+
+Nylas acceptance records the available API message ID and RFC Message-ID alongside
+the stable request operation ID. Authenticated events reconcile by that identity; unmatched
+events are quarantined and duplicate events are durable no-ops. Adverse outcomes
+take precedence over delivery success, including when events arrive out of order.
+Accepted or ambiguous operations are never automatically resent.
+
+The optional delivery monitor requires `pip install 'hermes-email-bridge[aws]'`.
+`deploy/aws/nylas-delivery.yaml` and `nylas_receiver.py` provide a raw-body HMAC
+receiver and encrypted FIFO queue with a retained DLQ and alarms. Supply an existing
+SecureString parameter encrypted by a customer-managed KMS key and a confirmed
+operator alarm topic; never put secret values in stack parameters or logs. Subscribe
+only to the four delivery events listed in the template, with compression disabled.
+The pull-only worker requires queue-consumer permissions, not Nylas credentials:
+
+```bash
+python -m hermes_email_bridge.delivery_worker \
+  --db-path /absolute/bridge.db --queue-url "$DELIVERY_QUEUE_URL" \
+  --grant-id "$NYLAS_GRANT_ID" --region "$AWS_REGION"
+```
+
+The macOS wrapper reads an owner-only `config/email-delivery.env`; the LaunchAgent
+template runs it independently of inbound processing. Delivery tables are additive
+and preserve the existing database version for rollback. A `delivered` event proves
+provider delivery only: callers that promise inbox visibility must additionally
+verify the controlled recipient mailbox. Production rollout requires the target
+gate, signed receiver fixtures, worker verification, and a controlled-mailbox canary.
+Rollback disables ingress and the worker and restores the prior caller/release;
+retain queued events and delivery tables as evidence.
+
 Inspect how a provider message normalizes (add `--raw` to include the raw payload):
 
 ```bash
@@ -707,6 +748,13 @@ HERMES_COMMAND='/absolute/hermes/venv/bin/python -I -B /absolute/hermes-email-ag
 ```
 
 ## Release notes
+
+### 0.7.0
+
+- Distinguished provider acceptance from delivery while retaining existing send fields.
+- Added an additive, idempotent delivery ledger and a pull-only SQS monitor.
+- Added signed Nylas delivery ingress infrastructure with retained evidence and alarms.
+- Preserved accepted/uncertain send suppression and compatibility with the prior database.
 
 ### 0.6.3
 

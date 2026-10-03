@@ -194,7 +194,7 @@ def test_version_reports_project_version(capsys: pytest.CaptureFixture[str]) -> 
     with pytest.raises(SystemExit) as stopped:
         main(["--version"])
     assert stopped.value.code == 0
-    assert capsys.readouterr().out.strip() == "0.6.3"
+    assert capsys.readouterr().out.strip() == "0.7.0"
 
 
 def test_send_cli_requires_both_activation_gates(
@@ -257,5 +257,10 @@ def test_send_cli_journals_and_suppresses_duplicate_operation(
         monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(payload)))
         assert main(["send"]) == 0
         result = json.loads(capsys.readouterr().out)
-        assert result == {"duplicate": duplicate, "provider_message_id": "sent-1"}
+        assert result == {
+            "duplicate": duplicate,
+            "provider_message_id": "sent-1",
+            "transport_state": "accepted",
+            "delivery_state": "awaiting",
+        }
     assert provider.sends == 1

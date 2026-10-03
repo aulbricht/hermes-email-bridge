@@ -13,6 +13,7 @@ from typing import TypedDict
 
 from . import __version__
 from .config import ConfigError, Settings, preflight_hermes_command
+from .delivery import DeliveryStore
 from .log import configure_logging
 from .models import ApprovalStatus, ConversationMapping
 from .outbound import OutboundService
@@ -53,6 +54,8 @@ def _parser() -> argparse.ArgumentParser:
         "send",
         help="Send one journaled message from an exact JSON object on stdin",
     )
+    delivery = commands.add_parser("delivery-status", help="Read delivery evidence; never sends")
+    delivery.add_argument("operation_id")
     inspect = commands.add_parser("inspect", help="Fetch and normalize one provider message")
     inspect.add_argument("message_id")
     inspect.add_argument("--raw", action="store_true", help="Include the raw provider payload")
@@ -247,11 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if args.approvals_command == "purge":
                     print(
                         json.dumps(
-                            {
-                                "purged": store.purge_closed_approvals(
-                                    args.closed_older_than_days
-                                )
-                            }
+                            {"purged": store.purge_closed_approvals(args.closed_older_than_days)}
                         )
                     )
                     return 0
@@ -260,15 +259,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 elif args.approvals_command == "reject":
                     status = ApprovalStatus.REJECTED
                 else:
-                    requests = store.list_approvals(
-                        provider_name, include_closed=args.all
-                    )
+                    requests = store.list_approvals(provider_name, include_closed=args.all)
                     print(json.dumps([asdict(item) for item in requests], default=str))
                     return 0
                 try:
-                    request = store.set_approval_status(
-                        provider_name, args.approval_id, status
-                    )
+                    request = store.set_approval_status(provider_name, args.approval_id, status)
                 except KeyError as exc:
                     raise ConfigError(
                         f"pending approval {args.approval_id} does not exist"
@@ -310,6 +305,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(json.dumps({"purged": store.purge_raw(days)}))
                 return 0
 
+            if args.command == "delivery-status":
+                ledger = DeliveryStore(connection=store._connection, lock=store._lock)
+                record = ledger.get(settings.provider, args.operation_id)
+                print(
+                    json.dumps(
+                        {
+                            "operation_id": args.operation_id,
+                            "transport_state": "accepted" if record else "unknown",
+                            "delivery_state": record.status.value if record else "awaiting",
+                            "evidence": asdict(record) if record else None,
+                        },
+                        default=str,
+                    )
+                )
+                return 0
             provider = _provider(settings)
             if args.command == "send":
                 if not settings.send_initiated or settings.dry_run:
@@ -324,6 +334,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         {
                             "duplicate": result.duplicate,
                             "provider_message_id": result.provider_message_id,
+                            "transport_state": result.transport_state,
+                            "delivery_state": result.delivery_state,
                         }
                     )
                 )

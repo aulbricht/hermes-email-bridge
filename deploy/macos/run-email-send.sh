@@ -19,4 +19,10 @@ set -a
 set +a
 
 : "${EMAIL_BRIDGE_VENV:?EMAIL_BRIDGE_VENV is required}"
-exec "$EMAIL_BRIDGE_VENV/bin/hermes-email-bridge" send
+case "${1:-send}" in
+    send) exec "$EMAIL_BRIDGE_VENV/bin/hermes-email-bridge" send ;;
+    delivery-status)
+        [ "$#" -eq 2 ] || exit 64
+        exec "$EMAIL_BRIDGE_VENV/bin/hermes-email-bridge" delivery-status "$2" ;;
+    *) exit 64 ;;
+esac

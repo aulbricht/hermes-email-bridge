@@ -8,6 +8,7 @@ import threading
 from dataclasses import dataclass
 from hashlib import sha256
 
+from .delivery import DeliveryStore
 from .mapping import normalize_email_address
 from .models import OutboundState
 from .providers.base import AmbiguousSendError, EmailProvider
@@ -21,6 +22,8 @@ _MAX_BODY_CHARACTERS = 1_000_000
 class OutboundResult:
     provider_message_id: str
     duplicate: bool
+    transport_state: str = "accepted"
+    delivery_state: str = "awaiting"
 
 
 class OutboundService:
@@ -28,6 +31,15 @@ class OutboundService:
         self.provider = provider
         self.store = store
         self._lock = threading.Lock()
+        self.delivery = DeliveryStore(connection=store._connection, lock=store._lock)
+
+    def _result(self, operation_id: str, message_id: str, *, duplicate: bool) -> OutboundResult:
+        delivery = self.delivery.get(self.provider.name, operation_id)
+        return OutboundResult(
+            message_id,
+            duplicate=duplicate,
+            delivery_state=delivery.status.value if delivery else "awaiting",
+        )
 
     def send(
         self,
@@ -89,7 +101,7 @@ class OutboundService:
         )
         if not claimed:
             if operation.state is OutboundState.SENT and operation.provider_message_id:
-                return OutboundResult(operation.provider_message_id, duplicate=True)
+                return self._result(operation_id, operation.provider_message_id, duplicate=True)
             if operation.state in {OutboundState.PENDING, OutboundState.UNCERTAIN}:
                 raise AmbiguousSendError(
                     "operation has no terminal delivery result; automatic retry suppressed"
@@ -118,10 +130,6 @@ class OutboundService:
                 OutboundState.FAILED,
             )
             raise
-        self.store.set_outbound_state(
-            self.provider.name,
-            operation_id,
-            OutboundState.SENT,
-            provider_message_id=message_id,
-        )
-        return OutboundResult(message_id, duplicate=False)
+        identity = self.provider.delivery_identity(operation_id, message_id)
+        self.store.set_outbound_accepted(self.provider.name, operation_id, message_id, identity)
+        return self._result(operation_id, message_id, duplicate=False)

@@ -289,6 +289,7 @@ class NylasProvider(EmailProvider):
         self.timeout = timeout
         self._opener = build_opener(_NoRedirectHandler)
         self._folder_ids: dict[str, str] = {}
+        self._send_identities: dict[str, tuple[str, str | None, str | None]] = {}
 
     @property
     def _grant_path(self) -> str:
@@ -373,11 +374,15 @@ class NylasProvider(EmailProvider):
             folder_id = item.get("id")
             system_folder = item.get("system_folder")
             attributes = item.get("attributes")
-            attribute_names = {
-                str(attribute).strip().lstrip("\\").lower()
-                for attribute in attributes
-                if isinstance(attribute, str)
-            } if isinstance(attributes, list) else set()
+            attribute_names = (
+                {
+                    str(attribute).strip().lstrip("\\").lower()
+                    for attribute in attributes
+                    if isinstance(attribute, str)
+                }
+                if isinstance(attributes, list)
+                else set()
+            )
             is_match = (
                 isinstance(system_folder, str) and system_folder.strip().lower() == name
             ) or (
@@ -499,6 +504,11 @@ class NylasProvider(EmailProvider):
             raise AmbiguousSendError("Nylas send response is missing a message id")
         return sent_id
 
+    def delivery_identity(
+        self, operation_id: str, message_id: str
+    ) -> tuple[str, str | None, str | None] | None:
+        return self._send_identities.get(operation_id)
+
     def send(
         self,
         *,
@@ -521,12 +531,23 @@ class NylasProvider(EmailProvider):
                 "is_plaintext": html is None,
                 "subject": subject,
                 "to": [{"email": recipient}],
+                "metadata": {"hermes_operation_id": operation_id},
             },
             headers={"Idempotency-Key": operation_key},
             send=True,
         )
-        data = self._data_object(response)
+        try:
+            data = self._data_object(response)
+        except NylasError:
+            raise AmbiguousSendError(
+                "Nylas accepted request but returned invalid evidence"
+            ) from None
         sent_id = _first_header(data, "message-id") or str(data.get("id") or "")
         if not sent_id:
             raise AmbiguousSendError("Nylas send response is missing a message id")
+        self._send_identities[operation_id] = (
+            self.grant_id,
+            _optional_string(data.get("id")),
+            _first_header(data, "message-id"),
+        )
         return sent_id

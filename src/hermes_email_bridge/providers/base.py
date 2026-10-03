@@ -63,3 +63,9 @@ class EmailProvider(ABC):
         """Normalize a verified webhook payload, or ignore unsupported event types."""
 
         raise NotImplementedError(f"{self.name} does not support webhooks")
+
+    def delivery_identity(
+        self, operation_id: str, message_id: str
+    ) -> tuple[str, str | None, str | None] | None:
+        """Optional grant, provider ID and RFC Message-ID for accepted sends."""
+        return None

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from hermes_email_bridge.delivery import DeliveryEvent, DeliveryStatus
 from hermes_email_bridge.models import NormalizedEmail, PollResult, SentPollResult
 from hermes_email_bridge.outbound import OutboundResult, OutboundService
 from hermes_email_bridge.providers.base import AmbiguousSendError, EmailProvider
@@ -63,6 +65,47 @@ def _send(service: OutboundService, operation_id: str = "operation-1") -> Outbou
     )
 
 
+class TrackedProvider(RecordingProvider):
+    def delivery_identity(self, operation_id: str, message_id: str) -> tuple[str, str, str]:
+        return "grant-1", "provider-1", "<sent@example.test>"
+
+
+def test_accepted_operation_records_identity_and_duplicate_reads_terminal_evidence() -> None:
+    provider = TrackedProvider()
+    with MappingStore(":memory:") as store:
+        service = OutboundService(provider=provider, store=store)
+        assert _send(service).delivery_state == "awaiting"
+        record = service.delivery.get("fake", "operation-1")
+        assert record and record.provider_message_id == "provider-1"
+        assert record.rfc_message_id == "<sent@example.test>"
+        service.delivery.apply_event(
+            DeliveryEvent(
+                "event-1",
+                "fake",
+                "grant-1",
+                DeliveryStatus.DELIVERED,
+                datetime.now(UTC),
+                operation_id="operation-1",
+                provider_message_id="provider-1",
+            )
+        )
+        result = _send(service)
+        assert result.duplicate and result.delivery_state == "delivered"
+        assert len(provider.calls) == 1
+
+
+def test_atomic_acceptance_rolls_back_journal_on_invalid_identity() -> None:
+    with MappingStore(":memory:") as store:
+        store.claim_outbound_operation("fake", "operation-1", "hash")
+        with pytest.raises(ValueError):
+            store.set_outbound_accepted("fake", "operation-1", "message", ("", "p", None))
+        row = store._connection.execute("SELECT state FROM outbound_operations").fetchone()
+        assert row and row["state"] == "pending"
+        assert (
+            store._connection.execute("SELECT COUNT(*) FROM outbound_delivery").fetchone()[0] == 0
+        )
+
+
 def test_outbound_operation_is_journaled_and_duplicate_returns_prior_result() -> None:
     provider = RecordingProvider()
     with MappingStore(":memory:") as store:
@@ -105,9 +148,7 @@ def test_ambiguous_send_becomes_uncertain_and_never_retries() -> None:
         with pytest.raises(AmbiguousSendError, match="automatic retry suppressed"):
             _send(service)
         assert len(provider.calls) == 1
-        row = store._connection.execute(
-            "SELECT state FROM outbound_operations"
-        ).fetchone()
+        row = store._connection.execute("SELECT state FROM outbound_operations").fetchone()
         assert row is not None and row["state"] == "uncertain"
 
 

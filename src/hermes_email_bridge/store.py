@@ -380,14 +380,10 @@ class MappingStore:
     def resolve(
         self, message: NormalizedEmail, *, allow_subject_resume: bool = False
     ) -> MappingResolution:
-        if (
-            message.sender_authentication
-            not in {
-                SenderAuthentication.AUTHENTICATED,
-                SenderAuthentication.REPLY_PROVEN,
-            }
-            or not self._participant(message)
-        ):
+        if message.sender_authentication not in {
+            SenderAuthentication.AUTHENTICATED,
+            SenderAuthentication.REPLY_PROVEN,
+        } or not self._participant(message):
             return MappingResolution(ResolutionStatus.DENIED, matched_by="sender_authentication")
 
         with self._lock:
@@ -571,9 +567,7 @@ class MappingStore:
             ).fetchall()
             return [self._row_to_allowlist(row) for row in rows]
 
-    def enqueue_approval(
-        self, message: NormalizedEmail, result: HermesResult
-    ) -> ApprovalRequest:
+    def enqueue_approval(self, message: NormalizedEmail, result: HermesResult) -> ApprovalRequest:
         """Quarantine minimal request metadata without dispatching work or storing the body."""
 
         now = utc_now().isoformat()
@@ -660,9 +654,7 @@ class MappingStore:
                 raise RuntimeError("approval update failed")
             return self._row_to_approval(row)
 
-    def purge_closed_approvals(
-        self, older_than_days: int, *, now: datetime | None = None
-    ) -> int:
+    def purge_closed_approvals(self, older_than_days: int, *, now: datetime | None = None) -> int:
         if older_than_days <= 0:
             raise ValueError("approval retention days must be positive")
         cutoff = (now or utc_now()) - timedelta(days=older_than_days)
@@ -878,6 +870,36 @@ class MappingStore:
             if row is None:
                 raise RuntimeError("outbound operation disappeared")
             return self._row_to_outbound_operation(row)
+
+    def set_outbound_accepted(
+        self,
+        provider: str,
+        operation_id: str,
+        message_id: str,
+        identity: tuple[str, str | None, str | None] | None,
+    ) -> None:
+        """Atomically journal transport acceptance and optional delivery identity."""
+        from .delivery import DeliveryStore
+
+        ledger = DeliveryStore(connection=self._connection, lock=self._lock)
+        with self._lock, self._connection:
+            cursor = self._connection.execute(
+                "UPDATE outbound_operations SET state='sent', provider_message_id=?, updated_at=? "
+                "WHERE provider=? AND operation_id=? AND state='pending'",
+                (message_id, utc_now().isoformat(), provider, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("outbound operation is not pending")
+            if identity is not None:
+                grant_id, provider_id, rfc_id = identity
+                ledger.record_acceptance(
+                    provider,
+                    operation_id,
+                    grant_id=grant_id,
+                    provider_message_id=provider_id,
+                    rfc_message_id=rfc_id,
+                    commit=False,
+                )
 
     def is_processed(self, provider: str, message_id: str) -> bool:
         with self._lock:

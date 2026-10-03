@@ -17,9 +17,9 @@ ROOT = Path(__file__).parents[1]
 
 def test_version_has_one_project_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert project["project"]["version"] == "0.6.3"
-    assert __version__ == "0.6.3"
-    assert '__version__ = "0.6.3"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
+    assert project["project"]["version"] == "0.7.0"
+    assert __version__ == "0.7.0"
+    assert '__version__ = "0.7.0"' not in (ROOT / "src/hermes_email_bridge/__init__.py").read_text()
 
 
 def test_docs_and_example_config_cover_composio_allowlisting_and_start_now() -> None:
