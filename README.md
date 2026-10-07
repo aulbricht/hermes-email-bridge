@@ -18,7 +18,7 @@ AgentMail is the first adapter, not a core dependency. The bridge contract is in
 - Exact runtime sender allowlisting, plus DKIM verification or reply-possession proof for Nylas inbound mail
 - Journaled initiated sends with stable operation IDs and terminal uncertain outcomes
 - No-tools automatic replies with a non-dispatchable local inbox for requests that need tools
-- No runtime Python dependencies
+- DKIM verification through dkimpy and bounded DNS lookups
 
 ## Install
 
