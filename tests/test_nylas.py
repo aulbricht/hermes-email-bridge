@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 import pytest
@@ -151,6 +152,10 @@ class StubNylasProvider(NylasProvider):
     ) -> dict[str, Any]:
         del body, headers, send
         self.requests.append((method, path, params))
+        if params == {"fields": "raw_mime"}:
+            return {"data": {"id": "message-1", "raw_mime": base64.b64encode(
+                b"From: allowed@example.test\r\n\r\nUnsigned test message"
+            ).decode()}}
         if path.endswith("/folders"):
             return {
                 "data": [

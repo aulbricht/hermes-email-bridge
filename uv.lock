@@ -308,6 +308,24 @@ wheels = [
 ]
 
 [[package]]
+name = "dkimpy"
+version = "1.1.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "dnspython" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f0/6f/84e91828186bbfcedd7f9385ef5e0d369632444195c20e08951b7ffe0481/dkimpy-1.1.8.tar.gz", hash = "sha256:b5f60fb47bbf5d8d762f134bcea0c388eba6b498342a682a21f1686545094b77", size = 66979, upload-time = "2024-07-04T22:16:38.321Z" }
+
+[[package]]
+name = "dnspython"
+version = "2.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8c/8b/57666417c0f90f08bcafa776861060426765fdb422eb10212086fb811d26/dnspython-2.8.0.tar.gz", hash = "sha256:181d3c6996452cb1189c4046c61599b84a5a86e099562ffde77d26984ff26d0f", size = 368251, upload-time = "2025-09-07T18:58:00.022Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/5a/18ad964b0086c6e62e2e7500f7edc89e3faa45033c71c1893d34eed2b2de/dnspython-2.8.0-py3-none-any.whl", hash = "sha256:01d9bbc4a2d76bf0db7c1f729812ded6d912bd318d3b1cf81d30c0f845dbf3af", size = 331094, upload-time = "2025-09-07T18:57:58.071Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -318,8 +336,11 @@ wheels = [
 
 [[package]]
 name = "hermes-email-bridge"
-version = "0.7.0"
+version = "0.7.1"
 source = { editable = "." }
+dependencies = [
+    { name = "dkimpy" },
+]
 
 [package.optional-dependencies]
 aws = [
@@ -327,6 +348,7 @@ aws = [
 ]
 dev = [
     { name = "build" },
+    { name = "cryptography" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
@@ -339,6 +361,8 @@ mcp = [
 requires-dist = [
     { name = "boto3", marker = "extra == 'aws'", specifier = ">=1.40,<2" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1.2" },
+    { name = "cryptography", marker = "extra == 'dev'", specifier = ">=46" },
+    { name = "dkimpy", specifier = "==1.1.8" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = "==1.28.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.15" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3" },
