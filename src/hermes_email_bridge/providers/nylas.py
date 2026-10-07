@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 from datetime import UTC, datetime, timedelta
@@ -24,6 +26,7 @@ from ..models import (
     SentPollResult,
 )
 from .base import AmbiguousSendError, EmailProvider, RetryableProviderError
+from .nylas_auth import authenticate_mime
 
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_BODY_CHARACTERS = 100_000
@@ -457,10 +460,7 @@ class NylasProvider(EmailProvider):
 
     def poll(self, cursor: str | None) -> PollResult:
         payloads, next_cursor = self._poll_payloads(cursor, folder_name="inbox")
-        messages = tuple(
-            normalize_nylas_message(payload, account_email=self.account_email)
-            for payload in payloads
-        )
+        messages = tuple(self._normalize_inbound(payload) for payload in payloads)
         return PollResult(messages, next_cursor)
 
     def poll_sent(self, cursor: str | None) -> SentPollResult:
@@ -469,10 +469,26 @@ class NylasProvider(EmailProvider):
         return SentPollResult(messages, next_cursor)
 
     def get(self, message_id: str) -> NormalizedEmail:
-        return normalize_nylas_message(
-            self._message(message_id),
-            account_email=self.account_email,
+        return self._normalize_inbound(self._message(message_id))
+
+    def _normalize_inbound(self, payload: dict[str, Any]) -> NormalizedEmail:
+        message = normalize_nylas_message(payload, account_email=self.account_email)
+        response = self._request(
+            "GET",
+            f"{self._grant_path}/messages/{quote(message.provider_message_id, safe='')}",
+            params={"fields": "raw_mime"},
         )
+        data = self._data_object(response)
+        encoded = data.get("raw_mime")
+        if data.get("id") != message.provider_message_id or not isinstance(encoded, str):
+            raise NylasError("Nylas raw MIME response does not match the message")
+        try:
+            raw = base64.b64decode(
+                encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True
+            )
+        except (ValueError, binascii.Error):
+            raise NylasError("Nylas raw MIME is invalid") from None
+        return authenticate_mime(message, raw)
 
     def reply(self, message: NormalizedEmail, text: str) -> str:
         recipient = normalize_email_address(message.from_email)

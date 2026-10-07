@@ -194,7 +194,7 @@ def test_version_reports_project_version(capsys: pytest.CaptureFixture[str]) -> 
     with pytest.raises(SystemExit) as stopped:
         main(["--version"])
     assert stopped.value.code == 0
-    assert capsys.readouterr().out.strip() == "0.7.0"
+    assert capsys.readouterr().out.strip() == "0.7.1"
 
 
 def test_send_cli_requires_both_activation_gates(

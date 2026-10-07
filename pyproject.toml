@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-email-bridge"
-version = "0.7.0"
+version = "0.7.1"
 description = "Provider-neutral inbound email bridge for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,10 +20,11 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Typing :: Typed",
 ]
-dependencies = []
+dependencies = ["dkimpy==1.1.8"]
 
 [project.optional-dependencies]
 dev = [
+  "cryptography>=46",
   "build>=1.2",
   "mypy>=1.15",
   "pytest>=8.3",

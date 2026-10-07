@@ -15,10 +15,10 @@ AgentMail is the first adapter, not a core dependency. The bridge contract is in
 - Hermes session creation and resume through a version-pinned programmatic adapter
 - JSON structured logs with secret-field redaction
 - Persistent poll cursor, processed-message idempotency, and optional raw payload storage
-- Exact runtime sender allowlisting, plus reply-possession proof for Nylas inbound mail
+- Exact runtime sender allowlisting, plus DKIM verification or reply-possession proof for Nylas inbound mail
 - Journaled initiated sends with stable operation IDs and terminal uncertain outcomes
 - No-tools automatic replies with a non-dispatchable local inbox for requests that need tools
-- No runtime Python dependencies
+- DKIM verification through dkimpy and bounded DNS lookups
 
 ## Install
 
@@ -182,12 +182,18 @@ the allowlist automatically. Removing an address remains effective across cursor
 overlap and restarts; only a later, newly observed outbound message can authorize it again.
 
 For Nylas, `EMAIL_BRIDGE_ALLOWED_SENDERS` is the authoritative upper bound and cannot
-be widened by sent mail or by the allowlist CLI. The bridge also requires the inbound
-message to be addressed only to the configured identity and to carry `In-Reply-To`
-for a recent outbound Message-ID observed through the configured grant. Direct mail,
-pre-cutover history, wrong-recipient mail, and From-only spoof attempts are denied
-before Hermes is invoked. Nylas message headers alone are never treated as an
-authentication verdict.
+be widened by sent mail or by the allowlist CLI. Every inbound message must be
+addressed only to the configured identity. New conversations are authorized by
+independently verifying an aligned RSA-SHA256 DKIM signature over the original MIME bytes,
+retrieved using Nylas's `fields=raw_mime`. The signature must cover From, To, Subject,
+Message-ID, MIME-Version, Content-Type, and the entire body; truncated signatures
+are rejected. The verified MIME body supplies agent instructions, rather than
+Nylas's separately rendered body. Raw `Authentication-Results` claims are ignored.
+Messages without a qualifying signature retain the existing proof path: an
+`In-Reply-To` matching a recent outbound Message-ID observed through the configured
+grant. Neither path bypasses the exact sender allowlist or participant checks.
+Reply-routing headers are used as authenticated routing evidence only when signed and
+unambiguous. Transient DKIM DNS lookup failures retry without permanently denying the message.
 
 Poll once, or continuously:
 
