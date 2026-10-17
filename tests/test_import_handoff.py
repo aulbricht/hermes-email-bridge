@@ -15,6 +15,7 @@ from hermes_email_bridge.models import (
     HermesResult,
     NormalizedEmail,
     SenderAuthentication,
+    SentEmail,
 )
 from hermes_email_bridge.providers.base import AmbiguousSendError
 from hermes_email_bridge.providers.fake import FakeProvider
@@ -137,14 +138,33 @@ def test_unknown_or_unallowlisted_sender_cannot_reach_import(tmp_path: Path) -> 
     assert handoff.calls == [] and runner.calls == 0 and provider.replies == []
 
 
-def test_reply_proof_cannot_start_a_fresh_import(tmp_path: Path) -> None:
+def test_observed_reply_proof_can_start_a_fresh_import(tmp_path: Path) -> None:
     provider, runner, handoff = Provider([]), Runner(), Handoff()
     with MappingStore(tmp_path / "bridge.db") as store:
         bridge = service(store, provider, runner, handoff)
-        proven = replace(message(), sender_authentication=SenderAuthentication.REPLY_PROVEN)
+        store.enroll_sent_message(SentEmail(
+            provider="nylas", provider_message_id="sent-1",
+            recipients=("owner@example.test",), sent_at=datetime.now(UTC),
+        ))
+        proven = replace(message(), sender_authentication=SenderAuthentication.UNKNOWN,
+                         in_reply_to="sent-1")
         assert bridge.handle(proven) == "processed"
+        assert store.import_thread_owner("nylas", "thread-1") == "owner@example.test"
+    assert len(handoff.calls) == 1 and runner.calls == 0
+
+
+def test_other_recipients_observed_message_does_not_prove_sender(tmp_path: Path) -> None:
+    provider, runner, handoff = Provider([]), Runner(), Handoff()
+    with MappingStore(tmp_path / "bridge.db") as store:
+        store.enroll_sent_message(SentEmail(
+            provider="nylas", provider_message_id="sent-1",
+            recipients=("other@example.test",), sent_at=datetime.now(UTC),
+        ))
+        unproven = replace(message(), sender_authentication=SenderAuthentication.UNKNOWN,
+                           in_reply_to="sent-1")
+        assert service(store, provider, runner, handoff).handle(unproven) == "skipped"
         assert store.import_thread_owner("nylas", "thread-1") is None
-    assert handoff.calls == [] and runner.calls == 1
+    assert handoff.calls == [] and runner.calls == 0
 
 
 def test_interrupted_handoff_stops_for_reconciliation_after_reload(tmp_path: Path) -> None:

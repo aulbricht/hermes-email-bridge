@@ -84,6 +84,7 @@ class BridgeService:
             and self.store.has_observed_sent_message(
                 message.provider,
                 message.in_reply_to,
+                recipient=message.from_email,
                 max_age_days=self.reply_proof_max_age_days,
             )
         ):
@@ -195,7 +196,10 @@ class BridgeService:
             and message.provider == "nylas"
             and message.thread_id
             and mapping is None
-            and message.sender_authentication is SenderAuthentication.AUTHENTICATED
+            and message.sender_authentication in {
+                SenderAuthentication.AUTHENTICATED,
+                SenderAuthentication.REPLY_PROVEN,
+            }
             and self.import_handoff.wants(message, mapping)
         ):
             return self._handle_import(message, mapping)

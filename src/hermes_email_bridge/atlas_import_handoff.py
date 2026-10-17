@@ -63,7 +63,9 @@ class AtlasImportHandoff:
 
     def wants(self, message: NormalizedEmail, mapping: ConversationMapping | None) -> bool:
         if (message.provider != "nylas" or mapping is not None or
-            message.sender_authentication is not SenderAuthentication.AUTHENTICATED or
+            message.sender_authentication not in {
+                SenderAuthentication.AUTHENTICATED, SenderAuthentication.REPLY_PROVEN,
+            } or
             len(message.attachments) != 1):
             return False
         attachment = message.attachments[0]

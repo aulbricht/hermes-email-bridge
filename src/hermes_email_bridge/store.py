@@ -836,6 +836,7 @@ class MappingStore:
         provider: str,
         message_id: str,
         *,
+        recipient: str,
         max_age_days: int,
         now: datetime | None = None,
     ) -> bool:
@@ -843,14 +844,23 @@ class MappingStore:
 
         if max_age_days <= 0:
             raise ValueError("maximum age must be positive")
+        try:
+            address = normalize_email_address(recipient)
+        except ValueError:
+            return False
         cutoff = (now or utc_now()) - timedelta(days=max_age_days)
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT 1 FROM observed_sent_messages
-                WHERE provider = ? AND message_id = ? AND observed_at >= ?
+                SELECT 1 FROM observed_sent_messages AS sent
+                JOIN email_allowlist AS allowed
+                  ON allowed.provider = sent.provider
+                 AND allowed.source_message_id = sent.message_id
+                WHERE sent.provider = ? AND sent.message_id = ?
+                  AND sent.observed_at >= ? AND allowed.address = ?
+                  AND allowed.revoked_at IS NULL
                 """,
-                (provider, message_id, cutoff.isoformat()),
+                (provider, message_id, cutoff.isoformat(), address),
             ).fetchone()
             return row is not None
 

@@ -121,6 +121,16 @@ def test_atlas_import_handoff_waits_for_slow_completed_turn(
     assert result == "Completed"
 
 
+def test_atlas_import_handoff_accepts_trusted_reply_proof() -> None:
+    from dataclasses import replace
+
+    message = replace(_message(), sender_authentication=SenderAuthentication.REPLY_PROVEN)
+    handoff = AtlasImportHandoff(
+        origin="https://atlas.example.invalid", token_file=Path("/unused"), grant_id="grant-1",
+    )
+    assert handoff.wants(message, None)
+
+
 def test_atlas_import_handoff_rejects_unsupported_or_unsafe_content(tmp_path: Path) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("a" * 48)
