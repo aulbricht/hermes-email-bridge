@@ -5,6 +5,7 @@ import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.request import Request
 
 import pytest
 
@@ -25,7 +26,7 @@ def _message(*, attachment: bool = True) -> NormalizedEmail:
 
 
 def test_atlas_import_handoff_sends_only_bounded_authenticated_envelope(
-    tmp_path, monkeypatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("a" * 48)
@@ -35,27 +36,28 @@ def test_atlas_import_handoff_sends_only_bounded_authenticated_envelope(
     )
     message = _message()
     assert handoff.wants(message, None)
-    seen = {}
+    seen_requests: list[Request] = []
+    seen_timeouts: list[float] = []
 
     class Response:
         status = 200
 
-        def __enter__(self):
+        def __enter__(self) -> Response:
             return self
 
-        def __exit__(self, *_args):
+        def __exit__(self, *_args: object) -> None:
             return None
 
-        def read(self, _limit):
+        def read(self, _limit: int) -> bytes:
             return json.dumps({
                 "status": "accepted", "owner_user_id": "usr_1", "session_id": "chat_1",
                 "upload_id": "del_1", "import_id": "imp_1", "reply_text": "Please review",
             }).encode()
 
     class Opener:
-        def open(self, request, timeout):
-            seen["request"] = request
-            seen["timeout"] = timeout
+        def open(self, request: Request, timeout: float) -> Response:
+            seen_requests.append(request)
+            seen_timeouts.append(timeout)
             return Response()
 
     monkeypatch.setattr(
@@ -66,16 +68,17 @@ def test_atlas_import_handoff_sends_only_bounded_authenticated_envelope(
             b"Name,Suite\nTenant A,A1\n" if max_bytes == 25 * 1024 * 1024 else b""
         ), "operation-1",
     ) == "Please review"
-    request = seen["request"]
+    request = seen_requests[0]
     assert request.full_url == (
         "https://atlas.example.invalid/api/v1/internal/email-import-handoff"
     )
     assert request.get_header("X-atlas-email-import-token") == "a" * 48
+    assert isinstance(request.data, bytes)
     body = json.loads(request.data)
     assert body["action"] == "import" and body["grant_id"] == "grant-1"
     assert body["attachment_ids"] == ["attachment-1"]
     assert body["text_body"] == "Please import"
-    assert seen["timeout"] == 3_660
+    assert seen_timeouts == [3_660]
 
 
 def test_atlas_import_handoff_waits_for_slow_completed_turn(
@@ -118,7 +121,7 @@ def test_atlas_import_handoff_waits_for_slow_completed_turn(
     assert result == "Completed"
 
 
-def test_atlas_import_handoff_rejects_unsupported_or_unsafe_content(tmp_path) -> None:
+def test_atlas_import_handoff_rejects_unsupported_or_unsafe_content(tmp_path: Path) -> None:
     token_file = tmp_path / "token"
     token_file.write_text("a" * 48)
     os.chmod(token_file, 0o644)

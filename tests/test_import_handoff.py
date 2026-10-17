@@ -180,10 +180,10 @@ def test_uncertain_import_reply_has_durable_send_intent_and_no_replay(tmp_path: 
     db = tmp_path / "bridge.db"
     runner, handoff = Runner(), Handoff()
     class UncertainProvider(Provider):
-        store = None
+        store: MappingStore
         sends = 0
 
-        def reply(self, email, text):
+        def reply(self, email: NormalizedEmail, text: str) -> str:
             self.sends += 1
             row = self.store._connection.execute(
                 "SELECT state FROM import_email_messages WHERE message_id=?",
