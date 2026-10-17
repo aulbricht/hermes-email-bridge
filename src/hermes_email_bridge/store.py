@@ -216,6 +216,34 @@ class MappingStore:
 
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS observed_sent_recipients (
+                provider TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                address TEXT NOT NULL,
+                PRIMARY KEY (provider, message_id, address)
+            )
+            """
+        )
+        # Older v3 stores retained only each recipient's latest observed send.
+        # Backfill that exact association; earlier recipient history is unknown.
+        source_tables = {row[0] for row in self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('email_allowlist','observed_sent_messages')"
+        )}
+        if source_tables == {"email_allowlist", "observed_sent_messages"}:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO observed_sent_recipients(provider,message_id,address)
+                SELECT allowed.provider,allowed.source_message_id,allowed.address
+                FROM email_allowlist AS allowed
+                JOIN observed_sent_messages AS sent
+                  ON sent.provider=allowed.provider
+                 AND sent.message_id=allowed.source_message_id
+                WHERE allowed.source='sent' AND allowed.revoked_at IS NULL
+                """
+            )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS outbound_operations (
                 provider TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
@@ -230,7 +258,115 @@ class MappingStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_email_threads (
+                provider TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                participant_email TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(provider, thread_id)
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS import_email_messages (
+                provider TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                participant_email TEXT NOT NULL,
+                attachment_ids_json TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN
+                    ('claimed','handled','reply_sent','reply_uncertain','reply_failed','failed')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(provider, message_id),
+                UNIQUE(operation_id)
+            )
+            """
+        )
         self._connection.commit()
+
+    def import_thread_owner(self, provider: str, thread_id: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT participant_email FROM import_email_threads "
+                "WHERE provider=? AND thread_id=?",
+                (provider, thread_id),
+            ).fetchone()
+            return str(row[0]) if row else None
+
+    def claim_import_message(self, message: NormalizedEmail, operation_id: str) -> bool:
+        """Permanently select import ownership before any downstream side effect.
+
+        An interrupted claim requires reconciliation; a replay never falls into the
+        generic runner or calls the import handler a second time automatically.
+        """
+        if message.provider != "nylas" or not message.thread_id:
+            raise ValueError("import routing requires a Nylas thread")
+        participant = normalize_email_address(message.from_email)
+        attachment_ids = [attachment.attachment_id for attachment in message.attachments]
+        if any(not identifier for identifier in attachment_ids) or len(set(attachment_ids)) != len(
+            attachment_ids
+        ):
+            raise ValueError("import attachment identities are ambiguous")
+        attachment_ids_json = json.dumps(sorted(attachment_ids), separators=(",", ":"))
+        now = utc_now().isoformat()
+        with self._lock, self._connection:
+            if not self._connection.in_transaction:
+                self._connection.execute("BEGIN IMMEDIATE")
+            owner = self._connection.execute(
+                "SELECT participant_email FROM import_email_threads "
+                "WHERE provider=? AND thread_id=?",
+                (message.provider, message.thread_id),
+            ).fetchone()
+            if owner and str(owner[0]) != participant:
+                raise ValueError("import thread belongs to a different participant")
+            existing = self._connection.execute(
+                "SELECT operation_id,attachment_ids_json FROM import_email_messages "
+                "WHERE provider=? AND message_id=?",
+                (message.provider, message.provider_message_id),
+            ).fetchone()
+            if existing:
+                if str(existing[0]) != operation_id or str(existing[1]) != attachment_ids_json:
+                    raise ValueError("import message operation changed")
+                return False
+            self._connection.execute(
+                """INSERT OR IGNORE INTO import_email_threads
+                   (provider,thread_id,participant_email,created_at) VALUES(?,?,?,?)""",
+                (message.provider, message.thread_id, participant, now),
+            )
+            self._connection.execute(
+                """INSERT INTO import_email_messages
+                   (provider,message_id,thread_id,participant_email,attachment_ids_json,
+                    operation_id,state,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,'claimed',?,?)""",
+                (
+                    message.provider,
+                    message.provider_message_id,
+                    message.thread_id,
+                    participant,
+                    attachment_ids_json,
+                    operation_id,
+                    now,
+                    now,
+                ),
+            )
+            return True
+
+    def set_import_message_state(self, provider: str, message_id: str, state: str) -> None:
+        if state not in {"handled", "reply_sent", "reply_uncertain", "reply_failed", "failed"}:
+            raise ValueError("invalid import message state")
+        with self._lock, self._connection:
+            changed = self._connection.execute(
+                """UPDATE import_email_messages SET state=?,updated_at=?
+                   WHERE provider=? AND message_id=? AND state IN ('claimed','handled')""",
+                (state, utc_now().isoformat(), provider, message_id),
+            ).rowcount
+            if changed != 1:
+                raise ValueError("import message state is already terminal")
 
     def add_mapping(
         self,
@@ -538,6 +674,11 @@ class MappingStore:
                 """,
                 (provider, normalized, removed_at, removed_at, removed_at),
             )
+            # A later re-enrollment must not revive proof from before revocation.
+            self._connection.execute(
+                "DELETE FROM observed_sent_recipients WHERE provider=? AND address=?",
+                (provider, normalized),
+            )
             return was_active
 
     def is_allowed(self, provider: str, address: str) -> bool:
@@ -720,6 +861,11 @@ class MappingStore:
                         now,
                     ),
                 )
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO observed_sent_recipients(provider,message_id,address) "
+                    "VALUES (?,?,?)",
+                    (message.provider, message.provider_message_id, normalized),
+                )
                 count += 1
             return count
 
@@ -728,6 +874,7 @@ class MappingStore:
         provider: str,
         message_id: str,
         *,
+        recipient: str,
         max_age_days: int,
         now: datetime | None = None,
     ) -> bool:
@@ -735,14 +882,26 @@ class MappingStore:
 
         if max_age_days <= 0:
             raise ValueError("maximum age must be positive")
+        try:
+            address = normalize_email_address(recipient)
+        except ValueError:
+            return False
         cutoff = (now or utc_now()) - timedelta(days=max_age_days)
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT 1 FROM observed_sent_messages
-                WHERE provider = ? AND message_id = ? AND observed_at >= ?
+                SELECT 1 FROM observed_sent_messages AS sent
+                JOIN observed_sent_recipients AS recipient
+                  ON recipient.provider = sent.provider
+                 AND recipient.message_id = sent.message_id
+                JOIN email_allowlist AS allowed
+                  ON allowed.provider = recipient.provider
+                 AND allowed.address = recipient.address
+                WHERE sent.provider = ? AND sent.message_id = ?
+                  AND sent.observed_at >= ? AND recipient.address = ?
+                  AND allowed.revoked_at IS NULL
                 """,
-                (provider, message_id, cutoff.isoformat()),
+                (provider, message_id, cutoff.isoformat(), address),
             ).fetchone()
             return row is not None
 

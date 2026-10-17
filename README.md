@@ -76,6 +76,8 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_SEND_INITIATED` | `false` | Allow caller-journaled initiated sends |
 | `EMAIL_BRIDGE_DRY_RUN` | `true` | Skip provider send even when replies are enabled |
 | `EMAIL_BRIDGE_ALLOWED_SENDERS` | empty | Required comma-separated exact inbound senders for Nylas |
+| `EMAIL_BRIDGE_ATLAS_IMPORT_ORIGIN` | empty | Reviewed HTTPS tunnel origin for optional Atlas import handoff |
+| `EMAIL_BRIDGE_ATLAS_IMPORT_TOKEN_FILE` | empty | Matching owner-only dedicated service token file; required with the origin |
 | `EMAIL_BRIDGE_REPLY_DOMAINS` | empty | Optional comma-separated exact domains allowed to receive replies |
 | `EMAIL_BRIDGE_REPLY_PROOF_MAX_AGE_DAYS` | `90` | Maximum age of an observed outbound Message-ID used as reply proof |
 | `AGENTMAIL_BASE_URL` | `https://api.agentmail.to/v0` | HTTPS AgentMail API base URL |
@@ -194,6 +196,19 @@ Messages without a qualifying signature retain the existing proof path: an
 grant. Neither path bypasses the exact sender allowlist or participant checks.
 Reply-routing headers are used as authenticated routing evidence only when signed and
 unambiguous. Transient DKIM DNS lookup failures retry without permanently denying the message.
+
+The optional Atlas import adapter is selected only when both Atlas import settings are
+configured. It sends one authorized PDF, CSV, or XLSX attachment to the exact
+`/api/v1/internal/email-import-handoff` path over HTTPS. The bridge durably claims the
+provider message before dispatch, never follows redirects or proxies, and remains the
+sole email response owner. It forwards bounded cleaned sender text to the same Atlas import
+conversation and sends only Atlas's durably completed reply text. An uncertain provider send
+remains in the bridge's reconciliation journal and is never blindly repeated. Production
+activation also needs the Atlas endpoint flag, dedicated token, pinned grant,
+schema migration, edge path restriction, and verified Approval navigation.
+The HTTPS handoff allows 3,660 seconds of socket inactivity for Atlas's 3,600-second
+Hermes stream read ceiling plus a minute of processing. An expired or broken connection
+remains uncertain and requires ledger reconciliation before any recovery.
 
 Poll once, or continuously:
 
@@ -364,6 +379,36 @@ flowchart LR
 ```
 
 The provider boundary is [`EmailProvider`](src/hermes_email_bridge/providers/base.py). An adapter implements `poll`, `get`, and `reply`; webhook parsing is optional. Core orchestration has no AgentMail imports.
+
+### Optional Atlas import handoff contract
+
+`BridgeService(import_handoff=...)` accepts an opt-in `ImportHandoff` implementation; the CLI does
+not install one. This hook runs only for Nylas messages after sender authentication, exact sender
+allowlisting, and conversation resolution. It is disabled when replies are disabled or dry-run is
+active. A new conversation may enter the import route only when it has no existing generic Hermes
+mapping, DKIM authentication is verified, and `wants(message, None)` returns true. Reply-possession
+proof alone cannot start an import. Later messages in the same Nylas thread remain
+import-owned for the same exact participant, including replies without attachments. An unverified
+sender or conflicting participant never reaches the hook.
+
+Before `handle` runs, the bridge stores a durable claim containing provider message ID, Nylas
+thread ID, participant, and sorted attachment IDs. Its deterministic `operation_id` must be the
+idempotency key for the eventual Atlas adapter. A duplicate or interrupted claim never invokes
+`handle`, the generic runner, or a second reply automatically; inspect and reconcile `claimed` or
+`failed` rows in `import_email_messages` before any manual recovery. If the hook is removed or
+replies are disabled after a thread is claimed, that thread stops for reconciliation rather than
+falling back to the generic runner. The handler receives a bounded
+attachment reader, not the email sender. It returns optional reply text; the bridge alone sends it
+in the provider thread and records uncertain delivery without automatic retry. It must not use the
+bridge's local `approval_requests` table as Atlas Import mapping approval.
+
+`NylasProvider.download_attachment(message, attachment, max_bytes=...)` uses the documented
+`GET /v3/grants/{grant_id}/attachments/{attachment_id}/download?message_id=...` binary endpoint.
+It accepts only an authenticated or reply-proven Nylas message addressed to the configured account
+and an attachment listed on that message. It rejects inline, missing-ID, empty, and oversized
+content; the caller's limit may not exceed 25 MiB. It follows no redirects. The eventual Atlas
+adapter still owns MIME/content validation, safe persistence, user/session ownership, import-job
+creation, and exact-plan approval.
 
 Resolution order is:
 

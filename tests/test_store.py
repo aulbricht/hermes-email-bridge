@@ -446,6 +446,52 @@ def test_removing_never_allowed_address_tombstones_old_sent_mail() -> None:
         assert store.is_allowed("agentmail", "person@example.test")
 
 
+def test_reply_proof_keeps_recent_sent_history_but_revocation_clears_it() -> None:
+    recipient = "person@example.test"
+    with MappingStore(":memory:") as store:
+        for message_id in ("sent-1", "sent-2"):
+            store.enroll_sent_message(SentEmail(
+                provider="nylas", provider_message_id=message_id,
+                recipients=(recipient,), sent_at=datetime.now(UTC),
+            ))
+        assert store.has_observed_sent_message(
+            "nylas", "sent-1", recipient=recipient, max_age_days=90,
+        )
+        assert not store.has_observed_sent_message(
+            "nylas", "sent-1", recipient="other@example.test", max_age_days=90,
+        )
+        store.remove_allowed_address("nylas", recipient)
+        store.add_allowed_address("nylas", recipient)
+        assert not store.has_observed_sent_message(
+            "nylas", "sent-1", recipient=recipient, max_age_days=90,
+        )
+        store.enroll_sent_message(SentEmail(
+            provider="nylas", provider_message_id="sent-3",
+            recipients=(recipient,), sent_at=datetime.now(UTC),
+        ))
+        assert store.has_observed_sent_message(
+            "nylas", "sent-3", recipient=recipient, max_age_days=90,
+        )
+
+
+def test_existing_v3_store_backfills_only_known_sent_recipient(tmp_path: Path) -> None:
+    path = tmp_path / "bridge.db"
+    with MappingStore(path) as store:
+        store.enroll_sent_message(SentEmail(
+            provider="nylas", provider_message_id="sent-1",
+            recipients=("person@example.test",), sent_at=datetime.now(UTC),
+        ))
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE observed_sent_recipients")
+    with MappingStore(path) as store:
+        assert store.has_observed_sent_message(
+            "nylas", "sent-1", recipient="person@example.test", max_age_days=90,
+        )
+        assert not store.has_observed_sent_message(
+            "nylas", "sent-1", recipient="other@example.test", max_age_days=90,
+        )
+
+
 def test_start_now_atomically_seeds_missing_cursors_without_overwrite() -> None:
     start = datetime(2026, 7, 11, 12, 0, tzinfo=UTC)
     with MappingStore(":memory:") as store:

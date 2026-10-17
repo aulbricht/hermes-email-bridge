@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import suppress
 from dataclasses import replace
+from hashlib import sha256
 
+from .import_handoff import ImportHandoff
 from .mapping import normalize_email_address
 from .models import (
+    Attachment,
+    ConversationMapping,
     HermesAction,
     HermesResult,
     NormalizedEmail,
@@ -37,6 +42,7 @@ class BridgeService:
         store_raw: bool = False,
         raw_retention_days: int = 30,
         allow_subject_resume: bool = False,
+        import_handoff: ImportHandoff | None = None,
     ) -> None:
         self.provider = provider
         self.store = store
@@ -49,6 +55,7 @@ class BridgeService:
         self.store_raw = store_raw
         self.raw_retention_days = raw_retention_days
         self.allow_subject_resume = allow_subject_resume
+        self.import_handoff = import_handoff
         self._processing_lock = threading.Lock()
         self.store.purge_raw(raw_retention_days)
 
@@ -77,6 +84,7 @@ class BridgeService:
             and self.store.has_observed_sent_message(
                 message.provider,
                 message.in_reply_to,
+                recipient=message.from_email,
                 max_age_days=self.reply_proof_max_age_days,
             )
         ):
@@ -163,6 +171,38 @@ class BridgeService:
                 **context,
             },
         )
+
+        import_owner = (
+            self.store.import_thread_owner(message.provider, message.thread_id)
+            if message.provider == "nylas" and message.thread_id
+            else None
+        )
+        if import_owner:
+            if import_owner != normalize_email_address(message.from_email):
+                self.store.mark_processed(
+                    message,
+                    "authorization_denied",
+                    store_raw=False,
+                    raw_retention_days=self.raw_retention_days,
+                )
+                return "skipped"
+            if self.import_handoff is None or not self.send_replies or self.dry_run:
+                raise RuntimeError("import route is paused; reconciliation required")
+            return self._handle_import(message, mapping)
+        if (
+            self.import_handoff
+            and self.send_replies
+            and not self.dry_run
+            and message.provider == "nylas"
+            and message.thread_id
+            and mapping is None
+            and message.sender_authentication in {
+                SenderAuthentication.AUTHENTICATED,
+                SenderAuthentication.REPLY_PROVEN,
+            }
+            and self.import_handoff.wants(message, mapping)
+        ):
+            return self._handle_import(message, mapping)
 
         try:
             result = self.runner.run(message, mapping)
@@ -258,6 +298,76 @@ class BridgeService:
             raw_retention_days=self.raw_retention_days,
         )
         return "processed"
+
+    def _handle_import(self, message: NormalizedEmail, mapping: ConversationMapping | None) -> str:
+        """Import owns this conversation; the bridge alone owns its email response."""
+        if self.import_handoff is None:
+            raise RuntimeError("import handoff is unavailable")
+        attachment_ids = sorted(
+            attachment.attachment_id or "" for attachment in message.attachments
+        )
+        identity = "\0".join([message.provider, message.provider_message_id, *attachment_ids])
+        operation_id = sha256(f"hermes-import-email-v1\0{identity}".encode()).hexdigest()
+        if not self.store.claim_import_message(message, operation_id):
+            return "skipped"
+        try:
+
+            def read_attachment(attachment: Attachment, max_bytes: int) -> bytes:
+                return self.provider.download_attachment(message, attachment, max_bytes=max_bytes)
+
+            reply = self.import_handoff.handle(message, mapping, read_attachment, operation_id)
+            self.store.set_import_message_state(
+                message.provider, message.provider_message_id, "handled"
+            )
+            if reply:
+                if (
+                    self.reply_domains
+                    and self._email_domain(message.from_email) not in self.reply_domains
+                ):
+                    raise ValueError("import reply domain is denied")
+                try:
+                    reply_id = self.provider.reply(message, reply)
+                except AmbiguousSendError:
+                    self.store.set_import_message_state(
+                        message.provider, message.provider_message_id, "reply_uncertain"
+                    )
+                    self.store.mark_processed(
+                        message,
+                        "import_reply_uncertain",
+                        store_raw=False,
+                        raw_retention_days=self.raw_retention_days,
+                    )
+                    return "processed"
+                self.store.set_import_message_state(
+                    message.provider, message.provider_message_id, "reply_sent"
+                )
+                logger.info(
+                    "import reply sent",
+                    extra={"event": "import_reply_sent", "reply_message_id": reply_id},
+                )
+            self.store.mark_processed(
+                message,
+                "import_handled",
+                store_raw=False,
+                raw_retention_days=self.raw_retention_days,
+            )
+            return "processed"
+        except Exception:
+            with suppress(ValueError):
+                self.store.set_import_message_state(
+                    message.provider, message.provider_message_id, "failed"
+                )
+            self.store.mark_processed(
+                message,
+                "import_reconciliation_required",
+                store_raw=False,
+                raw_retention_days=self.raw_retention_days,
+            )
+            logger.exception(
+                "import handoff requires reconciliation",
+                extra={"event": "import_reconciliation_required"},
+            )
+            return "processed"
 
     def _reply_skip_reason(
         self, message: NormalizedEmail, result: HermesResult

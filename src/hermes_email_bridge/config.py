@@ -286,6 +286,8 @@ class Settings:
     webhook_host: str
     webhook_port: int
     webhook_queue_size: int
+    atlas_import_origin: str | None = None
+    atlas_import_token_file: Path | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -336,6 +338,18 @@ class Settings:
             variable="NYLAS_BASE_URL",
             allow_local_http=nylas_allow_local_http,
         )
+        import_origin = values.get("EMAIL_BRIDGE_ATLAS_IMPORT_ORIGIN", "").strip()
+        import_token_path = values.get("EMAIL_BRIDGE_ATLAS_IMPORT_TOKEN_FILE", "").strip()
+        if bool(import_origin) != bool(import_token_path):
+            raise ConfigError("Atlas import origin and token file must be configured together")
+        if import_origin:
+            import_origin = validate_api_base_url(
+                import_origin, variable="EMAIL_BRIDGE_ATLAS_IMPORT_ORIGIN",
+            )
+            if urlsplit(import_origin).path not in {"", "/"}:
+                raise ConfigError("Atlas import origin must not include a path")
+            if not Path(import_token_path).is_absolute():
+                raise ConfigError("Atlas import token file must be absolute")
         send_replies = _bool(
             values.get("EMAIL_BRIDGE_SEND_REPLIES", "false"),
             "EMAIL_BRIDGE_SEND_REPLIES",
@@ -399,6 +413,8 @@ class Settings:
             webhook_host=values.get("EMAIL_BRIDGE_WEBHOOK_HOST", "127.0.0.1"),
             webhook_port=webhook_port,
             webhook_queue_size=webhook_queue_size,
+            atlas_import_origin=import_origin or None,
+            atlas_import_token_file=Path(import_token_path) if import_token_path else None,
         )
 
     def require_nylas(self) -> tuple[str, str, str]:

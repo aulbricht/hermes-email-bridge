@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from ..models import NormalizedEmail, PollResult, SentPollResult
+from ..models import Attachment, NormalizedEmail, PollResult, SentPollResult
 
 
 class RetryableProviderError(RuntimeError):
@@ -45,6 +45,12 @@ class EmailProvider(ABC):
     @abstractmethod
     def reply(self, message: NormalizedEmail, text: str) -> str:
         """Reply in the provider's existing email thread and return its message ID."""
+
+    def download_attachment(
+        self, message: NormalizedEmail, attachment: Attachment, *, max_bytes: int
+    ) -> bytes:
+        """Fetch a verified message attachment under a caller-supplied byte ceiling."""
+        raise NotImplementedError(f"{self.name} does not support attachment downloads")
 
     def send(
         self,
