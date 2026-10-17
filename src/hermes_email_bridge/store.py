@@ -216,6 +216,34 @@ class MappingStore:
 
         self._connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS observed_sent_recipients (
+                provider TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                address TEXT NOT NULL,
+                PRIMARY KEY (provider, message_id, address)
+            )
+            """
+        )
+        # Older v3 stores retained only each recipient's latest observed send.
+        # Backfill that exact association; earlier recipient history is unknown.
+        source_tables = {row[0] for row in self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('email_allowlist','observed_sent_messages')"
+        )}
+        if source_tables == {"email_allowlist", "observed_sent_messages"}:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO observed_sent_recipients(provider,message_id,address)
+                SELECT allowed.provider,allowed.source_message_id,allowed.address
+                FROM email_allowlist AS allowed
+                JOIN observed_sent_messages AS sent
+                  ON sent.provider=allowed.provider
+                 AND sent.message_id=allowed.source_message_id
+                WHERE allowed.source='sent' AND allowed.revoked_at IS NULL
+                """
+            )
+        self._connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS outbound_operations (
                 provider TEXT NOT NULL,
                 operation_id TEXT NOT NULL,
@@ -646,6 +674,11 @@ class MappingStore:
                 """,
                 (provider, normalized, removed_at, removed_at, removed_at),
             )
+            # A later re-enrollment must not revive proof from before revocation.
+            self._connection.execute(
+                "DELETE FROM observed_sent_recipients WHERE provider=? AND address=?",
+                (provider, normalized),
+            )
             return was_active
 
     def is_allowed(self, provider: str, address: str) -> bool:
@@ -828,6 +861,11 @@ class MappingStore:
                         now,
                     ),
                 )
+                self._connection.execute(
+                    "INSERT OR IGNORE INTO observed_sent_recipients(provider,message_id,address) "
+                    "VALUES (?,?,?)",
+                    (message.provider, message.provider_message_id, normalized),
+                )
                 count += 1
             return count
 
@@ -853,11 +891,14 @@ class MappingStore:
             row = self._connection.execute(
                 """
                 SELECT 1 FROM observed_sent_messages AS sent
+                JOIN observed_sent_recipients AS recipient
+                  ON recipient.provider = sent.provider
+                 AND recipient.message_id = sent.message_id
                 JOIN email_allowlist AS allowed
-                  ON allowed.provider = sent.provider
-                 AND allowed.source_message_id = sent.message_id
+                  ON allowed.provider = recipient.provider
+                 AND allowed.address = recipient.address
                 WHERE sent.provider = ? AND sent.message_id = ?
-                  AND sent.observed_at >= ? AND allowed.address = ?
+                  AND sent.observed_at >= ? AND recipient.address = ?
                   AND allowed.revoked_at IS NULL
                 """,
                 (provider, message_id, cutoff.isoformat(), address),
