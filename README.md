@@ -365,6 +365,36 @@ flowchart LR
 
 The provider boundary is [`EmailProvider`](src/hermes_email_bridge/providers/base.py). An adapter implements `poll`, `get`, and `reply`; webhook parsing is optional. Core orchestration has no AgentMail imports.
 
+### Optional Atlas import handoff contract
+
+`BridgeService(import_handoff=...)` accepts an opt-in `ImportHandoff` implementation; the CLI does
+not install one. This hook runs only for Nylas messages after sender authentication, exact sender
+allowlisting, and conversation resolution. It is disabled when replies are disabled or dry-run is
+active. A new conversation may enter the import route only when it has no existing generic Hermes
+mapping, DKIM authentication is verified, and `wants(message, None)` returns true. Reply-possession
+proof alone cannot start an import. Later messages in the same Nylas thread remain
+import-owned for the same exact participant, including replies without attachments. An unverified
+sender or conflicting participant never reaches the hook.
+
+Before `handle` runs, the bridge stores a durable claim containing provider message ID, Nylas
+thread ID, participant, and sorted attachment IDs. Its deterministic `operation_id` must be the
+idempotency key for the eventual Atlas adapter. A duplicate or interrupted claim never invokes
+`handle`, the generic runner, or a second reply automatically; inspect and reconcile `claimed` or
+`failed` rows in `import_email_messages` before any manual recovery. If the hook is removed or
+replies are disabled after a thread is claimed, that thread stops for reconciliation rather than
+falling back to the generic runner. The handler receives a bounded
+attachment reader, not the email sender. It returns optional reply text; the bridge alone sends it
+in the provider thread and records uncertain delivery without automatic retry. It must not use the
+bridge's local `approval_requests` table as Atlas Import mapping approval.
+
+`NylasProvider.download_attachment(message, attachment, max_bytes=...)` uses the documented
+`GET /v3/grants/{grant_id}/attachments/{attachment_id}/download?message_id=...` binary endpoint.
+It accepts only an authenticated or reply-proven Nylas message addressed to the configured account
+and an attachment listed on that message. It rejects inline, missing-ID, empty, and oversized
+content; the caller's limit may not exceed 25 MiB. It follows no redirects. The eventual Atlas
+adapter still owns MIME/content validation, safe persistence, user/session ownership, import-job
+creation, and exact-plan approval.
+
 Resolution order is:
 
 1. Existing opaque bridge marker from provider metadata or `X-Hermes-Bridge`

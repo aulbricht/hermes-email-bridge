@@ -490,6 +490,59 @@ class NylasProvider(EmailProvider):
             raise NylasError("Nylas raw MIME is invalid") from None
         return authenticate_mime(message, raw)
 
+    def download_attachment(
+        self, message: NormalizedEmail, attachment: Attachment, *, max_bytes: int
+    ) -> bytes:
+        """Download bytes only for an attachment listed on this Nylas message."""
+        if not 0 < max_bytes <= 25 * 1024 * 1024:
+            raise ValueError("attachment byte limit is invalid")
+        if (
+            message.provider != self.name
+            or message.to_email != self.account_email
+            or message.sender_authentication not in {
+                SenderAuthentication.AUTHENTICATED,
+                SenderAuthentication.REPLY_PROVEN,
+            }
+            or not message.provider_message_id
+            or not attachment.attachment_id
+            or attachment not in message.attachments
+            or attachment.inline
+        ):
+            raise NylasError("attachment is not a downloadable message attachment")
+        if attachment.size is not None and attachment.size > max_bytes:
+            raise NylasError("attachment exceeds the byte limit")
+        path = f"{self._grant_path}/attachments/{quote(attachment.attachment_id, safe='')}/download"
+        url = f"{self.base_url}{path}?{urlencode({'message_id': message.provider_message_id})}"
+        request = Request(
+            url,
+            method="GET",
+            headers={
+                "Accept": "application/octet-stream",
+                "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": f"hermes-email-bridge/{__version__}",
+            },
+        )
+        try:
+            with self._opener.open(request, timeout=self.timeout) as response:
+                stated = response.headers.get("Content-Length")
+                if stated is not None:
+                    try:
+                        length = int(stated)
+                        if length < 0:
+                            raise ValueError("negative length")
+                        if length > max_bytes:
+                            raise NylasError("attachment exceeds the byte limit")
+                    except ValueError as exc:
+                        raise NylasError("attachment has invalid length") from exc
+                data = bytes(response.read(max_bytes + 1))
+        except HTTPError as exc:
+            self._raise_http(exc.code, send=False)
+        except (TimeoutError, URLError):
+            raise RetryableProviderError("Nylas attachment download failed") from None
+        if not data or len(data) > max_bytes:
+            raise NylasError("attachment is empty or exceeds the byte limit")
+        return data
+
     def reply(self, message: NormalizedEmail, text: str) -> str:
         recipient = normalize_email_address(message.from_email)
         operation_key = sha256(
