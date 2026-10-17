@@ -17,6 +17,10 @@ from .models import ConversationMapping, NormalizedEmail, SenderAuthentication
 
 _PATH = "/api/v1/internal/email-import-handoff"
 _MAX_BYTES = 25 * 1024 * 1024
+# Atlas waits for a complete Hermes turn before returning this JSON response. Its
+# broker allows 3,600 seconds without a streamed event; allow a minute for the
+# remaining Atlas and tunnel work before declaring the outcome uncertain.
+_HANDOFF_READ_TIMEOUT_SECONDS = 3_660
 _MIME = {
     ".pdf": "application/pdf",
     ".csv": "text/csv",
@@ -117,7 +121,7 @@ class AtlasImportHandoff:
         )
         opener = build_opener(ProxyHandler({}), HTTPSHandler(), _NoRedirect())
         try:
-            with opener.open(request, timeout=30) as response:
+            with opener.open(request, timeout=_HANDOFF_READ_TIMEOUT_SECONDS) as response:
                 if response.status != 200:
                     raise RuntimeError("Atlas import response is uncertain")
                 result = json.loads(response.read(16_385))

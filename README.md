@@ -206,6 +206,9 @@ conversation and sends only Atlas's durably completed reply text. An uncertain p
 remains in the bridge's reconciliation journal and is never blindly repeated. Production
 activation also needs the Atlas endpoint flag, dedicated token, pinned grant,
 schema migration, edge path restriction, and verified Approval navigation.
+The HTTPS handoff allows 3,660 seconds of socket inactivity for Atlas's 3,600-second
+Hermes stream read ceiling plus a minute of processing. An expired or broken connection
+remains uncertain and requires ledger reconciliation before any recovery.
 
 Poll once, or continuously:
 

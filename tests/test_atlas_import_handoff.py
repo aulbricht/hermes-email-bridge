@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -73,7 +75,47 @@ def test_atlas_import_handoff_sends_only_bounded_authenticated_envelope(
     assert body["action"] == "import" and body["grant_id"] == "grant-1"
     assert body["attachment_ids"] == ["attachment-1"]
     assert body["text_body"] == "Please import"
-    assert seen["timeout"] == 30
+    assert seen["timeout"] == 3_660
+
+
+def test_atlas_import_handoff_waits_for_slow_completed_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token_file = tmp_path / "token"
+    token_file.write_text("a" * 48)
+    os.chmod(token_file, 0o600)
+    handoff = AtlasImportHandoff(
+        origin="https://atlas.example.invalid", token_file=token_file, grant_id="grant-1",
+    )
+
+    class Response:
+        status = 200
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, _limit: int) -> bytes:
+            return json.dumps({
+                "status": "accepted", "owner_user_id": "usr_1", "session_id": "chat_1",
+                "upload_id": "del_1", "import_id": "imp_1", "reply_text": "Completed",
+            }).encode()
+
+    class SlowOpener:
+        def open(self, _request: object, timeout: float) -> Response:
+            assert timeout > 3_600
+            time.sleep(0.05)
+            return Response()
+
+    monkeypatch.setattr(
+        "hermes_email_bridge.atlas_import_handoff.build_opener", lambda *_args: SlowOpener(),
+    )
+    result = handoff.handle(
+        _message(), None, lambda *_args: b"Name,Suite\nTenant A,A1\n", "op-1",
+    )
+    assert result == "Completed"
 
 
 def test_atlas_import_handoff_rejects_unsupported_or_unsafe_content(tmp_path) -> None:
