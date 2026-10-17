@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import stat
+import unicodedata
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -21,6 +22,13 @@ _MIME = {
     ".csv": "text/csv",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 }
+
+
+def _user_text(value: str) -> str:
+    return "".join(
+        char for char in value[:8_000]
+        if char in "\n\t" or (unicodedata.category(char)[0] != "C")
+    ).strip()
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -77,6 +85,7 @@ class AtlasImportHandoff:
             "authentication": str(message.sender_authentication),
             "attachment_ids": [item.attachment_id for item in message.attachments],
             "operation_id": operation_id,
+            "text_body": _user_text(message.text_body),
         }
         if message.attachments:
             if not self.wants(message, mapping):
@@ -118,7 +127,8 @@ class AtlasImportHandoff:
             ) from exc
         if (not isinstance(result, dict) or result.get("status") != "accepted" or
             any(not isinstance(result.get(key), str) or not result[key]
-                for key in ("owner_user_id", "session_id", "upload_id", "import_id"))):
+                for key in ("owner_user_id", "session_id", "upload_id", "import_id")) or
+            not isinstance(result.get("reply_text"), str) or
+            not 1 <= len(result["reply_text"]) <= 8_000):
             raise RuntimeError("Atlas import response is uncertain; reconcile before retry")
-        # Email is owned solely by the bridge; a customer-facing approval URL is not yet verified.
-        return None
+        return str(result["reply_text"])

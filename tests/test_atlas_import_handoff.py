@@ -47,7 +47,7 @@ def test_atlas_import_handoff_sends_only_bounded_authenticated_envelope(
         def read(self, _limit):
             return json.dumps({
                 "status": "accepted", "owner_user_id": "usr_1", "session_id": "chat_1",
-                "upload_id": "del_1", "import_id": "imp_1",
+                "upload_id": "del_1", "import_id": "imp_1", "reply_text": "Please review",
             }).encode()
 
     class Opener:
@@ -63,7 +63,7 @@ def test_atlas_import_handoff_sends_only_bounded_authenticated_envelope(
         message, None, lambda attachment, max_bytes: (
             b"Name,Suite\nTenant A,A1\n" if max_bytes == 25 * 1024 * 1024 else b""
         ), "operation-1",
-    ) is None
+    ) == "Please review"
     request = seen["request"]
     assert request.full_url == (
         "https://atlas.example.invalid/api/v1/internal/email-import-handoff"
@@ -72,6 +72,7 @@ def test_atlas_import_handoff_sends_only_bounded_authenticated_envelope(
     body = json.loads(request.data)
     assert body["action"] == "import" and body["grant_id"] == "grant-1"
     assert body["attachment_ids"] == ["attachment-1"]
+    assert body["text_body"] == "Please import"
     assert seen["timeout"] == 30
 
 
@@ -102,3 +103,10 @@ def test_atlas_import_configuration_requires_https_and_token_pair() -> None:
             "EMAIL_BRIDGE_ATLAS_IMPORT_ORIGIN": "https://atlas.example.invalid/other",
             "EMAIL_BRIDGE_ATLAS_IMPORT_TOKEN_FILE": "/tmp/token",
         })
+
+
+def test_email_text_is_bounded_and_control_characters_removed() -> None:
+    from hermes_email_bridge.atlas_import_handoff import _user_text
+
+    assert _user_text("  Change suite\x00 to A2\r\n") == "Change suite to A2"
+    assert len(_user_text("x" * 10_000)) == 8_000

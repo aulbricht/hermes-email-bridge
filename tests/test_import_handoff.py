@@ -16,6 +16,7 @@ from hermes_email_bridge.models import (
     NormalizedEmail,
     SenderAuthentication,
 )
+from hermes_email_bridge.providers.base import AmbiguousSendError
 from hermes_email_bridge.providers.fake import FakeProvider
 from hermes_email_bridge.runner import HermesRunner
 from hermes_email_bridge.service import BridgeService
@@ -173,3 +174,34 @@ def test_existing_import_thread_cannot_fall_back_to_generic_runner(tmp_path: Pat
             paused.handle(message("message-2", attachment=False))
         assert not store.is_processed("nylas", "message-2")
     assert runner.calls == 0 and len(provider.replies) == 1
+
+
+def test_uncertain_import_reply_has_durable_send_intent_and_no_replay(tmp_path: Path) -> None:
+    db = tmp_path / "bridge.db"
+    runner, handoff = Runner(), Handoff()
+    class UncertainProvider(Provider):
+        store = None
+        sends = 0
+
+        def reply(self, email, text):
+            self.sends += 1
+            row = self.store._connection.execute(
+                "SELECT state FROM import_email_messages WHERE message_id=?",
+                (email.provider_message_id,),
+            ).fetchone()
+            assert row["state"] == "handled"  # Durable intent precedes provider send.
+            raise AmbiguousSendError("send outcome unknown")
+
+    provider = UncertainProvider([])
+    with MappingStore(db) as store:
+        provider.store = store
+        bridge = service(store, provider, runner, handoff)
+        assert bridge.handle(message()) == "processed"
+        assert bridge.handle(message()) == "skipped"
+        assert store._connection.execute(
+            "SELECT state FROM import_email_messages WHERE message_id='message-1'"
+        ).fetchone()["state"] == "reply_uncertain"
+    with MappingStore(db) as store:
+        provider.store = store
+        assert service(store, provider, runner, handoff).handle(message()) == "skipped"
+    assert provider.sends == 1 and len(handoff.calls) == 1 and runner.calls == 0

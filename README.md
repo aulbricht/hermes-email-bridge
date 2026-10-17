@@ -201,8 +201,10 @@ The optional Atlas import adapter is selected only when both Atlas import settin
 configured. It sends one authorized PDF, CSV, or XLSX attachment to the exact
 `/api/v1/internal/email-import-handoff` path over HTTPS. The bridge durably claims the
 provider message before dispatch, never follows redirects or proxies, and remains the
-sole email response owner. The adapter currently returns no customer-facing reply text;
-production activation also needs the Atlas endpoint flag, dedicated token, pinned grant,
+sole email response owner. It forwards bounded cleaned sender text to the same Atlas import
+conversation and sends only Atlas's durably completed reply text. An uncertain provider send
+remains in the bridge's reconciliation journal and is never blindly repeated. Production
+activation also needs the Atlas endpoint flag, dedicated token, pinned grant,
 schema migration, edge path restriction, and verified Approval navigation.
 
 Poll once, or continuously:
