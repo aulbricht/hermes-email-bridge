@@ -12,6 +12,7 @@ from dataclasses import asdict
 from typing import TypedDict
 
 from . import __version__
+from .atlas_import_handoff import AtlasImportHandoff
 from .config import ConfigError, Settings, preflight_hermes_command
 from .delivery import DeliveryStore
 from .log import configure_logging
@@ -129,6 +130,15 @@ def _service(
     provider: EmailProvider,
     store: MappingStore,
 ) -> BridgeService:
+    import_handoff = (
+        AtlasImportHandoff(
+            origin=settings.atlas_import_origin,
+            token_file=settings.atlas_import_token_file,
+            grant_id=settings.nylas_grant_id or "",
+        )
+        if settings.atlas_import_origin and settings.atlas_import_token_file
+        else None
+    )
     return BridgeService(
         provider=provider,
         store=store,
@@ -145,6 +155,7 @@ def _service(
         store_raw=settings.store_raw,
         raw_retention_days=settings.raw_retention_days,
         allow_subject_resume=settings.allow_subject_resume,
+        import_handoff=import_handoff,
     )
 
 

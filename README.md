@@ -76,6 +76,8 @@ The bridge does not parse `.env` itself, avoiding a runtime dependency and keepi
 | `EMAIL_BRIDGE_SEND_INITIATED` | `false` | Allow caller-journaled initiated sends |
 | `EMAIL_BRIDGE_DRY_RUN` | `true` | Skip provider send even when replies are enabled |
 | `EMAIL_BRIDGE_ALLOWED_SENDERS` | empty | Required comma-separated exact inbound senders for Nylas |
+| `EMAIL_BRIDGE_ATLAS_IMPORT_ORIGIN` | empty | Reviewed HTTPS tunnel origin for optional Atlas import handoff |
+| `EMAIL_BRIDGE_ATLAS_IMPORT_TOKEN_FILE` | empty | Matching owner-only dedicated service token file; required with the origin |
 | `EMAIL_BRIDGE_REPLY_DOMAINS` | empty | Optional comma-separated exact domains allowed to receive replies |
 | `EMAIL_BRIDGE_REPLY_PROOF_MAX_AGE_DAYS` | `90` | Maximum age of an observed outbound Message-ID used as reply proof |
 | `AGENTMAIL_BASE_URL` | `https://api.agentmail.to/v0` | HTTPS AgentMail API base URL |
@@ -194,6 +196,14 @@ Messages without a qualifying signature retain the existing proof path: an
 grant. Neither path bypasses the exact sender allowlist or participant checks.
 Reply-routing headers are used as authenticated routing evidence only when signed and
 unambiguous. Transient DKIM DNS lookup failures retry without permanently denying the message.
+
+The optional Atlas import adapter is selected only when both Atlas import settings are
+configured. It sends one authorized PDF, CSV, or XLSX attachment to the exact
+`/api/v1/internal/email-import-handoff` path over HTTPS. The bridge durably claims the
+provider message before dispatch, never follows redirects or proxies, and remains the
+sole email response owner. The adapter currently returns no customer-facing reply text;
+production activation also needs the Atlas endpoint flag, dedicated token, pinned grant,
+schema migration, edge path restriction, and verified Approval navigation.
 
 Poll once, or continuously:
 
